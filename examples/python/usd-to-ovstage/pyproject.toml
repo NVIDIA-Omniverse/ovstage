@@ -1,0 +1,26 @@
+[project]
+name = "usd-to-ovstage"
+version = "0.1.0"
+description = "ovstage usd-to-ovstage Python example (one workflow twice: plain USD via pxr, then the ovstage equivalents)"
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+dependencies = [
+    "numpy==2.2.6",
+    "ovstage==0.1.0.346039",
+    "usd-core==26.5",
+]
+
+[tool.uv]
+# Windows reports x86-64 as AMD64 in PEP 508 platform_machine markers.
+# Wheel tags still use win_amd64; keep those concepts separate.
+# No linux-aarch64 here (unlike the sibling examples): usd-core publishes no
+# aarch64 wheels, and one unsatisfiable environment fails the whole resolve.
+environments = [
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "sys_platform == 'win32' and platform_machine == 'AMD64'",
+]
+required-environments = [
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "sys_platform == 'win32' and platform_machine == 'AMD64'",
+]
+

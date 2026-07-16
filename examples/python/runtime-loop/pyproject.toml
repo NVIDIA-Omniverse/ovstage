@@ -1,0 +1,25 @@
+[project]
+name = "runtime-loop"
+version = "0.1.0"
+description = "ovstage runtime-loop Python example (USD populate + live updates, headless)"
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+dependencies = [
+    "numpy==2.2.6",
+    "ovstage==0.1.0.346039",
+]
+
+[tool.uv]
+# Windows reports x86-64 as AMD64 in PEP 508 platform_machine markers.
+# Wheel tags still use win_amd64; keep those concepts separate.
+environments = [
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "sys_platform == 'linux' and platform_machine == 'aarch64'",
+    "sys_platform == 'win32' and platform_machine == 'AMD64'",
+]
+required-environments = [
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "sys_platform == 'linux' and platform_machine == 'aarch64'",
+    "sys_platform == 'win32' and platform_machine == 'AMD64'",
+]
+

@@ -1,0 +1,37 @@
+/* SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. */
+/* SPDX-License-Identifier: LicenseRef-NvidiaProprietary */
+/*
+ * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+ * property and proprietary rights in and to this material, related
+ * documentation and any modifications thereto. Any use, reproduction,
+ * disclosure or distribution of this material and related documentation
+ * without an express license agreement from NVIDIA CORPORATION or
+ * its affiliates is strictly prohibited.
+ */
+
+.c.struct .sig.sig-object.c,
+.c.var .sig.sig-object.c {
+    border: none;
+}
+
+.c.enum .sig.sig-object.c,
+.c.enumerator .sig.sig-object.c {
+    border: none;
+}
+
+/* Compact reference tables */
+.compact-table {
+    font-size: 0.85rem;
+}
+.compact-table td, .compact-table th {
+    padding: 0.3rem 0.5rem;
+}
+
+/* GitHub logo next to "GitHub Repository" sidebar link */
+.bd-sidebar-primary a.reference.external[href*="github.com"]::before {
+    font-family: "Font Awesome 6 Brands";
+    content: "\f09b"; /* fa-github */
+    margin-right: 0.4em;
+    font-style: normal;
+    font-weight: 400;
+}

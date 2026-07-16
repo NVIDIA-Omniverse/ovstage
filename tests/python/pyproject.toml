@@ -1,0 +1,24 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+#
+# ovstage public Python tests (CPU-only). These assert the write -> advance
+# write floor -> read round-trip and double as the tested source for the
+# write-read-roundtrip Python snippet.
+#
+# `ovstage` itself is provided by the produced build/package rather than pinned
+# here, because a published wheel is not yet guaranteed (the bindings load
+# libovstage via ctypes). In "current mode" CI, put the in-repo `python/` package
+# on PYTHONPATH and the built shared library on the loader path
+# (LD_LIBRARY_PATH / OVSTAGE_LIBRARY_PATH_HINT); conftest.py skips cleanly if
+# ovstage cannot be imported/loaded.
+
+[project]
+name = "ovstage-public-tests-python"
+version = "0.1.0"
+description = "ovstage public Python tests (CPU-only)"
+requires-python = ">=3.10,<3.14"
+dependencies = [
+    "numpy>=1.24",
+    "pytest>=8",
+]
+

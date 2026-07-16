@@ -1,0 +1,46 @@
+# Doxyfile for ovstage C API documentation
+# Used by Breathe to generate Sphinx documentation
+
+PROJECT_NAME           = "ovstage"
+PROJECT_BRIEF          = "NVIDIA OVStage runtime data-plane C API"
+
+# Input settings
+# include/ovx holds shared OVX headers generated from the canonical sources; it
+# may be absent in a minimal checkout, in which case Doxygen simply skips the
+# missing input directory.
+INPUT                  = ../include/ovstage ../include/ovx
+RECURSIVE              = YES
+FILE_PATTERNS          = *.h
+
+# Output settings - XML for Breathe
+GENERATE_XML           = YES
+XML_OUTPUT             = _doxygen/xml
+GENERATE_HTML          = NO
+GENERATE_LATEX         = NO
+
+# Parsing settings
+EXTRACT_ALL            = YES
+EXTRACT_STATIC         = YES
+EXTRACT_LOCAL_CLASSES  = YES
+
+# Enable preprocessing
+ENABLE_PREPROCESSING   = YES
+MACRO_EXPANSION        = YES
+EXPAND_ONLY_PREDEF     = NO
+
+# Documentation settings
+JAVADOC_AUTOBRIEF      = YES
+QT_AUTOBRIEF           = YES
+MULTILINE_CPP_IS_BRIEF = YES
+
+# Optimize for C
+OPTIMIZE_OUTPUT_FOR_C  = YES
+
+# Sort settings
+SORT_MEMBER_DOCS       = NO
+SORT_BRIEF_DOCS        = NO
+
+# Warning settings
+QUIET                  = YES
+WARNINGS               = YES
+WARN_IF_UNDOCUMENTED   = NO

@@ -1,0 +1,76 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    metersPerUnit = 0.01
+    upAxis = "Y"
+)
+
+def Xform "World"
+{
+    def Xform "Group"
+    {
+        def Mesh "Left"
+        {
+            int[] faceVertexCounts = [3]
+            int[] faceVertexIndices = [0, 1, 2]
+            point3f[] points = [(0, 0, 0), (1, 0, 0), (0, 0, 1)]
+            uniform token subdivisionScheme = "none"
+        }
+
+        def Mesh "Right" (
+            prepend apiSchemas = ["ShadowAPI"]
+        )
+        {
+            int[] faceVertexCounts = [3]
+            int[] faceVertexIndices = [0, 1, 2]
+            point3f[] points = [(0, 0, 0), (-1, 0, 0), (0, 0, -1)]
+            uniform token subdivisionScheme = "none"
+        }
+    }
+
+    def Cube "Anchor"
+    {
+        double size = 1.0
+    }
+
+    def Xform "Prototype" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        rel material:binding = </World/Looks/BoxMaterial>
+
+        def Cube "Box"
+        {
+            double size = 1.0
+        }
+    }
+
+    def Scope "Looks"
+    {
+        def Material "BoxMaterial"
+        {
+            token outputs:surface.connect = </World/Looks/BoxMaterial/Shader.outputs:surface>
+
+            def Shader "Shader"
+            {
+                uniform token info:id = "UsdPreviewSurface"
+                color3f inputs:diffuseColor = (0.6, 0.6, 0.6)
+                token outputs:surface
+            }
+        }
+    }
+
+    def Xform "InstanceA" (
+        instanceable = true
+        prepend references = </World/Prototype>
+    )
+    {
+    }
+
+    def Xform "InstanceB" (
+        instanceable = true
+        prepend references = </World/Prototype>
+    )
+    {
+    }
+}
