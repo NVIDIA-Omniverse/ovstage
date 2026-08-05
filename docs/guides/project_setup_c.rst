@@ -83,9 +83,26 @@ example, when the package lives at ``<exe_dir>/ovstage/bin``:
    ovstage_config_entry_t entries[] = {
        ovstage_config_entry_binary_package_root_path(
            literal_to_ovx_string(OVX_CONFIG_EXECUTABLE_DIR_TOKEN "/ovstage/bin")),
+       ovstage_config_entry_runtime_default_hierarchy_computation_model(
+           OVSTAGE_HIERARCHY_COMPUTATION_MODEL_GPU_INCREMENTAL),
    };
-   ovstage_config_t config = { entries, 1 };
+   ovstage_config_t config = { entries, 2 };
    ovstage_initialize(&config);
+
+The runtime-default model is process-scoped. It drives automatic transform
+updates for newly created instances and can be selected explicitly:
+
+.. code-block:: c
+
+   ovstage_compute_hierarchy(
+       stage,
+       OVSTAGE_HIERARCHY_COMPUTATION_MODEL_RUNTIME_DEFAULT,
+       input_ordinal,
+       output_ordinal);
+
+Configure a concrete CPU or GPU model on the first process reference. Passing
+``RUNTIME_DEFAULT`` as the configured value leaves the runtime default
+unmodified; that config entry is ignored.
 
 Minimal Program
 ---------------

@@ -8,6 +8,9 @@ standalone program, three numbered sections. It is the C sibling of
 > admission, sparse `index_map`/`mask`, delete tombstones, and CPU map/unmap —
 > are **asserted by the public tests** under `../../../tests/` (see that tree's
 > `AGENTS.md`). This example stays a workflow tour; the tests are the contract.
+> In particular, `../../../tests/c/test_minimal.cpp` verifies that a fixed-size
+> matrix written as `[N, 4, 4]` with `lanes = 1` reads back raw as `[N]` with
+> `lanes = 16`.
 
 ## At a glance
 

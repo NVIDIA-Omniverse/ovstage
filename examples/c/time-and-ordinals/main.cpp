@@ -127,10 +127,10 @@ int main()
     waitPop(stage, popEnq, "open_usd_from_string");
 
     // [snippet:float3-attribute-write]
-    // One float3 per prim travels as a single tensor of dtype lanes=3 /
-    // shape={prim count}, not a 2-D [3][3] of lanes=1. The semantic stamps
-    // the authored USD interpretation on the column: POINT for positions,
-    // VECTOR for velocities. UPSERT creates the prims on first write.
+    // This example uses the canonical float3 transport form: one tensor with
+    // dtype lanes=3 / shape={prim count}. A [prim count][3] lanes=1 copy-in is
+    // also accepted but normalizes to this raw form. The semantic stamps POINT
+    // for positions and VECTOR for velocities. UPSERT creates the prims.
     float startPos[kSphereCount * 3] = {};
     float startVel[kSphereCount * 3] = {};
     for (int i = 0; i < kSphereCount; ++i)

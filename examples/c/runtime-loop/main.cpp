@@ -163,8 +163,9 @@ int main(int argc, char** argv)
     // Write the Torus transform over 24 frames (one sealed ordinal per frame),
     // no USD round-trip. omni:xform is a 4x4 double matrix (row-vector
     // convention: translation in elements [12..14]) -> semantic = MATRIX.
-    // The current implementation stores it as ONE 16-lane element per prim, so the tensor is dtype
-    // {kDLFloat, 64, 16} / shape={1} -- NOT a 4x4 of lanes=1.
+    // The canonical transport form is ONE 16-lane element per prim, so this
+    // tensor uses dtype {kDLFloat, 64, 16} / shape={1}. A convenience 4x4 of
+    // lanes=1 is accepted on copy-in but is normalized back to this form.
     double matrix[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
     const int64_t matShape[] = { 1 };
     const int64_t matStrides[] = { 1 };

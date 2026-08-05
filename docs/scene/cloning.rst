@@ -62,11 +62,12 @@ Semantics
   exists until you observe it — C ``ovstage_wait_op`` + ``ovstage_release_op``,
   Python ``.wait()`` (``Stage.clone`` blocks and raises ``OvstageError``;
   ``Stage.clone_async`` returns an ``Operation``).
-- **Relationships are copied verbatim, not retargeted.** Bindings to a shared
-  scope *outside* the subtree still resolve; targets *inside* the subtree point
-  at the source's copies.
-- **Change tracking.** Only value attributes are change-tracked; relationship
-  changes and parent child-list changes are not ordinal-change-tracked.
+- **Internal paths are rebased; external paths remain shared.** Relationship
+  targets, path values, and attribute connections that point inside the source
+  subtree are retargeted to each clone. Paths outside the subtree are unchanged.
+- **Change tracking.** Cloned attribute values, including relationship targets,
+  are ordinal-change-tracked. Attribute connections and scene hierarchy changes,
+  such as parent child lists, are not.
 
 Where to Go Next
 ----------------

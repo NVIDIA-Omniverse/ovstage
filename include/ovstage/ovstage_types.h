@@ -1,3 +1,12 @@
+/* Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ *
+ * NVIDIA CORPORATION and its licensors retain all intellectual property
+ * and proprietary rights in and to this software, related documentation
+ * and any modifications thereto.  Any use, reproduction, disclosure or
+ * distribution of this software and related documentation without an express
+ * license agreement from NVIDIA CORPORATION is strictly prohibited.
+ */
+
 /**
  * @file ovstage_types.h
  * @brief Backend-owned ovstage data-plane types.
@@ -6,7 +15,7 @@
  * This header contains the type surface that is specific to the ovstage backend.
  * The generic vtable runtime types remain in `ovstage_api/ovstage_api_types.h`.
  *
- * @version 0.1.0
+ * @version 0.1.1
  * @date 2026-06-17
  */
 
@@ -33,11 +42,10 @@ typedef struct {
  * Process configuration (ovstage_initialize)
  *
  * The typed key/value shape mirrors ovrtx_config_t so keys can be added without
- * an ABI break and so the signature does not churn as keys land. Only the
- * static loader (ovstage-static) consumes config keys today, to locate the
- * ovstage shared library and its runtime closure; the ovstage shared library
- * itself still treats config as reserved. Pass NULL (or a struct with
- * entry_count 0) when you do not need to configure the loader.
+ * an ABI break and so the signature does not churn as keys land. The static
+ * loader (ovstage-static) consumes package-location keys, while the ovstage
+ * shared library consumes runtime-behavior keys. Pass NULL (or a struct with
+ * entry_count 0) to select defaults.
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
 /** @brief Key-type tag for ovstage_config_entry_t; selects the valid key/value union members. */
@@ -55,8 +63,19 @@ typedef enum {
 typedef enum { OVSTAGE_CONFIG_BOOL_COUNT } ovstage_config_bool_t;
 /** @brief Int64 config keys. Value type: int64_t. (None defined yet.) */
 typedef enum { OVSTAGE_CONFIG_INT64_COUNT } ovstage_config_int64_t;
-/** @brief Uint64 config keys. Value type: uint64_t. (None defined yet.) */
-typedef enum { OVSTAGE_CONFIG_UINT64_COUNT } ovstage_config_uint64_t;
+/** @brief Uint64 config keys. Value type: uint64_t. */
+typedef enum {
+    /**
+     * ovstage_hierarchy_computation_model_id_t override used for automatic
+     * hierarchy-derived transform updates and by
+     * OVSTAGE_HIERARCHY_COMPUTATION_MODEL_RUNTIME_DEFAULT.
+     *
+     * Defaults to OVSTAGE_HIERARCHY_COMPUTATION_MODEL_CPU_INCREMENTAL. An entry
+     * whose value is RUNTIME_DEFAULT is ignored.
+     */
+    OVSTAGE_CONFIG_RUNTIME_DEFAULT_HIERARCHY_COMPUTATION_MODEL,
+    OVSTAGE_CONFIG_UINT64_COUNT
+} ovstage_config_uint64_t;
 /** @brief Double config keys. Value type: double. (None defined yet.) */
 typedef enum { OVSTAGE_CONFIG_DOUBLE_COUNT } ovstage_config_double_t;
 /** @brief String config keys. Value type: ovx_string_t. */
@@ -152,8 +171,8 @@ typedef uint64_t ovstage_hierarchy_result_id_t;
  *
  * Not every backend, platform, or build necessarily supports every concrete
  * model below. Call ovstage_get_hierarchy_computation_models to discover the
- * models advertised by the current ovstage instance, along with their display
- * names and descriptions.
+ * concrete models and selectors advertised by the current ovstage instance,
+ * along with their display names and descriptions.
  *
  * The DEFAULT_* aliases are semantic convenience choices for callers that only
  * care about CPU vs GPU placement. They intentionally alias concrete entries
@@ -172,6 +191,15 @@ typedef enum {
 
     /** Globally recompute hierarchy-derived stage data on GPU. */
     OVSTAGE_HIERARCHY_COMPUTATION_MODEL_GPU_GLOBAL = 3,
+
+    /**
+     * Use the runtime default captured when this ovstage instance was created.
+     *
+     * The process default is configured through
+     * OVSTAGE_CONFIG_RUNTIME_DEFAULT_HIERARCHY_COMPUTATION_MODEL and defaults
+     * to CPU_INCREMENTAL.
+     */
+    OVSTAGE_HIERARCHY_COMPUTATION_MODEL_RUNTIME_DEFAULT = 4,
 
     /** Default CPU hierarchy computation model for this API revision. */
     OVSTAGE_HIERARCHY_COMPUTATION_MODEL_DEFAULT_CPU =

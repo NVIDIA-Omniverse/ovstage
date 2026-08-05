@@ -42,6 +42,10 @@ Stage and Path Dictionary
    :members:
    :undoc-members:
 
+.. autoclass:: ovstage.StageConfig
+   :members:
+   :undoc-members:
+
 .. autoclass:: ovstage.PathDictionary
    :members:
    :undoc-members:
@@ -174,6 +178,17 @@ Errors
    :undoc-members:
 
 .. autoclass:: ovstage.OvxError
+   :members:
+   :undoc-members:
+
+Logging
+^^^^^^^
+
+.. autofunction:: ovstage.set_log_callback
+
+.. autofunction:: ovstage.flush_log
+
+.. autoclass:: ovstage.LogSeverity
    :members:
    :undoc-members:
 

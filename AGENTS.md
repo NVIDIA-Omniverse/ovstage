@@ -9,7 +9,9 @@ docs, or tests.
 `ovstage` is a vectorized, GPU-native runtime stage for USD data — a shared,
 high-performance data substrate for OV Libraries (physics, rendering, animation,
 graph). It reads, writes, and manages simulation data (transforms, velocities,
-materials, metadata) across CPU and GPU memory, with zero-copy data paths.
+materials, metadata) across CPU and GPU memory, with zero-copy data paths. Currently,
+zero-copy applies to CUDA source-tensor writes; payload reads and map/unmap buffers
+are CPU-resident.
 
 The public surface is a pure **C API** (`include/ovstage/`) with a Python
 bindings package (`python/ovstage/`) layered on top.
@@ -43,8 +45,9 @@ still return only the latest committed state, but dirty metadata retains exact
 change membership within a bounded window. Older records may be coalesced to one
 latest marker per exact attribute and prim. The reported retention frontier is
 inclusive; callers must query it rather than assume a fixed retention depth.
-Range membership at or above it is exact, but returned payloads are still latest
-and the range is not a per-write payload event log.
+Range membership at or above it is exact; a selected `(attribute, path)` with a
+retained successor after the range end returns `OVSTAGE_ERROR_OUT_OF_RANGE`
+rather than a later payload, and the range is not a per-write payload event log.
 
 Built-in metadata attributes are auto-maintained and filterable: `usd-path`,
 `usd-schemas`, `usd-prim-type`, `usd-parent`, `usd-children`. (`usd-active`

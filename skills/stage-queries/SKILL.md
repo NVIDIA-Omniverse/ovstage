@@ -185,9 +185,12 @@ Introspection — match count, the scoped attribute list, and the reusable `all_
   filter on `usd-path`/`HAS`, which work on client-written prims.
 - **`PREFIX "/World"` matches `/Worldwide`** — `usd-path` PREFIX is byte-prefix matching on the
   path string. Append a trailing `/` to scope to the subtree (`PREFIX "/World/"`).
-- **Empty read from a matched set** — the columns you read weren't sealed; advance the write floor
-  to/above the write ordinal before reading (queries see latest committed state, but reads target
-  sealed data). See `application-flow`.
+- **`OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION` reading a matched set** — the selected columns weren't
+  sealed; advance the write floor to/above the write ordinal before reading (queries see latest
+  committed state, but reads target sealed data). See `application-flow`.
+- **`OVSTAGE_ERROR_OUT_OF_RANGE` reading a fixed range** — a selected `(attribute, path)` has a
+  retained successor after the range end, so latest-only storage cannot represent the window.
+  Widen/rebase the range or request latest state; advancing the floor alone does not fix it.
 - **Handle leak / teardown crash** — release the query (and in C the query result) before
   destroying the instance; read-group prim lists are borrows, never `destroy_path_list` them.
 

@@ -59,6 +59,26 @@ library, make it discoverable:
 
 Alternatively, set the ``OVSTAGE_LIBRARY_PATH_HINT`` environment variable.
 
+Configuring Transform Updates
+-----------------------------
+
+Pass a :py:class:`~ovstage.StageConfig` when creating the stage to select the
+hierarchy computation model used for automatic transform updates:
+
+.. filtered-literalinclude:: ../../tests/python/test_config.py
+   :language: python
+   :start-after: # [snippet:configure-transform-updates]
+   :end-before: # [/snippet:configure-transform-updates]
+   :exclude-pattern: ^\s*#\s*\[/?snippet:
+   :dedent:
+
+The setting is process-scoped. Configured stages may coexist when their
+concrete settings match; creating a stage with a conflicting setting while
+another stage remains live raises :py:class:`~ovstage.OvstageError`.
+``RUNTIME_DEFAULT`` is meaningful as a manual selector. As a configured value,
+it does not override the active process default; a fresh process defaults to
+CPU incremental.
+
 Minimal Program
 ---------------
 

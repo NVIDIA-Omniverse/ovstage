@@ -49,17 +49,17 @@ consumer: last_seen -> 6
 
 - A lagging consumer misses nothing: it sat out three ticks before the second
   catch-up, so it just gets a bigger delta (4 prim changes instead of 3).
-- Payloads are latest-committed. The first catch-up prints `S1 = 21.0` (written
-  at tick 2) inside a group stamped `ordinal 3`: the range read tells you
-  *which* prims changed, the value is the newest committed one, and
-  `group.ordinal` — the column's latest write ordinal — can land outside the
-  requested range (the tombstone group says `ordinal 6` though the delete
-  happened at tick 5).
+- Successful groups carry current state. The first catch-up includes
+  `S1 = 21.0`, written at tick 2.
 - A whole-prim delete arrives as a tombstone: a read group with
   `is_delete = true` and no tensors.
-- The consumer reads only up to the floor it fetched; sealed data never
-  changes, so it never sees a half-written tick — even with a concurrent
-  producer.
+- With a concurrent producer, a pending overlapping write can fail the read
+  with `OP_FAILED`. Once committed, a later change to the same selected
+  `(attribute, path)` after the requested end produces `OUT_OF_RANGE` whether
+  or not it is sealed; a selected in-range unsealed change produces
+  `WRITE_FLOOR_VIOLATION`. A production consumer should re-poll and widen/rebase
+  its range, or explicitly request current state if that is the intended
+  recovery.
 
 ## Build and run
 
@@ -111,10 +111,12 @@ ovstage skills under `../../../skills/`; keep them intact when editing.
   would be a snapshot read.
 - `--threads` runs both roles concurrently on the same instance — every API
   slot is thread-safe on a shared instance (see *Thread Safety* in
-  `ovstage_api.h`). Only the batching varies run to run (how many sealed ticks
-  each catch-up happens to see). Under load a producer write can be rejected
-  when it overlaps an outstanding consumer read; the run then reports the
-  rejection, shuts both roles down, and exits nonzero.
+  `ovstage_api.h`). When no overlap rejection occurs, only the batching varies
+  run to run (how many sealed ticks each catch-up happens to see). Under load,
+  a producer write can be rejected while a consumer read is outstanding; a
+  read can likewise reject a pending overlap or a committed change to a
+  selected `(attribute, path)` after the polled range end. This demo reports
+  the rejection, shuts both roles down, and exits nonzero rather than retrying.
 - The examples fail fast: any unexpected API failure prints and exits (helpers
   in `../common/ovstage_example_utils.h`). A real application would propagate
   errors instead.

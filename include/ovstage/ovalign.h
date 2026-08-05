@@ -1,3 +1,12 @@
+/* Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ *
+ * NVIDIA CORPORATION and its licensors retain all intellectual property
+ * and proprietary rights in and to this software, related documentation
+ * and any modifications thereto.  Any use, reproduction, disclosure or
+ * distribution of this software and related documentation without an express
+ * license agreement from NVIDIA CORPORATION is strictly prohibited.
+ */
+
 /**
  * @file ovalign.h
  * @brief OVAlign — composable cross-attribute group alignment library.
@@ -30,7 +39,7 @@
  * - Same prims.offset, prims.count, prims.index_map across all attrs within a group index.
  * - data (tensors, count, index_map, mask) remains per-attribute (different storage density).
  *
- * @version 0.1.0
+ * @version 0.1.1
  * @date 2026-05-23
  */
 

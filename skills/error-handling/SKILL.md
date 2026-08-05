@@ -115,7 +115,7 @@ most recent thread-local error is also available as an `ovx_string_t` via
 | `OVSTAGE_ERROR_INVALID_HANDLE` (2) | stale/invalid handle |
 | `OVSTAGE_ERROR_NOT_FOUND` (3) | token/path/list not found |
 | `OVSTAGE_ERROR_PRIM_NOT_FOUND` (4) | INSERT mode and prim already exists |
-| `OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION` (5) | write at ordinal <= write floor |
+| `OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION` (5) | write at/below the floor, or latest state / a selected in-range change above it |
 | `OVSTAGE_ERROR_NOT_SUPPORTED` (6) | unsupported operation |
 | `OVSTAGE_ERROR_QUEUE_FULL` (7) | backpressure: submit queue full |
 | `OVSTAGE_ERROR_END_OF_ITERATION` (8) | no more groups to iterate |
@@ -123,6 +123,7 @@ most recent thread-local error is also available as an `ovx_string_t` via
 | `OVSTAGE_ERROR_LAYOUT_CHANGED` (10) | layout changed during map |
 | `OVSTAGE_ERROR_TIMEOUT` (11) | fetch/wait did not complete within timeout |
 | `OVSTAGE_ERROR_OP_FAILED` (12) | an enqueued op failed; see `ovstage_get_last_op_error` |
+| `OVSTAGE_ERROR_OUT_OF_RANGE` (13) | requested ordinal range cannot be materialized from retained payloads |
 | `OVSTAGE_ERROR_INTERNAL` (99) | internal error |
 
 ## C — synchronous calls
@@ -215,9 +216,14 @@ A timeout surfaces as the `OVSTAGE_ERROR_TIMEOUT` code (`timeout=0` polls,
 - Treat `OVSTAGE_ERROR_TIMEOUT` as "not ready yet," distinct from `OVSTAGE_ERROR_OP_FAILED`
   ("the op ran and failed").
 - `OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION` means a write or delete targeted an ordinal at or
-  below the effective write floor for that attribute — re-check the ordinal sequencing
-  (see the ordinal / write-floor skill). `advance_write_floor` itself never raises this:
-  backwards advances clamp via `max(...)` rather than rejecting.
+  below the effective write floor, a latest read targets current recorded state above it, or
+  an explicit range selects an in-range change above it. The effective floor starts at 0, so
+  advance it to cover positive-ordinal state before reading. `advance_write_floor` itself never
+  raises this: backwards advances clamp via `max(...)` rather than rejecting.
+- `OVSTAGE_ERROR_OUT_OF_RANGE` on an explicit range means a selected `(attribute, path)` also
+  has a retained change after the range end, so the payload for that fixed range is no longer
+  available. Widen/rebase the range or request current state. Sealing the later change alone does
+  not resolve this error.
 - Call `ovstage_release_op` once an op is known complete; afterwards the `op_id` must not
   be reused with `ovstage_wait_op` or `ovstage_get_last_op_error`.
 

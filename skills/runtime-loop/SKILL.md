@@ -95,11 +95,11 @@ This skill has no scripts.
 
 - The referenced snippets remain the source of truth; update or add tested snippets before
   documenting new API usage.
-- **Transform layout: `omni:xform` is one 16-lane element per prim.** Write the 4×4 double as a
-  tensor with `dtype.lanes = 16`, `shape = [1]` (`semantic = MATRIX`, row-vector convention,
-  translation in row `[3][0..2]`) — **not** a 4×4 of `lanes = 1`. The transform is packed
-  into 16 lanes; a `lanes = 1` write is rejected because the existing column has 16 lanes. Validated
-  against a published ovstage build.
+- **Transform layout: `omni:xform` is one 16-lane element per prim.** The canonical 4×4 double
+  tensor uses `dtype.lanes = 16`, `shape = [1]` (`semantic = MATRIX`, row-vector convention,
+  translation in row `[3][0..2]`). A compact `shape = [1, 4, 4]`, `lanes = 1` copy-in is also
+  accepted, but the trailing dimensions are folded and not preserved: raw reads and maps return
+  the canonical `shape = [1]`, `lanes = 16` layout.
 - **Reading populated transforms.** This loop reads back the transform **it wrote itself** (works).
   The *populated* transform (`omni:fabric:localMatrix` / `omni:fabric:worldMatrix`) is not surfaced via
   `read_attributes` (computed downstream in ovrtx) — don't rely on reading a scene-authored transform.
@@ -174,8 +174,8 @@ Update path 2 — edit the USD source and propagate it through:
 
 ## Troubleshooting
 
-- **Read returns nothing after populate** — advance the write floor to the populate ordinal; reads
-  only see sealed data at/below the floor.
+- **Read fails with `OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION` after populate** — advance the write
+  floor to the populate ordinal; reads only see sealed data at/below the floor.
 - **`OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION`** — a write/`apply_usd_changes` used an ordinal at/below
   the floor. Keep ordinals monotonic (populate 1 → writes 2..N → USD edit N+1).
 - **USD edit didn't show up in reads** — `add_usd_reference` only edits USD; you must call

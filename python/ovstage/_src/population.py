@@ -23,7 +23,7 @@ import ctypes
 import math
 
 from . import bindings as _b
-from .types import OvstageError, PopulationDomain, check_ordinal
+from .types import OvstageError, PopulationDomain, check_ordinal, check_timeout
 
 __all__ = [
     "Operation",
@@ -96,12 +96,19 @@ class Operation:
         return str(lib.ovstage_population_get_last_op_error(self.op_id))
 
     def wait(self, timeout: int = _b.OVSTAGE_TIMEOUT_INFINITE):
-        """Wait for completion. Returns the payload, ``None`` on timeout; raises on failure."""
+        """Wait for completion. Returns the payload, ``None`` on timeout; raises on failure.
+
+        :param timeout: max nanoseconds to wait; ``OVSTAGE_TIMEOUT_INFINITE``
+            (default) blocks, ``0`` polls.
+        :raises TypeError: if ``timeout`` is not an integer (e.g. ``None``).
+        :raises ValueError: if ``timeout`` is negative or does not fit in uint64.
+        """
+        timeout = check_timeout(timeout)
         if self.status != _b.OVSTAGE_OK:
             raise OvstageError(self.status, last_error())
         lib, inst = self._stage._lib, self._stage._inst
         wait_result = _b.ovstage_population_op_wait_result_t()
-        code = lib.ovstage_population_wait_op(inst, self.op_id, int(timeout), ctypes.byref(wait_result))
+        code = lib.ovstage_population_wait_op(inst, self.op_id, timeout, ctypes.byref(wait_result))
         if code == _b.OVSTAGE_ERROR_TIMEOUT:
             return None  # op still pending — keep the input buffers alive for the worker
         self._keepalive = None  # op resolved (success or failure); inputs no longer read

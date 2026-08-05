@@ -44,6 +44,41 @@ static inline ovstage_config_entry_t ovstage_config_entry_string(ovstage_config_
 }
 
 /**
+ * Build a config entry for an unsigned 64-bit setting.
+ * @param key Config key from ovstage_config_uint64_t.
+ * @param value Unsigned 64-bit value.
+ */
+static inline ovstage_config_entry_t ovstage_config_entry_uint64(ovstage_config_uint64_t key,
+                                                                 uint64_t value)
+{
+    ovstage_config_entry_t entry;
+    entry.key_type = OVSTAGE_CONFIG_KEY_TYPE_UINT64;
+    entry.key.uint64_key = key;
+    entry.value.uint_value = value;
+    return entry;
+}
+
+/**
+ * Configure the hierarchy computation model used by automatic transform
+ * updates and by OVSTAGE_HIERARCHY_COMPUTATION_MODEL_RUNTIME_DEFAULT.
+ *
+ * To override the default, use CPU_INCREMENTAL, GPU_INCREMENTAL, or GPU_GLOBAL
+ * (the DEFAULT_CPU and DEFAULT_GPU aliases are also accepted). RUNTIME_DEFAULT
+ * means "no override"; an entry with that value is ignored.
+ *
+ * The setting is process-scoped and must be supplied when acquiring the first
+ * process reference. Existing instances retain the default captured when they
+ * were created.
+ */
+static inline ovstage_config_entry_t ovstage_config_entry_runtime_default_hierarchy_computation_model(
+    ovstage_hierarchy_computation_model_id_t model)
+{
+    return ovstage_config_entry_uint64(
+        OVSTAGE_CONFIG_RUNTIME_DEFAULT_HIERARCHY_COMPUTATION_MODEL,
+        (uint64_t)model);
+}
+
+/**
  * Configure the ovstage "binary package root" directory.
  *
  * This is used by the static loader (ovstage-static) to locate the ovstage

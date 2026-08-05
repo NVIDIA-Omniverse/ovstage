@@ -9,6 +9,9 @@ Python-only).
 > admission, sparse `index_map`/`mask`, delete tombstones, and CPU map/unmap —
 > are **asserted by the public tests** under `../../../tests/` (see that tree's
 > `AGENTS.md`). This example stays a workflow tour; the tests are the contract.
+> In particular, `../../../tests/python/test_minimal.py` verifies that a convenience matrix input
+> `(N, 4, 4)` normalizes to raw `(N,)` with 16 lanes and exports through DLPack
+> as `(N, 16)`.
 
 ## At a glance
 

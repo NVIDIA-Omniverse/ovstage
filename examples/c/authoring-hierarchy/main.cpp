@@ -93,9 +93,9 @@ static DLTensor cpuTokenTensor(uint64_t* ids, const int64_t* shape, const int64_
 }
 
 // Write `rows` 4x4 double matrices (16 doubles each, contiguous in `data`)
-// into a matrix column over `query`. The current implementation stores a 4x4 as ONE 16-lane
-// element per prim, so the tensor is dtype lanes=16 / shape={rows} (NOT a 4x4
-// of lanes=1).
+// into a matrix column over `query`. This helper uses the canonical transport
+// form: ONE 16-lane element per prim, dtype lanes=16 / shape={rows}. A compact
+// 4x4-of-lanes=1 copy-in is accepted but normalized back to this raw form.
 static void writeMatrixRows(ovstage_instance_t* stage, ovstage_query_handle_t query, ovx_token_t attribute,
                             double* data, size_t rows, ovstage_ordinal_t ordinal, const char* what)
 {
@@ -297,8 +297,9 @@ static std::vector<std::string> readTokenColumnNames(ovstage_instance_t* stage, 
             ovstage_release_group(stage, &group); // tombstone group: no data, no names
             continue;
         }
-        // Every covered prim needs a backing logical row: stacked scalar rows
-        // in one tensor, or (for array attributes) one tensor per row.
+        // Every covered prim must resolve to a transported data row, directly
+        // or through data.index_map. Fixed rows are stacked in one tensor;
+        // array attributes use one tensor per data row.
         if (!group.data.tensors)
             layoutError();
         if (!group.is_array && (group.data.tensor_count != 1 || !isTokenTensor(group.data.tensors[0])))

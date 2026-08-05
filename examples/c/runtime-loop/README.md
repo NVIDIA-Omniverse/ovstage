@@ -89,11 +89,12 @@ ovstage skills under `../../../skills/`; keep them intact when editing.
 
 ## Notes
 
-- The `omni:xform` write must present the transform as **one 16-lane float64
+- The example uses the canonical `omni:xform` layout: **one 16-lane float64
   element per prim** (`ndim=1`, `dtype={kDLFloat, 64, 16}`,
-  `OVSTAGE_SEMANTIC_MATRIX`) — the populated attribute column's type; a 2-D 4×4
-  tensor with `lanes=1` is rejected, while the memory layout is unchanged
-  (row-major 4×4, translation in elements `[12..14]`).
+  `OVSTAGE_SEMANTIC_MATRIX`). A convenience input shaped `[N, 4, 4]` with
+  `lanes=1` is also accepted, but the trailing shape is not preserved; raw
+  reads/maps return `[N]` with 16 lanes. The memory remains row-major 4×4 with
+  translation in elements `[12..14]`.
 - The inline USDA layer needs the prim body braces and each statement on their
   own lines; a single-line `def ... { ... }` is a parse error.
 - The examples fail fast: any unexpected API failure prints and exits (helpers

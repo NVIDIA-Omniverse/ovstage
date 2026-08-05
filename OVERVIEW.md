@@ -59,7 +59,7 @@ These principles guided the API design and are relevant for understanding trade-
 
 4. **Optional complexity — implementations can subset.** An implementation supporting only latest-value reads uses the same API signatures. Value-based query filters are optional. Historical/per-version payload access is optional. The API contract is the same; the capability level is declared.
 
-5. **Round-trip symmetry.** Read results are directly usable as write inputs — same addressing, same data structures. No reshaping between read and write.
+5. **Round-trip symmetry.** Canonical read results are directly usable as write inputs — same addressing and data structures. Fixed-size values use one transported data-row dimension plus `dtype.lanes`; compact convenience write shapes are normalized to that canonical form. Logical prim-to-row association remains separate in `data.index_map`.
 
 ---
 
@@ -153,7 +153,7 @@ graph LR
 ovstage stores data and exposes changes — but it does **not** automatically push updates to consumers. Each library owns when and how it reads from ovstage:
 
 - **Pull-based:** Libraries call read operations when they're ready for new data (typically once per their simulation tick)
-- **Delta-aware:** Reads can ask "what changed since ordinal N?" — ovstage reports only the changed prims and returns their latest data, not the full scene
+- **Delta-aware:** Reads can ask "what changed since ordinal N?" — ovstage reports only the changed prims and returns their latest data, not the full scene. Only the latest payload is retained, so a *fixed* range whose selected `(attribute, path)` changed again after the range end cannot be represented and returns `OVSTAGE_ERROR_OUT_OF_RANGE` rather than membership and data
 - **Independent rates within retention:** A consumer can request a larger change range on its next read without imposing a global update cadence. Exact change membership is guaranteed only at or above the runtime-reported retention frontier; consumers must query that frontier and recover appropriately if they fall behind it. API waits and CPU/GPU synchronization still apply where documented.
 - **No global sync:** A write by ovphysx does not trigger an immediate update in ovrtx. The renderer reads when it's ready for the next frame.
 
@@ -202,7 +202,9 @@ Every write carries an ordinal used for ordering and change membership. Readers 
 
 ### What data format does ovstage use?
 
-All tensor data uses **DLTensor** (from the DLPack standard). This provides zero-copy interop with the Python/ML ecosystem (NumPy, PyTorch, JAX, Warp) and carries device type, pointer, and shape metadata. No custom tensor types.
+All tensor data uses **DLTensor** (from the DLPack standard). This provides zero-copy interop with the Python/ML ecosystem (NumPy, PyTorch, JAX, Warp) and carries device type, pointer, shape, and lane-width metadata. No custom tensor types.
+
+Fixed-size attributes use a lane-canonical raw layout: reads and maps return `ndim = 1`, `shape = (N,)`, with the complete per-row tuple width in `dtype.lanes`, where `N` is the transported data-row count. Without `data.index_map`, logical prims select rows one-to-one and `N` must equal the logical prim count; with it, `data.index_map[i]` selects the row for logical prim `i`, so `N` may differ from the logical prim count: it can be smaller when rows are shared, or larger when a query touches only part of a transported bucket. Copy-in writes may use compact convenience shapes such as `(N, 3)` with one lane for a point or `(N, 4, 4)` with one lane for a matrix, but those trailing dimensions are folded and are not preserved. A flat `(N * L,)` tensor with one lane is not a convenience encoding of `N` rows of width `L`. The corresponding raw results are `(N,)` with 3 or 16 lanes. Python DLPack export expands the lane width as exactly one trailing axis, so the matrix becomes `(N, 16)`, not `(N, 4, 4)`. Array/ragged attributes are outside this fixed-size rule.
 
 ### Can ovstage be used without the full Omniverse stack?
 

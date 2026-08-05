@@ -1,3 +1,12 @@
+/* Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ *
+ * NVIDIA CORPORATION and its licensors retain all intellectual property
+ * and proprietary rights in and to this software, related documentation
+ * and any modifications thereto.  Any use, reproduction, disclosure or
+ * distribution of this software and related documentation without an express
+ * license agreement from NVIDIA CORPORATION is strictly prohibited.
+ */
+
 /**
  * @file ovstage_api_types.h
  * @brief ovstage_api — shared types, handles, and instance bundle.
@@ -26,7 +35,7 @@
  * The execution-model documentation lives at the top of `ovstage_api.h`
  * alongside the vtable definition.
  *
- * @version 0.1.0
+ * @version 0.1.1
  * @date 2026-05-28
  */
 
@@ -49,7 +58,7 @@
  * always agree. */
 #define OVSTAGE_VERSION_MAJOR 0
 #define OVSTAGE_VERSION_MINOR 1
-#define OVSTAGE_VERSION_PATCH 0
+#define OVSTAGE_VERSION_PATCH 1
 
 /* Marks a deprecated public entry point: OVSTAGE_DEPRECATED("Use <new> instead")
  * on the old declaration. Emits a compiler warning at the call site where
@@ -102,7 +111,7 @@ typedef enum ovstage_api_status_t
     OVSTAGE_ERROR_INVALID_HANDLE        = 2,  /**< Stale/invalid handle of any kind. */
     OVSTAGE_ERROR_NOT_FOUND             = 3,
     OVSTAGE_ERROR_PRIM_NOT_FOUND        = 4,  /**< INSERT mode and prim already exists. */
-    OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION = 5,  /**< Ordinal <= write floor. */
+    OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION = 5,  /**< Write at/below effective write floor; snapshot read with current state above it; range read with a selected change above it. */
     OVSTAGE_ERROR_NOT_SUPPORTED         = 6,
     OVSTAGE_ERROR_QUEUE_FULL            = 7,  /**< Backpressure: submit queue full. */
     OVSTAGE_ERROR_END_OF_ITERATION      = 8,  /**< No more groups to iterate. */
@@ -110,6 +119,7 @@ typedef enum ovstage_api_status_t
     OVSTAGE_ERROR_LAYOUT_CHANGED        = 10, /**< Layout changed during map. */
     OVSTAGE_ERROR_TIMEOUT               = 11, /**< Fetch/wait did not complete within timeout. */
     OVSTAGE_ERROR_OP_FAILED             = 12, /**< An enqueued op failed; see get_last_op_error. */
+    OVSTAGE_ERROR_OUT_OF_RANGE          = 13, /**< Requested ordinal range cannot be materialized from retained payloads. */
     OVSTAGE_ERROR_INTERNAL              = 99
 } ovstage_api_status_t;
 
@@ -134,7 +144,15 @@ typedef enum ovstage_api_status_t
 typedef uint64_t ovstage_ordinal_t;
 #endif
 
-/** @brief Bitmask pointer. NULL = all valid. Bit i set = element i is valid. */
+/**
+ * @brief Bitmask pointer. NULL = all valid. Bit i set = element i is valid.
+ *
+ * Element `i` is bit `i % 64` of word `i / 64`, least significant bit first.
+ * A non-NULL mask spans at least `ceil(count / 64)` `uint64_t` words, where
+ * `count` is the logical element count of the structure carrying it; exactly
+ * that many words are read. Any bits above `count` in the final word are
+ * ignored.
+ */
 typedef const uint64_t* ovstage_mask_t;
 
 /**
@@ -312,17 +330,24 @@ typedef enum {
  * groups and map (write iterator) groups.
  *
  * Tensor transport layout:
- * - Stacked rows use tensor_count = 1; one tensor describes all logical rows
- *   along its leading dimension.
+ * - Stacked rows use tensor_count = 1; one tensor describes all transported
+ *   data rows along its leading dimension.
  * - Per-row transport uses tensor_count = N; each tensor describes one
- *   logical row's variable-length payload.
+ *   transported data row's variable-length payload.
+ * - A fixed-size value tensor returned by read or map is canonical: `ndim == 1`,
+ *   `shape[0]` is the number of transported data rows, and `dtype.lanes`
+ *   is the complete tuple width (for example, point3f uses 3 lanes and
+ *   matrix4d uses 16). Write-side convenience trailing dimensions are not
+ *   retained or reconstructed.
  *
  * Tensor count is not an attribute-kind signal. Read results report logical
  * kind in ovstage_read_group_t::is_array. Copy-in writes declare it in
  * ovstage_write_data_t::is_array.
  *
  * index_map usage (applies across the logical element axis):
- * - Sparse/gather access: tensor[index_map[i]] for logical element i
+ * - Sparse/gather access: logical element i selects data row index_map[i]
+ *   (`tensors[0]` row index_map[i] for stacked fixed-size transport, or
+ *   `tensors[index_map[i]]` for per-row array transport)
  * - Reordering: tensors stored in different order than prims
  * - Deduplication/broadcast: many prims map to few unique values
  *
@@ -343,11 +368,15 @@ typedef enum {
  * @invariant For value groups, `tensor_count >= 1`. For fixed-size attributes
  *            it is 1; for array attributes it equals the number of logical prim
  *            elements.
+ * @invariant A fixed-size value tensor has `ndim == 1`; its leading shape is
+ *            the transported data-row count and `dtype.lanes` carries the
+ *            tuple width. Logical element `i` selects row `i` when `index_map`
+ *            is NULL, or row `index_map[i]` otherwise.
  * @invariant For delete/tombstone read groups (`is_delete == true`),
  *            `tensor_count == 0`, `tensors == NULL`, and `count == 0`.
  * @invariant `index_map` and `mask` are mutually exclusive.
  * @invariant `count` is set (non-zero) when index_map or mask is non-NULL.
- *            When both are NULL, consumers use `tensor_count` directly.
+ *            When both are NULL, logical elements select data rows by identity.
  * @invariant `cuda_sync` is `{0, 0}` for CPU-resident or already-synchronized data.
  */
 typedef struct {
@@ -390,8 +419,8 @@ typedef struct {
  *
  * Shared across read groups and map groups.
  *
- * - `attribute_write_floor_ordinal`: The write floor for this attribute,
- *   snapshot at read-submit time. Data at ordinals <=
+ * - `attribute_write_floor_ordinal`: The write floor in effect for this
+ *   attribute when the group was produced. Data at ordinals <=
  *   attribute_write_floor_ordinal is sealed (will never change).
  * - `layout_generation`: Monotonically increasing counter scoped to the
  *   attribute. Bumps on structural changes (prim add/remove, index_map shape
@@ -410,11 +439,20 @@ typedef struct {
 /**
  * @brief Ordinal range for read operations.
  *
- * - Latest value at or before N: has_start_ordinal = false, end_ordinal = N.
- *   Returns the most recent value with ordinal <= end_ordinal.
- * - Range query [start, end]: has_start_ordinal = true,
- *   start_ordinal <= end_ordinal. Returns all changes in the interval
- *   [start_ordinal, end_ordinal].
+ * - Latest snapshot request: has_start_ordinal = false, end_ordinal = N.
+ *   In the current implementation, recorded columns return their latest
+ *   committed payload, not a historical payload selected at or before N.
+ * - Change range [start, end]: has_start_ordinal = true,
+ *   start_ordinal <= end_ordinal. Selects keys with retained changes in the
+ *   inclusive interval [start_ordinal, end_ordinal]. As a limitation of the
+ *   current implementation, this interval selects keys only; it does not select
+ *   a historical payload version. A selected change above the effective write
+ *   floor fails with OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION. If a selected public
+ *   key (attribute and path) also has a retained change after end_ordinal, the
+ *   read fails with OVSTAGE_ERROR_OUT_OF_RANGE because the payload for the fixed
+ *   range is no longer available, whether or not the later change is sealed.
+ *   Otherwise, the selected key returns its latest committed payload or
+ *   tombstone.
  *
  * Implementations may coalesce or discard history below their inclusive
  * retention frontier. Query ovstage_get_oldest_preserved_ordinal before relying
@@ -422,17 +460,18 @@ typedef struct {
  *
  * @remark The current implementation retains bounded exact
  * change membership at or above the frontier reported by
- * ovstage_get_oldest_preserved_ordinal, but returns the latest retained payload
- * or tombstone for each selected key. Callers must query the frontier rather
- * than assume a fixed retention depth. Its ordinal ranges are therefore not a
- * historical-payload event log.
+ * ovstage_get_oldest_preserved_ordinal. Callers must query the frontier rather
+ * than assume a fixed retention depth. Ordinal ranges are therefore not a
+ * historical-payload event log. Historical-payload support must first return a
+ * retained in-range payload when one is available before reporting
+ * OVSTAGE_ERROR_OUT_OF_RANGE.
  *
  * 0 is a valid ordinal (no sentinel values).
  */
 typedef struct {
     ovstage_ordinal_t start_ordinal;     /**< Range start (only when has_start_ordinal). */
     ovstage_ordinal_t end_ordinal;       /**< Upper-bound ordinal. */
-    bool              has_start_ordinal; /**< false = latest <= end_ordinal; true = range [start, end]. */
+    bool              has_start_ordinal; /**< false = latest snapshot; true = range [start, end]. */
 } ovstage_ordinal_range_t;
 
 /** Per-attribute USD semantic — the authored *interpretation* of a column's
@@ -681,11 +720,56 @@ typedef struct {
  * @invariant `tensor_count >= 1`.
  * @invariant When `is_array == false`, `tensor_count == 1` and the tensor
  *            contains the fixed-size rows stacked along its leading dimension.
+ *            The canonical input is `ndim == 1`, `shape == {source_rows}`, with
+ *            the complete per-row tuple width in `dtype.lanes`. A compact
+ *            convenience input may instead place tuple components in trailing
+ *            shape dimensions (for example `(N, 3)` with `lanes == 1`, or
+ *            `(N, 4)` with `lanes == 4`). Those per-row dimensions are folded
+ *            into `dtype.lanes`; their rank and shape are not preserved. Reads
+ *            and maps expose the canonical 1-D form (`(N,)`, lanes 3 or 16 in
+ *            these examples). Without `index_map`, `shape[0]` must equal the
+ *            logical element count. A flat `(N * L,)`, `lanes == 1` tensor is
+ *            not an encoding of `N` rows of width `L`.
  * @invariant When `is_array == true`, `tensor_count == 1` selects packed
  *            uniform-row transport and `tensor_count > 1` selects one tensor
  *            per source row. Neither form changes the declared logical kind.
+ *            Packed transport carries no explicit row capacity -- one flat
+ *            tensor holds every row back to back -- so its row count is
+ *            inferred: the highest `index_map` entry plus one, or the logical
+ *            element count when `index_map` is NULL. The uniform row width is
+ *            the payload size divided by that inferred count -- not by the
+ *            logical element count -- so an `index_map` declares the partition
+ *            as well as selecting from it, and may declare more rows than the
+ *            logical element count. A partition the payload cannot support is
+ *            rejected: the payload must divide evenly across the inferred count,
+ *            and the resulting row width must be a whole number of `dtype`
+ *            elements. A packed payload cannot carry trailing rows above the
+ *            highest `index_map` entry; they would change the inferred width of
+ *            every row. Use `tensor_count > 1` when rows must be described
+ *            individually.
  * @invariant `index_map` and `mask` are mutually exclusive.
  * @invariant `count` is set (non-zero) when index_map or mask is non-NULL.
+ *            Otherwise `count == 0` means the write addresses every prim the
+ *            query covers. A non-zero `count` addresses the leading `count`
+ *            prims in query order and may not exceed the query's prim count.
+ *            The *logical element count* is `count`, or the query's prim count
+ *            when `count == 0`.
+ * @invariant `index_map` has `count` entries and holds source row indices, not
+ *            target prim indices: logical element `i` reads transported row
+ *            `index_map[i]`. Where the payload declares a transported row count
+ *            -- `shape[0]` when `is_array == false`, `tensor_count` for per-row
+ *            array transport -- every entry is less than it, and an out-of-range
+ *            entry is rejected rather than reinterpreted. Rows no entry
+ *            references are left unused, so the payload may carry more rows than
+ *            the query has prims. Packed array transport declares no row count;
+ *            there the map defines one, as described above.
+ * @invariant `mask` selects which of the `count` logical elements are written;
+ *            unselected prims are left untouched. It does not change how the
+ *            payload is cut into rows, so the payload still carries a row for
+ *            every logical element, including the unselected ones. A non-NULL
+ *            `mask` addresses at least `ceil(count / 64)` `uint64_t` words --
+ *            the implementation reads that many -- with element `i` at bit
+ *            `i % 64` of word `i / 64`.
  * @invariant `cuda_sync` is `{0, 0}` for CPU-resident or already-synchronized data.
  *
  * Every attribute, including reserved metadata, follows this contract.
@@ -700,9 +784,9 @@ typedef struct {
     const DLManagedTensorVersioned* const* managed_tensors;  /**< Storage-managed tensors (read-only to the implementation). Deleter invoked when storage no longer needs them. NULL when tensors is provided. */
     uint32_t                               tensor_count;     /**< Number of tensors in tensors/managed_tensors; selects transport layout, not attribute kind. */
 
-    uint32_t                               count;       /**< Logical element count when index_map/mask present. */
-    const uint32_t*                        index_map;   /**< NULL = identity; non-NULL = gather/reorder/dedup. */
-    ovstage_mask_t                         mask;        /**< NULL = all valid; non-NULL = bitmask over elements. */
+    uint32_t                               count;       /**< Logical element count; addresses the leading `count` prims in query order. Required (non-zero) when index_map/mask present; `0` = every prim the query covers. */
+    const uint32_t*                        index_map;   /**< NULL = identity; non-NULL = gather/reorder/dedup. `count` source row indices, each below the transported row count. */
+    ovstage_mask_t                         mask;        /**< NULL = all valid; non-NULL = bitmask over elements, at least `ceil(count / 64)` words long. Selects target elements; it does not change how the payload is cut into rows. */
     ovstage_cuda_sync_t                    cuda_sync;   /**< GPU sync applied before access; `{0,0}` = none. See ovstage_cuda_sync_t. */
     ovstage_attribute_semantic_t           semantic;    /**< Authored USD interpretation for this write (NONE = unspecified). Must match an existing prim/name unless the attribute is being created. Geometric semantics are recorded at creation and surfaced back on read; see ovstage_attribute_semantic_t. */
     bool                                   is_array;    /**< Logical attribute kind. Sole authority for fixed (`false`) versus array (`true`) storage. Kept last to minimize padding; it occupies existing tail padding on 64-bit ABIs. */

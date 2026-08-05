@@ -7,7 +7,7 @@
 
 **ovstage** is a C and Python library providing a shared, high-performance, vectorized, GPU-capable scene data substrate for [USD](https://openusd.org) scene data for use in Omniverse Libraries spanning physics, rendering, sensors, animation, and more. 
 
-It provides C and Python APIs for reading, writing, querying, and managing simulation data such as transforms, velocities, materials, hierarchy, and metadata across CPU and GPU memory, with zero-copy data paths and DLPack tensor interchange.
+It provides C and Python APIs for reading, writing, querying, and managing simulation data such as transforms, velocities, materials, hierarchy, and metadata across CPU and GPU memory, with zero-copy data paths and DLPack tensor interchange. Currently, zero-copy applies to CUDA source-tensor writes; payload reads and map/unmap buffers are CPU-resident.
 
 **ovstage** is suited for developers looking to build simulation and visualization applications, tools or workflows based on Omniverse Libraries, such as [ovphysx](https://github.com/NVIDIA-Omniverse/PhysX/tree/main/ovphysx) and [ovrtx](https://github.com/NVIDIA-Omniverse/ovrtx).
 
@@ -130,7 +130,7 @@ This model is appropriate when producers and consumers are tightly coupled and b
 - **Use asynchronous, ordinal-keyed execution** - mutating and data-producing calls enqueue work, return an `op_index`, and can expose typed handles that feed later enqueues.
 - **Advance visibility explicitly** - writes carry an ordinal, and callers advance the write floor so consumers read the latest committed stage state.
 - **Read latest committed payloads** - this release retains the current committed snapshot for payload reads; older ordinal payloads are not read back.
-- **Track change membership** - consumers can ask what changed since an ordinal and receive exact changed-prim membership within the reported retention frontier plus latest committed data, avoiding full-scene diffs (expressed as an ordinal-range read; see `ovstage_ordinal_range_t`). Callers query the frontier rather than assuming a fixed retention depth; older markers may be coalesced per attribute and prim, so this is not a historical-payload event log.
+- **Track change membership** - consumers can ask what changed since an ordinal and receive exact changed-prim membership within the reported retention frontier plus latest committed data, avoiding full-scene diffs (expressed as an ordinal-range read; see `ovstage_ordinal_range_t`). Callers query the frontier rather than assuming a fixed retention depth; older markers may be coalesced per attribute and prim, so this is not a historical-payload event log. Because only the latest payload is retained, a fixed range whose selected `(attribute, path)` changed again after the range end returns `OVSTAGE_ERROR_OUT_OF_RANGE` instead of membership and data — end the range at the newest change, or use a snapshot read, when that matters.
 - **Keep tensor data CPU- or GPU-native** - exchange payloads as DLPack `DLTensor` values for zero-copy CPU/GPU interop.
 - **Map attributes for direct producer writes** - use map/unmap flows when a producer wants to fill ovstage-owned storage directly.
 - **Reuse prim identity across libraries** - exchange tokens and prim-path lists through the shared path dictionary instead of string lookups at every boundary.

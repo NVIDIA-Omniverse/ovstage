@@ -83,6 +83,7 @@ from ._src.types import (
     QueryResult,
     ReadGroup,
     Scope,
+    StageConfig,
     TIMEOUT_INFINITE,
     WriteDesc,
 )
@@ -95,10 +96,11 @@ from ._src.types import (
 try:
     from ._version import version as __version__
 except Exception:
-    __version__ = "0.1.0"
+    __version__ = "0.1.1"
 
 __all__ = [
     "Stage",
+    "StageConfig",
     "Query",
     "Read",
     "Map",

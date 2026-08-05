@@ -92,9 +92,10 @@ This skill has no scripts.
   change/deletion membership — that surface is part of the API contract. **In the current
   build**, payload reads are latest-snapshot only and do not provide historical payload
   versions. At or above the reported inclusive retention frontier, a range selects exact
-  changed/deleted membership, but each non-delete group carries the latest committed payload
-  for the selected key. Below that frontier, membership may be coalesced or discarded. Do not
-  treat an ordinal range as a historical-payload event log.
+  changed/deleted membership. It returns current payload/delete state only when the selected
+  key has no retained successor after the range end; otherwise it returns
+  `OVSTAGE_ERROR_OUT_OF_RANGE`. Below that frontier, membership may be coalesced or discarded.
+  Do not treat an ordinal range as a historical-payload event log.
 - **USD population not covered here.** Ingesting existing USD uses the population API
   (`ovstage_population.h`); this skill documents the direct write/read lifecycle.
 - **⚠️ Draft — API in flux.** Treat exact symbols/ordering as provisional against the headers.
@@ -180,14 +181,19 @@ intern token / `path_dictionary_create_path_list_from_strings` → `ovstage_quer
 
 ## Troubleshooting
 
-- **Wrote, but the read sees nothing** — two causes: the ordinal isn't sealed yet (call
-  `ovstage_advance_write_floor` to/above it before reading at/below it), and/or enqueue
+- **Read fails with `OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION` after a write** — the selected state is
+  not sealed; call `ovstage_advance_write_floor` to/above its ordinal. Also remember that enqueue
   success means *accepted*, not *executed* (wait/fetch first). See `cpu-ahead-gpu-async`.
+- **Fixed range fails with `OVSTAGE_ERROR_OUT_OF_RANGE`** — a selected `(attribute, path)` has a
+  retained successor after the range end, so latest-only storage cannot represent that window.
+  Widen/rebase the range, repoll from a newer cursor, or explicitly request latest state.
+  Advancing the floor alone does not resolve it.
 - **Write rejected (`OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION`)** — you wrote at an ordinal at or
   below the current write floor. Write above the floor, then advance the floor afterward.
 - **Expecting historical payloads from an ordinal range** — unsupported in this
   latest-snapshot build. Ranges at or above the reported retention frontier provide exact
-  changed-prim membership, but their groups carry the latest committed payload or tombstone.
+  changed-prim membership; representable ranges carry current payload/delete state, while a
+  retained same-key successor after the range end produces `OUT_OF_RANGE`.
 - **Leaks / teardown crashes** — release in reverse: the read group, the read handle, the
   path-list reference, *then* destroy the instance (the path dictionary is instance-owned —
   never free it yourself).

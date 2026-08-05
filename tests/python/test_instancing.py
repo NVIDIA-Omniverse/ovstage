@@ -71,6 +71,7 @@ def test_instancing_query_round_trip(stage):
         pytest.skip("libovstage was built without the population bridge")
 
     population.open_usd_from_string(stage, INSTANCING_USDA, domains=PopulationDomain.RENDERING)
+    stage.advance_write_floor(1).wait()
     prototype_roots = instancing.get_prototype_roots(stage)
     assert len(prototype_roots) == 1
     prototype_root = prototype_roots[0]

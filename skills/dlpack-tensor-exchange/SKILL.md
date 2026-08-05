@@ -45,8 +45,9 @@ Resolve inputs in this order: existing repository files and referenced snippets,
   staging** write (`map_attribute` → `fetch_map_next` → fill → `unmap_*`).
 - Residency: CPU (`DLDevice{ kDLCPU, 0 }`) or CUDA (`DLDevice{ kDLCUDA, device_ordinal }`),
   and whether a producing/consuming GPU kernel needs a `cuda_sync`.
-- Attribute kind: fixed-size (one tensor, all prims stacked along the leading dimension) vs.
-  array/ragged (one tensor per prim element).
+- Attribute kind: fixed-size (one tensor, all transported data rows stacked along the leading
+  dimension) vs. array/ragged (one tensor per transported data row). Logical prims select
+  those rows directly or through `index_map`.
 - Sparsity: dense, or `index_map` (gather/reorder/dedup) or `mask` (per-element validity) —
   the two are mutually exclusive.
 - The shipped headers (`ovstage_api/ovstage_api_types.h` for the data structs, the bundled
@@ -68,7 +69,9 @@ Resolve inputs in this order: existing repository files and referenced snippets,
    `fetch_read_next`), or mapped staging write (`map_attribute` / `fetch_map_next` / `unmap_*`).
 2. Describe data with a `DLTensor`: `data` pointer, `device` (`{kDLCPU,0}` or
    `{kDLCUDA, ord}`), `ndim`, `dtype` (`{code, bits, lanes}` — `lanes` is the tuple width, e.g.
-   3 for a float3), `shape`, `strides`, `byte_offset`.
+   3 for a float3), `shape`, `strides`, `byte_offset`. Fixed-size read and map tensors use
+   the canonical transport layout: `ndim = 1`, `shape = [data_rows]`, and `dtype.lanes`
+   holds the complete tuple width.
 3. **Write (copy-in):** put the tensor(s) in `ovstage_write_data_t.tensors` (client-managed —
    must stay valid until the op completes) **or** `.managed_tensors` (storage takes ownership
    via the `DLManagedTensorVersioned` deleter); exactly one is non-NULL. Set `tensor_count`
@@ -87,7 +90,15 @@ Resolve inputs in this order: existing repository files and referenced snippets,
    handle), passing a write-done `ovstage_cuda_sync_t` whose `wait_event` ovstage waits on
    before sealing.
 7. **Sparsity:** when `index_map` or `mask` is set, use `count` (logical element count) with
-   `index_map[i]` (gather) or `mask` (validity); they are mutually exclusive.
+   `index_map[i]` (gather) or `mask` (validity); they are mutually exclusive. `index_map`
+   selects *source rows*, `mask` selects *target elements* — to write a subset of a query's
+   prims, use `mask`. Where the payload declares a row count (`shape[0]` fixed,
+   `tensor_count` per-row array) every `index_map` entry must be below it and out-of-range is
+   rejected, not reinterpreted; unreferenced rows are simply unused. Packed array transport
+   declares none, so there the map defines the partition as `max(index_map) + 1` uniform
+   rows. `mask` does not change the row partition, so a masked payload still carries a row
+   per logical element, and it must span at least `ceil(count / 64)` `uint64_t` words —
+   element `i` is bit `i % 64` of word `i / 64`, and exactly that many words are read.
 
 ## Output Format
 
@@ -121,6 +132,10 @@ This skill has no scripts.
   supported (see the Python section), but the Python write path uses only the client-managed
   `tensors` field: the caller keeps the source object alive until the op completes, rather than
   handing ownership to storage via `managed_tensors`.
+- **Fixed-size shape is normalized, not preserved.** Compact convenience write shapes are
+  accepted, but trailing component dimensions are folded into `dtype.lanes`; raw C reads and
+  maps return the canonical 1-D row layout. This statement does not cover array/ragged
+  attributes, whose tensor shapes describe per-prim elements.
 - **⚠️ Draft — API in flux.** Treat exact symbols/usage as provisional against the headers.
 
 ## Overview
@@ -134,8 +149,13 @@ at unmap, not a direct view. One data shape is reused throughout:
   carry: an array of `DLTensor`s (`tensors` + `tensor_count`), optional sparsity
   (`index_map` *or* `mask`, with `count`), and a GPU-sync `cuda_sync` (`{stream, wait_event}`).
 - **`tensor_count` depends on attribute kind:** fixed-size attributes use a single tensor
-  with all prims stacked along the leading dimension; array (ragged) attributes use one
-  tensor per logical prim element.
+  with all transported data rows stacked along the leading dimension; array (ragged)
+  attributes use one tensor per transported data row.
+- **Fixed-size tensors are lane-canonical on read and map:** the leading dimension is the
+  transported data-row count and `dtype.lanes` is the full tuple width. Logical elements
+  select rows directly or through `data.index_map`. Writes may use this canonical layout or
+  a compact convenience shape; convenience trailing dimensions are folded and are not
+  retained as schema metadata.
 - **Three paths:** *copy-in* (`write_attribute`, implementation copies/scatters your tensors
   into storage), *copy-out* (`read_attributes` → `fetch_read_next`, you read from the
   returned tensors), and *mapped staging* (`map_attribute` → `fetch_map_next`, you fill a
@@ -145,6 +165,29 @@ at unmap, not a direct view. One data shape is reused throughout:
   sync / default, 1 = default stream, >1 = a specific stream): `{0, 0}` means CPU-resident or
   already-synchronized; a non-zero `wait_event` on a **read** means *wait before access*; on a
   **write/unmap** it is the event ovstage *waits on* (relative to `stream`) before sealing your data.
+
+### Fixed-size canonical and convenience layouts
+
+For fixed-size attributes (`is_array = false`), use the canonical layout when shape stability
+matters across a raw C API round trip. Convenience layouts are accepted on copy-in, but only
+their leading dimension is the source data-row count; all trailing component dimensions are
+folded into the canonical lane width. In this table, `N` is the source/transported data-row
+count. When `data.index_map` is present, `N` may differ from the logical prim count: it can
+be smaller when rows are shared or larger when a query touches only part of a transported
+bucket. Without `index_map`, `N` must equal the logical prim count. A flat `(N * L,)`,
+`lanes = 1` tensor is not a convenience encoding of `N` rows of width `L`; use `(N, L)` or
+canonical lanes.
+
+| Value per data row | Canonical write / raw read / raw map | Accepted convenience write | Python DLPack export |
+|---|---|---|---|
+| scalar | `shape = [N]`, `lanes = 1` | same | `(N,)` |
+| point/vector/color (`float3`) | `shape = [N]`, `lanes = 3` | `shape = [N, 3]`, `lanes = 1` | `(N, 3)` |
+| matrix (`matrix4d`) | `shape = [N]`, `lanes = 16` | `shape = [N, 4, 4]`, `lanes = 1`, or `shape = [N, 4]`, `lanes = 4` | `(N, 16)` |
+
+The original convenience shape is not preserved: a matrix written as `(N, 4, 4)` is read and
+mapped by the raw API as `shape = [N]`, `lanes = 16`. Python's DLPack protocol export adds
+exactly one trailing axis for the lane width, so it produces `(N, 16)`, not `(N, 4, 4)`.
+Array/ragged attributes are outside this fixed-size layout rule.
 
 ## C — write and read (copy-in / copy-out)
 
@@ -164,6 +207,14 @@ dtype (POINT/COLOR/MATRIX on float storage; TOKEN_ID pins uint64 token-id storag
 stamps it and the read recovers it — the public test asserts the round-trip:
 
 > **Source:** `tests/c/test_attributes.cpp` snippet `semantic-roles-c`
+
+The public contract test also authors a matrix with the convenience input layout
+`shape = [3, 4, 4]`, `lanes = 1`, then observes the canonical raw read layout
+`shape = [3]`, `lanes = 16`:
+
+> **Source:** `tests/c/test_minimal.cpp` snippet `canonical-fixed-shapes-c`
+
+> **Source:** `tests/python/test_minimal.py` snippet `canonical-fixed-shapes`
 
 For **GPU-resident** data the only additions are the device and a producing event (the rest
 of the call is identical to the snippet above):
@@ -204,7 +255,8 @@ of backing storage. The flow:
    element counts so storage can pre-allocate the ragged backing.
 2. `ovstage_fetch_map_next(stage, map, timeout, &map_group)` — iterate writable groups (same
    fetch-with-timeout contract as `fetch_read_next`); write your values into
-   `map_group.data.tensors[i].data`.
+   `map_group.data.tensors[i].data`. A fixed-size map group uses the same canonical
+   `shape = [data_rows]`, full-`dtype.lanes` layout as a raw read.
 3. Commit: `ovstage_unmap_group(stage, map, &map_group, write_done_sync)` per group, then
    `ovstage_unmap_attribute(stage, map, write_done_sync)` to commit any remainder and release
    the handle. `write_done_sync` is an `ovstage_cuda_sync_t` whose `wait_event` ovstage waits
@@ -219,6 +271,27 @@ All map/unmap ops are ordinal-keyed at the session's `ordinal`, like `write_attr
 > not implemented. The Python equivalent maps an existing and a fresh column:
 >
 > **Source:** `tests/python/test_map_attribute.py` snippet `map-unmap-cpu`
+
+### Read-only vs writable exports
+
+`dlpack(i)` takes a `readonly` keyword that sets the DLPack read-only flag on the exported
+capsule. The defaults follow the group kind: a `ReadGroup` exports `readonly=True`, a
+(writable) `MapGroup` exports `readonly=False`. Pass `readonly=True` on a map group to hand a
+view to code that must not write through it — the consumer then refuses the write instead of
+silently corrupting the mapped buffer:
+
+> **Source:** `tests/python/test_map_attribute.py` snippet `map-dlpack-readonly`
+
+Two caveats:
+
+- **The flag needs a versioned capsule.** Only a consumer that requests DLPack `max_version >=
+  (1, 0)` receives the versioned layout that carries `flags`; numpy >= 2.1 does. An older
+  consumer takes the legacy `DLManagedTensor`, which has no flags field, so `readonly=True` is
+  silently dropped and the view is writable. Do not rely on the flag as an access-control
+  boundary — it is a correctness hint to a cooperating consumer.
+- **Rejection is the consumer's, not ovstage's.** numpy raises `ValueError: assignment
+  destination is read-only`; another framework may word it differently or refuse at a
+  different point.
 
 ## Key Types / Functions
 
@@ -246,8 +319,32 @@ All map/unmap ops are ordinal-keyed at the session's `ordinal`, like `write_attr
   (deleter invoked when no longer needed).
 - **`index_map` and `mask` both set** — they're mutually exclusive; pick gather (`index_map`)
   or validity (`mask`), and set `count` when either is present.
-- **Wrong `tensor_count`** — fixed-size attributes require `tensor_count == 1` (prims stacked
-  along the leading dim); per-prim tensors are for array/ragged attributes.
+- **`count = 0` used to mean "no elements"** — it means *every prim the query covers*, so a
+  `count` computed as the length of an empty selection widens the write to the whole query
+  instead of skipping it. With `index_map`/`mask` set it is rejected
+  (`INVALID_ARGUMENT: count must be non-zero when index_map or mask is supplied`); the
+  Python binding rejects it in all three forms with a `ValueError`.
+- **`index_map` used to pick target prims** — it picks *source rows*. `index_map=[1]` on a
+  two-prim query does not write the second prim; it tells the first logical element to read
+  payload row 1. Use `mask` to select which prims are written.
+- **`INVALID_ARGUMENT: index_map references a source row outside the transported row count`**
+  — an entry is at or past the payload's row count. Check `shape[0]` (fixed) or
+  `tensor_count` (per-row array), and remember that omitting `count` alongside `index_map`
+  defaults it to the map's length in the Python binding, which narrows the write to the
+  query's leading prims.
+- **`INVALID_ARGUMENT: ... does not divide evenly across N source row(s) (from the highest
+  index_map entry)`** or **`... is not a whole number of ... elements`** — the packed-array
+  counterpart. There the map declares the partition, so a stray entry asks for a row count
+  the payload cannot be cut into. Both messages report the row count and where it came from;
+  compare it against the rows you meant to transport.
+- **`ValueError: index_map must hold one entry per logical element`** — `count` was raised
+  past `len(index_map)`. The runtime reads exactly `count` entries, so widening a write means
+  lengthening the map (or switching to `mask` to select target prims), not raising `count`.
+- **Wrong `tensor_count`** — fixed-size attributes require `tensor_count == 1` (transported
+  data rows are stacked along the leading dim); per-row tensors are for array/ragged attributes.
+- **Convenience input shape did not round-trip** — expected for fixed-size attributes. Inspect
+  the raw result as `shape = [data_rows]` with the complete tuple width in `dtype.lanes`;
+  use the canonical input form when the same descriptor must be reusable without normalization.
 - **Creating a mapped attribute fails** — a new column needs `desc.dtype`; a zero-initialized
   dtype only works when the existing schema is unambiguous. Changing an existing prim/name's
   dtype or semantic fails — delete the attribute first, then map/write the new schema.
@@ -266,7 +363,9 @@ surface and `error-handling` (Python) for the exception types.
 - **Write:** pass a NumPy array (or a list of them for array/ragged attributes) to
   `Stage.write_attribute` / `write_attributes`; `make_dltensor` wraps it in a CPU `DLTensor`
   (`DLDevice{kDLCPU, 0}`) aliasing the array's buffer. Keep the array alive until the op completes
-  — the returned `Operation` holds it for you until `.wait()`.
+  — the returned `Operation` holds it for you until `.wait()`. For fixed-size attributes, a
+  NumPy `(N, 3)` point array or `(N, 4, 4)` matrix array is a convenience write layout; the
+  raw result is normalized to `(N,)` with 3 or 16 lanes.
 - **Read / map:** `ReadGroup.array(i)` / `MapGroup.array(i)` return a zero-copy NumPy **view**
   (CPU), valid only until the group/result is released.
 
@@ -275,12 +374,24 @@ surface and `error-handling` (Python) for the exception types.
 - **Write (ingest):** pass any object exposing `__dlpack__` straight to `write_attribute` /
   `write_attributes` (or build one explicitly with `DLTensor.from_dlpack(obj, stream=...)`). The
   producer's buffer is aliased zero-copy, so a **CUDA device buffer is written without a host
-  round-trip**; the source object is retained on the `Operation` until `.wait()`.
+  round-trip**; the source object is retained on the `Operation` until `.wait()`. If a producer
+  exposes vector elements as a compact trailing component axis (for example Warp `vec3f` as
+  `(N, 3)`, `lanes=1`), `make_dltensor(obj, dtype=float3)` can explicitly fold complete trailing
+  axes into lanes without copying, where `float3` is a caller-created
+  `DLDataType(code=DLDataTypeCode.kDLFloat, bits=32, lanes=3)`. The fold requires byte-aligned
+  source elements, requires a positive bit width, preserves the base type and byte extent, and is
+  never inferred automatically, so array-valued `point3f[]` does not become ambiguous with scalar
+  arrays. If the fold consumes every source axis (for example `(3,)`, `lanes=1` to `float3`), the
+  adapter returns `shape=(1,)`, `ndim=1`. Explicit overrides for that view must match `shape=[1]`,
+  `ndim=1`, and compact `strides=[1]`.
 - **Read / map (export):** `ReadGroup.dlpack(i)` / `MapGroup.dlpack(i)` return a `ManagedDLTensor`
   implementing `__dlpack__` / `__dlpack_device__`, so `np.from_dlpack(group.dlpack(i))`,
   `wp.from_dlpack(...)`, `torch.from_dlpack(...)` consume it zero-copy (CPU **or** CUDA). A read
   group exports read-only; a writable map group exports writable (NumPy ≥ 2.1 honors the flag).
-  Borrowed lifetime: valid only until the group/result is released — copy it to outlive the read.
+  Each vector dtype is exported by adding exactly one trailing lane axis. Thus a canonical
+  fixed-size matrix tensor `shape = [N]`, `lanes = 16` exports as `(N, 16)`, not as the
+  convenience input shape `(N, 4, 4)`. Borrowed lifetime: valid only until the group/result is
+  released — copy it to outlive the read.
 
 GPU synchronization remains the caller's responsibility (record/await via `cuda_sync` per the
 residency model above; DLPack ingest does not synchronize your streams for you). See

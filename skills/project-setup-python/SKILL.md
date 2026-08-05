@@ -75,10 +75,9 @@ This skill has no scripts.
 ## Limitations
 
 - The referenced snippets remain the source of truth; update or add tested snippets before documenting new API usage.
-- **Consumption model:** ovstage is consumed as a **published `ovstage` wheel** (see Installing).
-  During early access the wheel is on an internal NVIDIA package index, not public PyPI —
-  public distribution is out of scope for now. The import + library-path mechanics here also cover
-  consuming a **local build**. For C/C++ setup, see
+- **Consumption model:** ovstage is consumed as a **published `ovstage` wheel** (see Installing),
+  distributed on public PyPI (`pip install ovstage` / `uv add ovstage`). The import + library-path
+  mechanics here also cover consuming a **local build**. For C/C++ setup, see
   `project-setup-c`.
 
 ## Overview

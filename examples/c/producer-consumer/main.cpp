@@ -187,8 +187,10 @@ static bool runProducerTick(const Example& ex, int tick)
 // [snippet:poll-write-floor]
 // The consumer's poll: ask for the GLOBAL write floor (attribute = zero token
 // + empty string), fetch the ordinal, release the ordinal-query handle. This
-// is the only coordination the consumer needs -- everything at or below the
-// floor is sealed, so reading up to it can never race an in-flight write.
+// is the producer's publish cursor -- everything at or below the floor is
+// sealed for range membership. Payload storage is latest-only, so a later
+// change to the same selected (attribute, path) can make the fixed-range read
+// return OUT_OF_RANGE.
 // Returns false on a failed op (already reported) so the caller decides the
 // policy; the handle is released either way.
 static bool fetchGlobalFloor(ovstage_instance_t* stage, ovstage_ordinal_t* outFloor)
@@ -243,12 +245,9 @@ static std::string sensorName(const Example& ex, const ovstage_prim_group_t& pri
 }
 
 // What one fetched change group yields, as-is: the covered prims resolved to
-// display names, plus the latest-committed value per prim for a value group;
-// a tombstone group (is_delete = true, no tensors) carries no values -- the
-// prims listed were deleted somewhere in the delta range. ordinal is the
-// column's latest write ordinal -- it can exceed the requested range end (here
-// the tombstone group reports ordinal 6 though the delete landed at 5; with a
-// concurrent producer it can even exceed the fetched floor).
+// display names, plus current values for a successful value group. A tombstone
+// group (is_delete = true, no tensors) carries no values -- the listed prims
+// were deleted somewhere in the delta range.
 struct DeltaGroup
 {
     ovstage_ordinal_t ordinal = 0;
@@ -261,8 +260,9 @@ struct DeltaGroup
 // fetched groups as-is in outGroups. The EXPLICIT-BEGIN range makes it a
 // delta ("what changed since startOrdinal - 1"); an open begin would be a
 // snapshot read. Each fetched group covers the prims that changed in the
-// range for one attribute; payloads are the LATEST-COMMITTED values, and the
-// value row for the local-th prim honors data.index_map when present.
+// range for one attribute. If a selected (attribute, path) changed again after
+// endOrdinal, the read returns OUT_OF_RANGE. The value row for the local-th
+// prim honors data.index_map when present.
 // Returns false on a failed op (already reported) so the caller decides the
 // policy; the group and read handles are released either way.
 static bool consumeDelta(const Example& ex, ovstage_ordinal_t startOrdinal, ovstage_ordinal_t endOrdinal,
@@ -270,7 +270,7 @@ static bool consumeDelta(const Example& ex, ovstage_ordinal_t startOrdinal, ovst
 {
     ovstage_ordinal_range_t delta{};
     delta.start_ordinal = startOrdinal; // explicit begin: only changes AT or AFTER startOrdinal
-    delta.end_ordinal = endOrdinal;     // never read past the fetched floor
+    delta.end_ordinal = endOrdinal;     // inclusive end of the selected changes
     delta.has_start_ordinal = true;
 
     ovstage_read_handle_t read = OVSTAGE_INVALID_READ_HANDLE;
@@ -374,14 +374,15 @@ static bool consumerCatchUp(const Example& ex, ovstage_ordinal_t* lastSeen)
 // Concurrent mode (--threads): producer and consumer run on the SAME instance
 // from two threads -- every ovstage_api slot is thread-safe when called on a
 // shared instance (see the Thread Safety section in ovstage_api.h). The
-// consumer only ever reads up to a floor it fetched, so it never observes a
-// half-written tick; what varies run to run is the batching (how many sealed
-// ticks each catch-up happens to see), which is why this mode's output is not
-// part of the expected-output block. Returns false on the expected race under
-// load: a producer write is rejected while it overlaps an outstanding
-// consumer read. A stalled floor would hang the consumer, so the producer
-// flags the failure and both roles shut down; a failed consumer catch-up
-// flags the same way, and the producer polls the flag between ticks.
+// consumer reads change membership only through a floor it fetched. A pending
+// overlapping write makes the read fail with OP_FAILED. Once committed, a later
+// change to the same selected (attribute, path) after the requested end makes
+// the read fail with OUT_OF_RANGE whether or not that later change is sealed. A
+// selected in-range unsealed change instead reports WRITE_FLOOR_VIOLATION. When
+// no overlap rejection occurs, only the batching varies, which is why this
+// mode's output is not part of the expected-output block. This demo treats any
+// race failure as terminal: a stalled floor would hang the consumer, so either
+// role flags the failure and both shut down.
 static bool runThreaded(const Example& ex)
 {
     std::atomic<bool> failed{ false };

@@ -14,8 +14,15 @@ Reading Attributes
 ``read_attributes`` requests one or more attribute columns over a
 :doc:`query </scene/queries>` and returns the results as **groups** you fetch and
 then release. Reads target sealed data at or below the write floor, so advance
-the floor after writing (refer to :doc:`writing_attributes`) before reading the data
-back.
+the floor after writing (refer to :doc:`writing_attributes`) before reading the
+data back. The effective floor starts at 0. The floor is compared against the
+state a read would serve, never against the requested end ordinal: a snapshot
+read whose current recorded state sits above the floor, or an explicit range
+selecting an unsealed in-range change, fails with
+``OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION``, including before the first floor
+advance. Lowering the requested end ordinal does not avoid this; advancing the
+floor does. An empty explicit range and a missing recorded attribute still
+return no groups, while derived built-ins are not floor-gated.
 
 Read → Fetch → Release
 ----------------------
@@ -57,6 +64,18 @@ Groups and Lifetime
 A group's tensor data is a borrowed view into the latest committed snapshot.
 Copy it if you need it after the next commit (refer to :doc:`/concepts/dlpack_tensors`).
 
+Fixed-Size Result Shape
+-----------------------
+
+A raw fixed-size read group is lane-canonical: its single tensor has
+``ndim == 1``, ``shape == (N,)``, and the full tuple width in ``dtype.lanes``.
+``N`` is the transported data-row count and may differ from ``data.count``
+(the logical prim count): it can be smaller when ``data.index_map`` shares
+rows, or larger when a query touches only part of a transported bucket. A
+convenience write shape is not reconstructed; for example, a matrix written as
+``(N, 4, 4)`` is read as ``(N,)`` with 16 lanes. Python DLPack export presents
+that as ``(N, 16)``.
+
 Reading Built-in Metadata
 -------------------------
 
@@ -89,8 +108,12 @@ with ``NOT_SUPPORTED``.
 
 .. note::
 
-   This build retains only the **latest committed** state, so reads return the
-   latest sealed value. Do not design flows that read back older ordinals.
+   This build retains only the **latest committed** payload. An explicit
+   ``[start, end]`` range first selects keys changed in that interval. If a
+   selected key also has a retained change after ``end``, the read returns
+   ``OVSTAGE_ERROR_OUT_OF_RANGE`` because the payload for that fixed range is no
+   longer available. Widen/rebase the range or request current state; advancing
+   the floor alone does not resolve this error.
 
 Where to Go Next
 ----------------

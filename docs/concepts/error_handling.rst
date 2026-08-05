@@ -44,7 +44,7 @@ Status Codes
      - In INSERT (create-only) mode, a prim already exists at the target path. (A missing item is ``OVSTAGE_ERROR_NOT_FOUND`` above.)
    * - ``OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION``
      - 5
-     - A write/apply targeted an ordinal at or below the write floor.
+     - A write/apply targeted an ordinal at or below the floor, or a read would serve state above it: the current recorded state for a snapshot read, or a selected in-range change for an explicit range. The requested end ordinal is not itself compared with the floor.
    * - ``OVSTAGE_ERROR_NOT_SUPPORTED``
      - 6
      - The operation is not supported by this build.
@@ -66,6 +66,9 @@ Status Codes
    * - ``OVSTAGE_ERROR_OP_FAILED``
      - 12
      - The op executed but failed.
+   * - ``OVSTAGE_ERROR_OUT_OF_RANGE``
+     - 13
+     - A fixed range selected a key whose retained same-key successor cannot be represented by latest-only storage.
    * - ``OVSTAGE_ERROR_INTERNAL``
      - 99
      - An internal error occurred.

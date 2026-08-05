@@ -1,3 +1,12 @@
+/* Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ *
+ * NVIDIA CORPORATION and its licensors retain all intellectual property
+ * and proprietary rights in and to this software, related documentation
+ * and any modifications thereto.  Any use, reproduction, disclosure or
+ * distribution of this software and related documentation without an express
+ * license agreement from NVIDIA CORPORATION is strictly prohibited.
+ */
+
 /**
  * @file ovstage.h
  * @brief OVStage instance lifecycle — creation and destruction of the
@@ -15,7 +24,7 @@
  * call the generic `ovstage_*` wrappers declared in `ovstage_api.h` and the
  * backend-specific entry points declared here to drive it.
  *
- * @version 0.1.0
+ * @version 0.1.1
  * @date 2026-05-27
  */
 
@@ -52,18 +61,17 @@ extern "C" {
  * create_instance.
  *
  * @param config Optional process configuration (see ovstage_config_t / the
- *               entry builders in ovstage_config.h). Only the static loader
- *               (ovstage-static) consumes any keys today —
- *               OVSTAGE_CONFIG_BINARY_PACKAGE_ROOT_PATH, which tells it where to
- *               load the ovstage shared library from and MUST be supplied here,
- *               before any other ovstage_* call, when a non-default root is
- *               needed. The path may include OVX_CONFIG_EXECUTABLE_DIR_TOKEN
- *               ("${executable_dir}"), which the loader substitutes with the
- *               absolute directory of the running executable. The ovstage shared
- *               library's own ovstage_initialize ignores config, so pass NULL
- *               (or entry_count == 0) when linking it directly. Passing loader
- *               keys is harmless in either build.
- * @return OVSTAGE_OK on success.
+ *               entry builders in ovstage_config.h).
+ *               OVSTAGE_CONFIG_BINARY_PACKAGE_ROOT_PATH is consumed by the
+ *               static loader and must be supplied before any other ovstage_*
+ *               call when a non-default root is needed.
+ *               OVSTAGE_CONFIG_RUNTIME_DEFAULT_HIERARCHY_COMPUTATION_MODEL is
+ *               consumed by the runtime and controls automatic hierarchy
+ *               updates and the RUNTIME_DEFAULT selector for new instances.
+ *               A runtime setting supplied after a process reference already
+ *               exists must match the active setting.
+ * @return OVSTAGE_OK on success; OVSTAGE_ERROR_INVALID_ARGUMENT for malformed,
+ *         duplicate, unknown, or conflicting runtime configuration.
  * @post Balance every successful call with one ovstage_shutdown().
  */
 ovstage_api_status_t ovstage_initialize(const ovstage_config_t* config);
@@ -205,14 +213,13 @@ ovstage_api_status_t ovstage_get_usd_stage_id(
  * `ovstage_enqueue_result_t` (status + `op_index`); await completion through the vtable
  * `wait_op` (and release it with `release_op`) like any other data-plane operation.
  *
- * Relationship targets are cloned: relationship attributes (e.g. `material:binding`,
- * `skel:skeleton`) are copied verbatim alongside value attributes, so a clone's
- * relationships resolve correctly when their targets are outside the cloned subtree
- * (the common case — bindings to a shared materials scope). Targets that point inside
- * the cloned subtree are copied verbatim and not retargeted to the clone's own copies
- * (matches `ovrtx_clone_usd`). Only value attributes are change-tracked, so
- * relationship changes — and connectivity changes such as the source/target parents'
- * child lists — are not ordinal-change-tracked.
+ * Path-bearing values that target the source subtree are rebased to the corresponding
+ * target subtree. This includes relationship targets (e.g. `material:binding`,
+ * `skel:skeleton`), scalar/array path values, and USD attribute connections.
+ * Paths outside the source subtree are copied unchanged, so clones can continue to
+ * reference shared materials and other shared resources. Cloned attribute values,
+ * including relationship targets and attribute connections, are ordinal-change-tracked.
+ * Scene hierarchy changes, such as the source/target parents' child lists, are not.
  *
  * @param instance         The ovstage instance.
  * @param source_path      Path to the source subtree to clone.
@@ -305,8 +312,9 @@ ovstage_enqueue_result_t ovstage_release_hierarchy(
  * @brief Return the hierarchy computation models supported by this backend.
  *
  * The descriptor array lists the ovstage_hierarchy_computation_model_id_t
- * enum values supported by this instance. Names and descriptions are
- * implementation-owned and valid for the lifetime of the instance.
+ * concrete values and selectors supported by this instance. Names and
+ * descriptions are implementation-owned and valid for the lifetime of the
+ * instance.
  *
  * @param instance The ovstage instance.
  * @param[out] out_models Receives the implementation-owned descriptor array.
@@ -329,9 +337,9 @@ ovstage_api_status_t ovstage_get_hierarchy_computation_models(
  * assigned to hierarchy-derived results.
  *
  * @param instance The ovstage instance.
- * @param computation_model_id Public model enum value, typically one of the
- *        OVSTAGE_HIERARCHY_COMPUTATION_MODEL_DEFAULT_* aliases or a concrete
- *        model returned by ovstage_get_hierarchy_computation_models.
+ * @param computation_model_id Public model enum value: a concrete model, a
+ *        DEFAULT_* alias, or RUNTIME_DEFAULT to use the process default
+ *        captured when the instance was created.
  * @param input_ordinal Ordinal of hierarchy inputs to compute from.
  * @param output_ordinal Ordinal assigned to hierarchy-derived outputs.
  * @return Enqueue result with status + op_index. Per-op execution failures are

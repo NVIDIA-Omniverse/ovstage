@@ -16,7 +16,8 @@
 #   cmake --build build --config Release
 #   ctest --test-dir build --output-on-failure
 #
-# run_tests.sh does this for you (and sets the runtime loader path). CPU-only.
+# When running, point the shared-library loader path at the package's bin/ (ctest
+# loads the ovstage runtime library). CPU-only.
 
 cmake_minimum_required(VERSION 3.18)
 project(ovstage_public_tests_c CXX)
@@ -27,7 +28,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 find_package(ovstage REQUIRED)
 
-# Fetch GoogleTest (parity with rendering/ovrtx/public/tests/docs/c).
+# Fetch GoogleTest for the C test suite.
 include(FetchContent)
 FetchContent_Declare(
     googletest

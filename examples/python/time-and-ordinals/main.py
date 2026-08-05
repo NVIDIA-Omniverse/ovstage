@@ -109,10 +109,10 @@ def main() -> int:
                                         domains=PopulationDomain.ALL)
 
         # [snippet:float3-attribute-write]
-        # One float3 per prim travels as a single tensor of dtype lanes=3 /
-        # shape=[prim count], not a 2-D [3][3] of lanes=1. The semantic stamps
-        # the authored USD interpretation on the column: POINT for positions,
-        # VECTOR for velocities. UPSERT creates the prims on first write.
+        # This example uses the canonical float3 transport form: one tensor
+        # with dtype lanes=3 / shape=[prim count]. A [prim count, 3] lanes=1
+        # copy-in is also accepted but normalizes to this raw form. The semantic
+        # stamps POINT for positions and VECTOR for velocities.
         stage.write_attribute(sphere_query, position, ordinal=1, tensors=_float3_tensor(START),
                               is_array=False, semantic=AttributeSemantic.POINT).wait()
         stage.write_attribute(sphere_query, velocity, ordinal=1, tensors=_float3_tensor(VELOCITY),

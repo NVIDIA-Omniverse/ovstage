@@ -99,6 +99,21 @@ for _name in getattr(_ovstage, "__all__", []):
     if isinstance(_obj, type) and getattr(_obj, "__module__", "").startswith("ovstage._src"):
         _obj.__module__ = "ovstage"
 
+# The public submodules ``ovstage.population`` and ``ovstage.instancing`` are
+# documented via ``.. automodule::`` and expose classes (e.g. ``Operation``) that
+# are also defined under ``ovstage._src.*``. The loop above only covers the
+# top-level ``ovstage.__all__``, so rebind each submodule's own ``__all__`` classes
+# to the public submodule path too, otherwise objects.inv leaks e.g.
+# ``ovstage._src.population.Operation``.
+for _subname in ("population", "instancing"):
+    _sub = getattr(_ovstage, _subname, None)
+    if _sub is None:
+        continue
+    for _name in getattr(_sub, "__all__", ()):
+        _obj = getattr(_sub, _name, None)
+        if isinstance(_obj, type) and getattr(_obj, "__module__", "").startswith("ovstage._src"):
+            _obj.__module__ = f"ovstage.{_subname}"
+
 # -- Options for Napoleon (Google/NumPy docstrings) --------------------------
 napoleon_google_docstring = True
 napoleon_numpy_docstring = True

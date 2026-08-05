@@ -83,11 +83,6 @@ is what works today):
 > information; any read or predicate naming it is rejected with
 > `NOT_SUPPORTED`. Subject to removal in a future release.
 
-> **`usd-active` is not supported.** It appears in the header contract for
-> stability, but a live prim is always active, so the attribute carries no
-> information; any read or predicate naming it is rejected with
-> `NOT_SUPPORTED`. Subject to removal in a future release.
-
 ## Build and run
 
 The example builds standalone with CMake: `find_package(ovstage)` locates an

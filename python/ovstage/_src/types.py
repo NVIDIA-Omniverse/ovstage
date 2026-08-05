@@ -21,6 +21,7 @@ from enum import IntEnum, IntFlag
 from typing import Any, List, Optional, Sequence, Tuple, Union
 
 from . import bindings as _b
+from .bindings import check_timeout  # defined there to avoid an import cycle with flush_log
 from .dlpack import DLTensor, ManagedDLTensor, dltensor_to_numpy
 
 __all__ = [
@@ -33,6 +34,7 @@ __all__ = [
     "AttributeSemantic",
     "HierarchyRelation",
     "HierarchyComputationModel",
+    "StageConfig",
     "OrdinalRange",
     "Predicate",
     "Filter",
@@ -84,6 +86,7 @@ class ErrorCode(IntEnum):
     LAYOUT_CHANGED = _b.OVSTAGE_ERROR_LAYOUT_CHANGED
     TIMEOUT = _b.OVSTAGE_ERROR_TIMEOUT
     OP_FAILED = _b.OVSTAGE_ERROR_OP_FAILED
+    OUT_OF_RANGE = _b.OVSTAGE_ERROR_OUT_OF_RANGE
     INTERNAL = _b.OVSTAGE_ERROR_INTERNAL
 
 
@@ -215,8 +218,29 @@ class HierarchyComputationModel(IntEnum):
     CPU_INCREMENTAL = _b.OVSTAGE_HIERARCHY_COMPUTATION_MODEL_CPU_INCREMENTAL
     GPU_INCREMENTAL = _b.OVSTAGE_HIERARCHY_COMPUTATION_MODEL_GPU_INCREMENTAL
     GPU_GLOBAL = _b.OVSTAGE_HIERARCHY_COMPUTATION_MODEL_GPU_GLOBAL
+    RUNTIME_DEFAULT = _b.OVSTAGE_HIERARCHY_COMPUTATION_MODEL_RUNTIME_DEFAULT
     DEFAULT_CPU = _b.OVSTAGE_HIERARCHY_COMPUTATION_MODEL_DEFAULT_CPU
     DEFAULT_GPU = _b.OVSTAGE_HIERARCHY_COMPUTATION_MODEL_DEFAULT_GPU
+
+
+@dataclass
+class StageConfig:
+    """Process configuration applied when creating a :class:`~ovstage.Stage`.
+
+    The configuration is process-scoped. Configured stages may coexist when
+    their concrete settings match; creating a stage with a conflicting setting
+    while another stage is live raises :class:`OvstageError`.
+    """
+
+    runtime_default_hierarchy_computation_model: Optional[HierarchyComputationModel] = None
+    """Model used for automatic transform updates and manual
+    :attr:`HierarchyComputationModel.RUNTIME_DEFAULT` computations.
+
+    ``None`` and :attr:`HierarchyComputationModel.RUNTIME_DEFAULT` do not
+    override the active process default. A fresh process defaults to
+    :attr:`HierarchyComputationModel.CPU_INCREMENTAL`; ``RUNTIME_DEFAULT`` is
+    sent as an entry that the native runtime intentionally ignores.
+    """
 
 
 @dataclass
@@ -271,7 +295,9 @@ class WriteDesc:
     kind; it is never inferred from ``tensors``. ``tensors`` accepts the same
     numpy/DLTensor forms as :meth:`Stage.write_attribute`. Sparsity and CUDA
     synchronization are write-local, as is ``semantic``; the ordinal and
-    prim mode are shared by the batch.
+    prim mode are shared by the batch. Fixed-size convenience shapes are
+    normalized to one source-data-row dimension with the tuple width in
+    ``dtype.lanes``; their trailing dimensions are not preserved.
     """
 
     attribute: Union[int, str]
@@ -289,8 +315,13 @@ class WriteDesc:
 class OrdinalRange:
     """Ordinal range for reads.
 
-    - ``OrdinalRange.latest(N)`` → most recent value with ordinal <= N.
-    - ``OrdinalRange.between(start, end)`` → all changes in [start, end].
+    - ``OrdinalRange.latest(N)`` → latest snapshot request; recorded columns
+      return current committed payload rather than historical payload <= N.
+    - ``OrdinalRange.between(start, end)`` → select the keys that changed
+      in inclusive [start, end]. An unsealed selected change raises
+      ``WRITE_FLOOR_VIOLATION``. If a selected key also changed after ``end``,
+      latest-only storage raises ``OUT_OF_RANGE`` because the payload for that
+      fixed range is no longer available.
     """
 
     end_ordinal: int
@@ -397,12 +428,21 @@ class Operation:
         self.op_id = int(op_id)
         self._keepalive = keepalive  # holds input buffers alive until waited
         self._consumed = False
+        # A rejected enqueue records its detail in the thread-local last-error
+        # slot, which the next enqueue on this thread clears. Reading it lazily
+        # at wait() time can therefore return a later operation's message, or
+        # nothing at all. The enqueue has only just returned, so capture it now.
+        self._enqueue_error = (
+            self._stage._last_op_error(self.op_id) if self.status != _b.OVSTAGE_OK else None
+        )
 
     @property
     def ok(self) -> bool:
         return self.status == _b.OVSTAGE_OK
 
     def error_message(self) -> str:
+        if self._enqueue_error is not None:
+            return self._enqueue_error
         return self._stage._last_op_error(self.op_id)
 
     def wait(self, timeout: int = TIMEOUT_INFINITE) -> None:
@@ -410,7 +450,15 @@ class Operation:
 
         Mirrors the C++ ``waitOk`` helper: if the enqueue was rejected, or the
         op or its dependencies failed, raises :class:`OvstageError`.
+
+        :param timeout: max nanoseconds to wait; ``TIMEOUT_INFINITE`` (default)
+            blocks, ``0`` polls.
+        :raises TypeError: if ``timeout`` is not an integer (e.g. ``None``).
+        :raises ValueError: if ``timeout`` is negative or does not fit in uint64.
         """
+        # Validate before the try: a rejected timeout must not consume the op
+        # or drop the keepalives of inputs the pending op may still read.
+        timeout = check_timeout(timeout)
         try:
             if self.status != _b.OVSTAGE_OK:
                 raise OvstageError(self.status, self.error_message())
@@ -502,14 +550,24 @@ class _GroupBase:
         return int(local)
 
     def tensor(self, index: int) -> DLTensor:
-        """Raw :class:`DLTensor` at ``index`` (for shape/dtype/device checks)."""
+        """Raw :class:`DLTensor` at ``index`` (for shape/dtype/device checks).
+
+        A fixed-size read/map tensor is lane-canonical: ``ndim=1``, the leading
+        dimension is the transported data-row count, and ``dtype.lanes`` is the
+        complete tuple width. Use :meth:`data_row_index` to resolve a logical
+        group element through any data index map. Convenience write dimensions
+        are not reconstructed.
+        """
         count = int(self.raw.data.tensor_count)
         if not 0 <= index < count:
             raise IndexError(f"tensor index {index} out of range [0, {count})")
         return self.raw.data.tensors[index]
 
     def array(self, index: int):
-        """Zero-copy flat numpy view of tensor ``index`` (CPU only)."""
+        """Zero-copy flat numpy view of tensor ``index`` (CPU only).
+
+        Tuple lanes are folded into this one-dimensional base-element view.
+        """
         return dltensor_to_numpy(self.tensor(index))
 
     def dlpack(self, index: int, *, readonly: bool = True) -> ManagedDLTensor:
@@ -518,8 +576,14 @@ class _GroupBase:
 
         Unlike :meth:`array` (CPU-only numpy), this also works for CUDA-resident
         tensors. The data is borrowed from ovstage and valid only until the owning
-        group/result is released — copy it if it must outlive the read. The group
-        is retained for the lifetime of the returned view.
+        group/result is released — copy it if it must outlive the read. The returned
+        :class:`~ovstage.ManagedDLTensor` retains the group, but a consumer view does
+        not. A direct ``np.from_dlpack(group.dlpack(i))`` remains valid while the
+        owning read/map operation is alive; custom producers whose manager context
+        owns the backing allocation have stricter lifetime requirements (see
+        :class:`~ovstage.ManagedDLTensor`). A multi-lane raw dtype
+        exports with exactly one trailing lane axis, so a fixed matrix is
+        ``(N, 16)``, not ``(N, 4, 4)``.
         """
         return ManagedDLTensor(self.tensor(index), manager_ctx=self, deleter_callback=None, readonly=readonly)
 

@@ -16,7 +16,8 @@ high-performance data substrate for OV Libraries spanning physics, rendering, se
 animation, and graph. It provides a unified **C API** for reading, writing, querying, and
 managing simulation data such as transforms, velocities, materials, hierarchy, and
 metadata across CPU and GPU memory, with zero-copy data paths and DLPack tensor
-interchange.
+interchange. Currently, zero-copy applies to CUDA source-tensor writes; payload reads
+and map/unmap buffers are CPU-resident.
 
 In this documentation you will find getting started guides for C and Python, API
 references, and example projects.
@@ -27,8 +28,7 @@ references, and example projects.
 .. note::
 
    ovstage is currently **pre-release** software. The API, runtime behavior, and
-   packaging can change. Standalone public packages, prebuilt binaries, and Python
-   wheels are still in progress.
+   packaging can change before GA.
 
 Execution Model
 ---------------

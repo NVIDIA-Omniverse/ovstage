@@ -28,17 +28,19 @@ from .types import (
     HierarchyComputationModelDesc,
     HierarchyItem,
     HierarchyResult,
+    MapGroup,
     Operation,
     OrdinalRange,
     OvstageError,
     PrimMode,
     QueryResult,
     ReadGroup,
-    MapGroup,
     Scope,
+    StageConfig,
     TIMEOUT_INFINITE,
     WriteDesc,
     check_ordinal,
+    check_timeout,
 )
 
 __all__ = ["Stage", "Query", "Read", "Map", "OrdinalQuery", "Hierarchy"]
@@ -54,9 +56,19 @@ def _handle(value) -> int:
 
 
 class Stage:
-    """An ovstage instance: the unit of stage-data read/write/query."""
+    """An ovstage instance: the unit of stage-data read/write/query.
 
-    def __init__(self, name: Optional[str] = None):
+    Args:
+        name: Optional instance name used for diagnostics.
+        config: Optional process configuration. Its runtime-default hierarchy
+            model is captured by this instance and controls automatic transform
+            updates.
+    """
+
+    def __init__(self, name: Optional[str] = None, config: Optional[StageConfig] = None):
+        if config is not None and not isinstance(config, StageConfig):
+            raise TypeError(f"config must be a StageConfig or None, got {type(config).__name__}")
+
         self._lib = _b.load()
         # Data-plane calls dispatch through the instance vtable; _api forwards
         # instance->context to the resolved slot. Flat symbols (create/destroy,
@@ -64,27 +76,72 @@ class Stage:
         # on self._lib.
         self._api = _b.instance_api(self._lib, self._invalid_instance_error)
         self._inst = _b.ovstage_instance_p()
-        desc = _b.ovstage_instance_desc_t()
+        self._holds_process_ref = False
         self._name_bytes = name.encode("utf-8") if name is not None else None
+        desc = _b.ovstage_instance_desc_t()
         desc.name = self._name_bytes
+
+        if config is not None:
+            native_config = self._to_c_config(config)
+            code = self._lib.ovstage_initialize(ctypes.byref(native_config))
+            if code != _b.OVSTAGE_OK:
+                raise OvstageError(code, self._last_error())
+            self._holds_process_ref = True
+
         code = self._lib.ovstage_create_instance(ctypes.byref(desc), ctypes.byref(self._inst))
         if code != _b.OVSTAGE_OK:
-            raise OvstageError(code, self._last_error())
+            message = self._last_error()
+            if self._holds_process_ref:
+                self._lib.ovstage_shutdown()
+                self._holds_process_ref = False
+            raise OvstageError(code, message)
 
     # ── lifecycle ──────────────────────────────────────────────────────────
+    @staticmethod
+    def _to_c_config(config: StageConfig) -> _b.ovstage_config_t:
+        entries = []
+        model = config.runtime_default_hierarchy_computation_model
+        if model is not None:
+            try:
+                model = HierarchyComputationModel(model)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    "runtime_default_hierarchy_computation_model must be a "
+                    f"HierarchyComputationModel, got {model!r}"
+                ) from None
+            if model == HierarchyComputationModel.INVALID:
+                raise ValueError(
+                    "runtime_default_hierarchy_computation_model must be CPU_INCREMENTAL, "
+                    "GPU_INCREMENTAL, GPU_GLOBAL, or RUNTIME_DEFAULT"
+                )
+            entries.append(
+                _b.ovstage_config_entry_uint64(
+                    _b.OVSTAGE_CONFIG_RUNTIME_DEFAULT_HIERARCHY_COMPUTATION_MODEL,
+                    int(model),
+                )
+            )
+        return _b.ovstage_config_t(entries)
+
     @staticmethod
     def get_version() -> tuple:
         _b.load()
         return _b.library_version()
 
     def destroy(self) -> None:
-        if not self._inst:
-            return
-        # ovstage_population's per-stage state (including any held USD-runtime
-        # reference) is released automatically by ovstage_destroy_instance —
-        # no manual detach is required (see ovstage_population.h lifecycle).
-        self._lib.ovstage_destroy_instance(self._inst)
-        self._inst = _b.ovstage_instance_p()
+        if self._inst:
+            # ovstage_population's per-stage state (including any held USD-runtime
+            # reference) is released automatically by ovstage_destroy_instance —
+            # no manual detach is required (see ovstage_population.h lifecycle).
+            code = self._lib.ovstage_destroy_instance(self._inst)
+            if code != _b.OVSTAGE_OK:
+                raise OvstageError(code, self._last_error())
+            self._inst = _b.ovstage_instance_p()
+
+        if self._holds_process_ref:
+            code = self._lib.ovstage_shutdown()
+            self._holds_process_ref = False
+            if code != _b.OVSTAGE_OK:
+                raise OvstageError(code, self._last_error())
 
     def __enter__(self) -> "Stage":
         return self
@@ -158,7 +215,7 @@ class Stage:
     def wait_op_raw(self, op_id: int, timeout: int = TIMEOUT_INFINITE) -> int:
         """Wait without raising or releasing; returns the raw ``ovstage_api_status_t``."""
         wait = _b.ovstage_op_wait_result_t()
-        return int(self._api.ovstage_wait_op(self._inst, op_id, timeout, ctypes.byref(wait)))
+        return int(self._api.ovstage_wait_op(self._inst, op_id, check_timeout(timeout), ctypes.byref(wait)))
 
     def wait_op(self, op_id: int, timeout: int = TIMEOUT_INFINITE):
         """Low-level wait: returns ``(code, error_op_ids, lowest_pending_op_id)``.
@@ -168,7 +225,7 @@ class Stage:
         ``error_op_ids``).
         """
         wait = _b.ovstage_op_wait_result_t()
-        code = int(self._api.ovstage_wait_op(self._inst, op_id, timeout, ctypes.byref(wait)))
+        code = int(self._api.ovstage_wait_op(self._inst, op_id, check_timeout(timeout), ctypes.byref(wait)))
         error_op_ids = (
             [int(wait.error_op_ids[i]) for i in range(int(wait.error_op_id_count))]
             if wait.error_op_ids
@@ -214,7 +271,9 @@ class Stage:
     def fetch_query_result(self, query, timeout: int = TIMEOUT_INFINITE) -> QueryResult:
         """Fetch (and release) a query result, copying out its scalar summary."""
         res = _b.ovstage_query_result_t()
-        self._check(self._api.ovstage_fetch_query_result(self._inst, _handle(query), timeout, ctypes.byref(res)))
+        self._check(
+            self._api.ovstage_fetch_query_result(self._inst, _handle(query), check_timeout(timeout), ctypes.byref(res))
+        )
         attributes = [int(res.attributes[i]) for i in range(int(res.attribute_count))]
         out = QueryResult(
             attributes=attributes,
@@ -251,7 +310,7 @@ class Stage:
     def fetch_read_next(self, read, timeout: int = TIMEOUT_INFINITE) -> Optional[ReadGroup]:
         """Fetch the next read group, or ``None`` at end of iteration."""
         grp = _b.ovstage_read_group_t()
-        code = self._api.ovstage_fetch_read_next(self._inst, _handle(read), timeout, ctypes.byref(grp))
+        code = self._api.ovstage_fetch_read_next(self._inst, _handle(read), check_timeout(timeout), ctypes.byref(grp))
         if code == _b.OVSTAGE_ERROR_END_OF_ITERATION:
             return None
         if code != _b.OVSTAGE_OK:
@@ -282,6 +341,11 @@ class Stage:
             raise TypeError("is_array must be a bool")
         if index_map is not None and mask is not None:
             raise ValueError("index_map and mask are mutually exclusive; pass at most one")
+        # wd.count is a uint32, so a negative wraps to a value near 2^32 and is
+        # reported back as a count that exceeds the query -- naming neither the
+        # sign nor the argument that carried it.
+        if count is not None and count < 0:
+            raise ValueError(f"count must not be negative; got {count}")
         keep: list = []
         items = tensors if isinstance(tensors, (list, tuple)) else [tensors]
         if not items:
@@ -298,16 +362,65 @@ class Stage:
         wd.tensor_count = len(dl_tensors)
         wd.is_array = is_array
         if index_map is not None:
+            # The runtime reads exactly `count` entries from index_map -- one
+            # source row per logical element -- so a count wider than the map
+            # would read past the buffer this binding owns. Only Python knows
+            # the map's length, so the bound has to be enforced here.
+            resolved_count = len(index_map) if count is None else count
+            if resolved_count == 0:
+                # 0 is the C contract's "every prim the query covers", which
+                # cannot be what a map means: the runtime would leave it unread
+                # and write the whole query. It rejects the pair, so fail here
+                # while the empty argument that produced it is still visible.
+                raise ValueError(
+                    "index_map requires a non-zero count; an empty index_map (or count=0) addresses "
+                    "no logical elements. Omit index_map to write every prim the query covers"
+                )
+            if resolved_count > len(index_map):
+                raise ValueError(
+                    f"index_map must hold one entry per logical element: count={resolved_count} "
+                    f"exceeds len(index_map)={len(index_map)}. To address more of the query, "
+                    "lengthen index_map (or use mask to select target prims)"
+                )
             im = (ctypes.c_uint32 * len(index_map))(*[int(x) for x in index_map])
             keep.append(im)
             wd.index_map = ctypes.cast(im, ctypes.POINTER(ctypes.c_uint32))
-            wd.count = count if count is not None else len(index_map)
+            wd.count = resolved_count
         elif mask is not None:
+            # The C contract requires a non-zero count whenever mask is set, and
+            # the mask words cannot imply one: they are a bitset whose length is
+            # a word count, not an element count. Defaulting to 0 here would
+            # build a payload the runtime rejects with no way for the caller to
+            # see why, so ask for the count instead.
+            if count is None:
+                raise ValueError(
+                    "mask requires an explicit count (the number of logical elements the mask indexes)"
+                )
+            if count == 0:
+                raise ValueError(
+                    "mask requires a non-zero count; count=0 is the contract's 'every prim the query "
+                    "covers', which would leave the mask unread"
+                )
+            # The runtime tests one bit per logical element, reading
+            # ceil(count / 64) words, so a short mask reads past the buffer.
+            if count > len(mask) * 64:
+                raise ValueError(
+                    f"mask must hold at least {(count + 63) // 64} 64-bit word(s) to index "
+                    f"{count} logical element(s); got {len(mask)}"
+                )
             mk = (ctypes.c_uint64 * len(mask))(*[int(x) for x in mask])
             keep.append(mk)
             wd.mask = ctypes.cast(mk, ctypes.POINTER(ctypes.c_uint64))
-            wd.count = count if count is not None else 0
+            wd.count = count
         elif count is not None:
+            if count == 0:
+                # The one count that silently does something else: 0 is the C
+                # sentinel for the full query, so a caller passing len() of an
+                # empty selection would write every prim instead of none.
+                raise ValueError(
+                    "count=0 does not address zero elements: it is the contract's 'every prim the "
+                    "query covers'. Omit count to write the whole query"
+                )
             wd.count = count
         # Populate {stream, wait_event}; unset fields stay 0 (no sync) — no
         # implicit default-stream pinning.
@@ -343,10 +456,54 @@ class Stage:
         attributes). Caller-owned tensors are kept alive on the returned
         :class:`Operation` until ``wait()``.
 
+        Fixed-size writes (``is_array=False``) are normalized to the raw API's
+        lane-canonical layout: reads and maps return ``ndim=1``, a leading
+        dimension equal to the transported data-row count, and the complete
+        per-row tuple width in ``dtype.lanes``. Logical prims select those rows
+        directly or through the group's data index map. Compact convenience
+        inputs such as a point array shaped ``(N, 3)`` or a matrix array shaped
+        ``(N, 4, 4)`` are accepted, but their trailing shape is folded and not
+        preserved. Without an index map, the leading dimension must equal the
+        logical element count; a flat ``(N * L,)`` array is not inferred as
+        ``N`` rows of width ``L``. This normalization does not describe
+        array/ragged attributes.
+
+        Array element types are never inferred from tensor shape. If a
+        non-NumPy DLPack producer exposes a vector element as a trailing component
+        axis (for example Warp ``vec3f`` as ``(N, 3)``, ``lanes=1``), first call
+        :func:`make_dltensor` with the explicit lane dtype. That helper permits
+        only a validated, compact trailing-axis fold, so ``point3f[]`` can remain
+        zero-copy without ambiguously reinterpreting scalar arrays.
+
         Reserved metadata uses the same contract: ``usd-prim-type`` requires
         ``is_array=False`` and ``usd-schemas`` requires ``is_array=True``.
         Neither attribute is implicitly broadcast; use ``index_map`` when
         target rows intentionally share source data.
+
+        ``count`` is the number of logical elements the write addresses — the
+        leading ``count`` prims of the query, in query order. With neither
+        ``index_map`` nor ``mask`` it defaults to the query's prim count. When
+        given it must be positive: ``0`` is the C contract's spelling of "the
+        whole query", so passing it — including as ``len()`` of an empty
+        selection — raises ``ValueError`` rather than writing nothing.
+        ``index_map`` and ``mask`` are mutually exclusive and both refine that
+        logical element axis:
+
+        * ``index_map[i]`` is the **source row** logical element ``i`` reads from,
+          not the prim being written. Use it to gather, reorder, or broadcast
+          rows (``index_map=[0, 0]`` writes one source row to two prims). Every
+          entry must be less than the transported row count, which for a
+          fixed-size write is ``shape[0]``. The map holds one entry per logical
+          element, so ``count`` defaults to ``len(index_map)`` and may not
+          exceed it — to address more of the query, lengthen the map rather than
+          raising ``count``.
+        * ``mask`` is a bitmask over the same logical element axis selecting
+          which prims are written; unselected prims are left untouched. It has
+          no default ``count``: supply one, along with enough 64-bit words to
+          cover it (``ceil(count / 64)``).
+
+        To write a subset of a query's prims, use ``mask``; ``index_map`` selects
+        source data, not targets.
 
         ``semantic`` is the :class:`AttributeSemantic` (or raw
         ``ovstage_attribute_semantic_t`` value) carried on the write. Geometric
@@ -381,6 +538,8 @@ class Stage:
 
         Every write is validated before the operation is queued. The
         returned operation owns all ctypes/tensor keepalives until ``wait()``.
+        Each fixed-size entry follows the same lane-canonical normalization as
+        :meth:`write_attribute`.
         """
         items = list(writes)
         keep: list = []
@@ -579,6 +738,11 @@ class Stage:
         ``dtype`` is the element storage type used only when the column does not
         yet exist (the full per-element tuple width must be encoded in
         ``dtype.lanes``); it is ignored when the attribute already has a type.
+        Fixed-size map groups expose the same lane-canonical layout as raw
+        reads: ``ndim=1``, ``shape=(data_rows,)``, and the complete tuple width
+        in ``dtype.lanes``. Use the group's ``data_row_index(local)`` to resolve
+        a logical element through any data index map. Map groups do not
+        reconstruct a convenience write shape such as ``(N, 4, 4)``.
         ``semantic`` is the :class:`AttributeSemantic` (or raw
         ``ovstage_attribute_semantic_t`` value) carried on the map. Geometric
         semantics record a geometric role on the column when the map creates it;
@@ -614,7 +778,7 @@ class Stage:
 
     def fetch_map_next(self, mapping, timeout: int = TIMEOUT_INFINITE) -> Optional[MapGroup]:
         grp = _b.ovstage_map_group_t()
-        code = self._api.ovstage_fetch_map_next(self._inst, _handle(mapping), timeout, ctypes.byref(grp))
+        code = self._api.ovstage_fetch_map_next(self._inst, _handle(mapping), check_timeout(timeout), ctypes.byref(grp))
         if code == _b.OVSTAGE_ERROR_END_OF_ITERATION:
             return None
         if code != _b.OVSTAGE_OK:
@@ -682,7 +846,9 @@ class Stage:
 
     def fetch_ordinal(self, ordinal_query, timeout: int = TIMEOUT_INFINITE) -> int:
         value = _b.ovstage_ordinal_t()
-        self._check(self._api.ovstage_fetch_ordinal(self._inst, _handle(ordinal_query), timeout, ctypes.byref(value)))
+        self._check(
+            self._api.ovstage_fetch_ordinal(self._inst, _handle(ordinal_query), check_timeout(timeout), ctypes.byref(value))
+        )
         return int(value.value)
 
     def release_ordinal_query(self, ordinal_query) -> Operation:
@@ -804,6 +970,13 @@ class _HandleObject:
 
 class Query(_HandleObject):
     def result(self, timeout: int = TIMEOUT_INFINITE) -> QueryResult:
+        """Fetch (and release) the query result.
+
+        :param timeout: max nanoseconds to wait for the result;
+            ``TIMEOUT_INFINITE`` (default) blocks, ``0`` polls.
+        :raises TypeError: if ``timeout`` is not an integer (e.g. ``None``).
+        :raises ValueError: if ``timeout`` is negative or does not fit in uint64.
+        """
         return self._stage.fetch_query_result(self, timeout)
 
     def release(self) -> Operation:
@@ -812,6 +985,14 @@ class Query(_HandleObject):
 
 class Read(_HandleObject):
     def fetch_next(self, timeout: int = TIMEOUT_INFINITE) -> Optional[ReadGroup]:
+        """Fetch the next read group, or ``None`` at end of iteration.
+
+        :param timeout: max nanoseconds to wait for the next group;
+            ``TIMEOUT_INFINITE`` (default) blocks, ``0`` polls.
+        :raises TypeError: if ``timeout`` is not an integer (e.g. ``None``).
+        :raises ValueError: if ``timeout`` is negative or does not fit in uint64.
+        :raises OvstageError: with ``ErrorCode.TIMEOUT`` if no group is ready in time.
+        """
         return self._stage.fetch_read_next(self, timeout)
 
     def groups(self, timeout: int = TIMEOUT_INFINITE):
@@ -875,6 +1056,14 @@ class Map(_HandleObject):
         self._unmapped = False
 
     def fetch_next(self, timeout: int = TIMEOUT_INFINITE) -> Optional[MapGroup]:
+        """Fetch the next writable map group, or ``None`` at end of iteration.
+
+        :param timeout: max nanoseconds to wait for the next group;
+            ``TIMEOUT_INFINITE`` (default) blocks, ``0`` polls.
+        :raises TypeError: if ``timeout`` is not an integer (e.g. ``None``).
+        :raises ValueError: if ``timeout`` is negative or does not fit in uint64.
+        :raises OvstageError: with ``ErrorCode.TIMEOUT`` if no group is ready in time.
+        """
         return self._stage.fetch_map_next(self, timeout)
 
     def groups(self, timeout: int = TIMEOUT_INFINITE):
@@ -931,6 +1120,13 @@ class Map(_HandleObject):
 
 class OrdinalQuery(_HandleObject):
     def fetch(self, timeout: int = TIMEOUT_INFINITE) -> int:
+        """Fetch the queried ordinal value.
+
+        :param timeout: max nanoseconds to wait for the value;
+            ``TIMEOUT_INFINITE`` (default) blocks, ``0`` polls.
+        :raises TypeError: if ``timeout`` is not an integer (e.g. ``None``).
+        :raises ValueError: if ``timeout`` is negative or does not fit in uint64.
+        """
         return self._stage.fetch_ordinal(self, timeout)
 
     def release(self) -> Operation:

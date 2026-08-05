@@ -76,10 +76,11 @@ ovstage skills under `../../../skills/`; keep them intact when editing.
 - `open_usd(...)` takes any `.usda`/`.usdc` path; `torus-plane.usda` is the
   ovrtx minimal example scene, copied next to `main.py` so the example stays
   self-contained.
-- The `omni:xform` write supplies the 4×4 as **one 16-lane element per prim**
-  (`dtype.lanes = 16`, `shape = [1]`, via `make_dltensor`), not a 4×4 of
-  `lanes = 1` — the current implementation stores the transform packed into 16 lanes and rejects a
-  `lanes = 1` write.
+- The example supplies `omni:xform` in its canonical form: **one 16-lane
+  element per prim** (`dtype.lanes = 16`, `shape = [1]`, via
+  `make_dltensor`). A convenience input shaped `(N, 4, 4)` with `lanes = 1`
+  is also accepted, but its trailing shape is not preserved: raw reads/maps
+  return `(N,)` with 16 lanes and Python DLPack export produces `(N, 16)`.
 - The inline `add_usd_reference` USDA must be multi-line; a single-line
   layer-metadata + prim body does not parse through the anonymous-layer path.
 

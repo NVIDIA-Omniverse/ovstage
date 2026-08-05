@@ -33,7 +33,7 @@ sum of the locals down its chain:
 prototype prim types: Xform Xform Cube Xform Cube
 applied schemas on /World/Proto/Body: PhysicsMassAPI PhysicsRigidBodyAPI
 cloned /World/Proto -> /World/Env_0 /World/Env_1 /World/Env_2
-hierarchy computation models: cpu-incremental gpu-incremental gpu-global
+hierarchy computation models: cpu-incremental gpu-incremental gpu-global runtime-default
 world matrix rows before compute_hierarchy: absent (derived rows are pull-computed)
 stale placeholder world translation /World/Env_0/Body/Tip: 0.0 0.0 0.0
 world translation /World/Proto/Body/Tip: 10.0 100.0 7.0

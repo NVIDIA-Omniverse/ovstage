@@ -95,17 +95,25 @@ Python vs. C
 Common Failure Modes
 --------------------
 
-- **Reading an unsealed ordinal returns nothing.** Advance the write floor
-  first (step 6).
+- **Reading selected unsealed state fails** with
+  ``OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION``. Advance the write floor first
+  (step 6).
+- **A fixed range rejects a later change to the same selected key.** If a
+  selected ``(attribute, path)`` also has a retained change after the range end,
+  the read fails with ``OVSTAGE_ERROR_OUT_OF_RANGE`` whether or not that later
+  change is sealed. Widen or rebase the range, repoll from a newer cursor, or
+  request current state when that is what the consumer wants. Advancing the
+  floor alone does not resolve this error.
 - **Writing at or below the write floor is rejected** with
   ``OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION``. Choose an ordinal above the current
   floor. (Advancing the floor backwards is *not* an error — it clamps.)
 
 .. note::
 
-   This build retains only the **latest committed** state. The C API surface
-   includes ordinal and retention concepts, but do not design flows that read
-   back older ordinals.
+   This build retains only the **latest committed** state. Fixed ranges select
+   the keys that changed, not historical payloads, and return
+   ``OVSTAGE_ERROR_OUT_OF_RANGE`` when a selected key changed again after the
+   range end.
 
 Where to Go Next
 ----------------

@@ -16,7 +16,7 @@
 import numpy as np
 import pytest
 
-from ovstage import OrdinalRange, OvxError, PathDictionary
+from ovstage import AttributeSemantic, ErrorCode, OrdinalRange, OvxError, PathDictionary
 
 
 @pytest.mark.parametrize("value", ["pre\x00post", "\x00lead", "trail\x00"])
@@ -85,5 +85,74 @@ def test_write_advance_read(stage):
         finally:
             # Release every handle before the stage is destroyed (on `with` exit):
             # the query handle and the path-list reference.
+            stage.release_query(query).wait()
+            paths.destroy_path_list(prim_paths)
+
+
+def test_convenience_fixed_shapes_read_back_in_canonical_lane_form(stage):
+    with PathDictionary(stage) as paths:
+        point = paths.intern_token("point3-convenience")
+        matrix = paths.intern_token("matrix4-convenience")
+        flat = paths.intern_token("point3-flat-invalid")
+        prim_paths = paths.create_path_list_from_strings(["/World/A", "/World/B"])
+        query = stage.query_from_path_list(prim_paths)
+        try:
+            # [snippet:canonical-fixed-shapes]
+            point_values = np.arange(6, dtype=np.float32).reshape(2, 3)
+            matrix_values = np.arange(32, dtype=np.float64).reshape(2, 4, 4)
+            rejected_flat = stage.write_attribute(
+                query,
+                flat,
+                ordinal=1,
+                tensors=point_values.reshape(-1),
+                is_array=False,
+                semantic=AttributeSemantic.POINT,
+            )
+            assert rejected_flat.status == ErrorCode.INVALID_ARGUMENT
+            assert rejected_flat.op_id == 0
+
+            stage.write_attribute(
+                query,
+                point,
+                ordinal=1,
+                tensors=point_values,
+                is_array=False,
+                semantic=AttributeSemantic.POINT,
+            ).wait()
+            stage.write_attribute(
+                query,
+                matrix,
+                ordinal=1,
+                tensors=matrix_values,
+                is_array=False,
+                semantic=AttributeSemantic.MATRIX,
+            ).wait()
+            stage.advance_write_floor(ordinal=1).wait()
+
+            expected = {
+                point: (3, (2, 3), point_values),
+                matrix: (16, (2, 16), matrix_values.reshape(2, 16)),
+            }
+            read = stage.read_attributes(query, [point, matrix], OrdinalRange.latest(1))
+            read.wait()
+            seen = set()
+            while True:
+                group = read.fetch_next()
+                if group is None:
+                    break
+                lanes, exported_shape, values = expected[group.attribute]
+                raw = group.tensor(0)
+                assert raw.ndim == 1
+                assert raw.shape_tuple == (2,)
+                assert raw.dtype.lanes == lanes
+                exported = np.from_dlpack(group.dlpack(0))
+                assert exported.shape == exported_shape
+                np.testing.assert_allclose(exported, values)
+                seen.add(group.attribute)
+                stage.release_group(group)
+            assert seen == {point, matrix}
+            read.release().wait()
+            # [/snippet:canonical-fixed-shapes]
+        finally:
             stage.release_query(query).wait()
             paths.destroy_path_list(prim_paths)

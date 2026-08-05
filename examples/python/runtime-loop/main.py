@@ -169,8 +169,9 @@ def main() -> int:
 
 def _translate_matrix(tx, ty, tz):
     """A 4x4 double transform as omni:xform expects it (row-major, translation in
-    the last row). The current implementation packs the matrix into one 16-lane element per prim, so
-    the write tensor is shape [1] with a lanes=16 dtype -- NOT a 4x4 of lanes=1."""
+    the last row). This example uses the canonical transport form: one 16-lane
+    element per prim. A convenience 4x4 of lanes=1 is accepted on copy-in but
+    normalized back to shape [1], lanes=16 on raw reads and maps."""
     m = np.array([1, 0, 0, 0,  0, 1, 0, 0,  0, 0, 1, 0,  tx, ty, tz, 1], dtype=np.float64)
     return make_dltensor(m, dtype=DLDataType(code=DLDataTypeCode.kDLFloat, bits=64, lanes=16), shape=[1])
 

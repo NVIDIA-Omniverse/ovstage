@@ -47,6 +47,14 @@ Population (USD → ovstage)
 .. doxygenfile:: ovstage_population.h
    :project: ovstage
 
+.. doxygengroup:: ovstage_population_lifecycle
+   :project: ovstage
+   :content-only:
+
+.. doxygengroup:: ovstage_population_diagnostics
+   :project: ovstage
+   :content-only:
+
 Instancing
 ----------
 
@@ -54,6 +62,10 @@ High-level instancing queries.
 
 .. doxygenfile:: ovstage_instancing.h
    :project: ovstage
+
+.. doxygengroup:: ovstage_instancing
+   :project: ovstage
+   :content-only:
 
 API Types and Utilities
 -----------------------
@@ -66,6 +78,19 @@ API Types and Utilities
 
 .. doxygenfile:: ovstage_api_utils.h
    :project: ovstage
+
+Configuration
+-------------
+
+Helpers for building the ``ovstage_config_t`` entries passed to
+``ovstage_initialize()``.
+
+.. doxygenfile:: ovstage_config.h
+   :project: ovstage
+
+.. doxygengroup:: ovstage_config_helpers
+   :project: ovstage
+   :content-only:
 
 Alignment Helpers
 -----------------

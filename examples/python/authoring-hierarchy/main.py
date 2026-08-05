@@ -223,8 +223,8 @@ def main() -> int:
 
 def _matrix_rows(rows):
     """4x4 double translation matrices as a matrix column expects them: row-major, translation
-    in the last row. The current implementation packs each matrix into a single 16-lane element per prim, so the
-    tensor is shape [len(rows)] with a lanes=16 dtype -- NOT a 4x4 of lanes=1."""
+    in the last row. This helper uses the canonical transport form: shape [len(rows)] with a
+    lanes=16 dtype. A compact 4x4-of-lanes=1 write is accepted but normalizes to this raw form."""
     data = np.array(
         [[1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, tx, ty, tz, 1] for (tx, ty, tz) in rows], dtype=np.float64
     )

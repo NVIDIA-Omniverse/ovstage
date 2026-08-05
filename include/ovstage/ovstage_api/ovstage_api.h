@@ -1,3 +1,12 @@
+/* Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ *
+ * NVIDIA CORPORATION and its licensors retain all intellectual property
+ * and proprietary rights in and to this software, related documentation
+ * and any modifications thereto.  Any use, reproduction, disclosure or
+ * distribution of this software and related documentation without an express
+ * license agreement from NVIDIA CORPORATION is strictly prohibited.
+ */
+
 /**
  * @file ovstage_api.h
  * @brief ovstage_api — vtable-based contract for asynchronous, ordinal-keyed
@@ -35,11 +44,18 @@
  *   execute in submission order; ops at different ordinal values are
  *   independent and may execute concurrently.
  *
- * - **Reads and queries are independent.** Reads (`read_attributes`) target
- *   sealed data — ordinal ranges at or below the write floor, which is
- *   immutable — and never participate in write ordering. Queries (`query`)
- *   resolve against the latest committed stage state at execution time and
- *   do not order with each other or with writes.
+ * - **Reads and queries are independent.** Reads (`read_attributes`) of
+ *   recorded columns are validated against the effective write floor and never
+ *   participate in write ordering. The floor is the ordinal through which data
+ *   is sealed, and it starts at 0: a write is only readable once the caller
+ *   advances the floor to cover its ordinal. An explicit ordinal range first
+ *   selects the keys that changed in it. A selected change above the floor
+ *   fails with OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION. If a selected public key
+ *   also has a retained change after the range end, the latest-only
+ *   implementation fails with OVSTAGE_ERROR_OUT_OF_RANGE because the payload
+ *   for the fixed range is no longer available. Queries (`query`) resolve
+ *   against the latest committed stage state at execution time and do not
+ *   order with each other or with writes.
  *
  * - **Write-floor advances are ordinal-keyed.** Advancing the write floor
  *   (global or per-attribute) to ordinal N is implicitly ordered after all
@@ -120,7 +136,7 @@
  * table above for contract stability only and is subject to removal in a
  * future release.
  *
- * @version 0.1.0
+ * @version 0.1.1
  * @date 2026-05-27
  */
 
@@ -378,6 +394,13 @@ struct ovstage_vtable_t
      * Multi-attribute read: enqueue one read for multiple attributes, then
      * iterate groups via fetch_read_next. Reads target sealed data and never
      * participate in write ordering; reads also never order with each other.
+     *
+     * Validation is scoped to each selected (attribute, path), so an unrelated
+     * path never vetoes a read. A selected change above the write floor fails
+     * with OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION; a selected key with a retained
+     * change after the range end fails with OVSTAGE_ERROR_OUT_OF_RANGE, because
+     * this implementation retains only the latest payload. A range that selects
+     * nothing remains a successful zero-group read.
      * ─────────────────────────────────────────────────────────────────────── */
 
     /**
@@ -398,7 +421,13 @@ struct ovstage_vtable_t
      *         OVSTAGE_ERROR_END_OF_ITERATION when no more groups,
      *         OVSTAGE_ERROR_TIMEOUT if the next group is not ready
      *         within timeout,
-     *         OVSTAGE_ERROR_OP_FAILED if the underlying enqueue failed.
+     *         OVSTAGE_ERROR_OP_FAILED if the underlying enqueue failed. When a
+     *         deferred read is rejected, the producer's own status (for example
+     *         OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION or
+     *         OVSTAGE_ERROR_OUT_OF_RANGE) is reported once that producer has
+     *         completed; a fetch that is itself waiting on the producer reports
+     *         OVSTAGE_ERROR_OP_FAILED instead. Ready queries are validated at
+     *         enqueue and report the typed status from read_attributes.
      *
      * @post On OVSTAGE_OK, the group is independently valid until
      *       release_group.
@@ -443,6 +472,16 @@ struct ovstage_vtable_t
      * attribute name, and existing storage do not infer or correct it. Writing
      * a different schema to an existing prim/name fails; delete that attribute
      * first, then write it again with the new schema.
+     *
+     * Fixed-size values use a lane-canonical schema: each transported data row
+     * holds one attribute tuple, with the complete tuple width in
+     * `DLDataType.lanes`. Compact convenience inputs may put tuple components
+     * in trailing tensor dimensions, but those dimensions are folded into
+     * lanes and are not preserved. Read and map results always expose the
+     * canonical 1-D data-row tensor. Logical prims select those rows directly
+     * or through `data.index_map`; see ovstage_write_data_t and ovstage_data_t.
+     * Without an index map, the leading dimension must equal the logical
+     * element count; a flat component buffer is not inferred as wider rows.
      *
      * Reserved metadata follows the same attribute-write and row-coverage contract
      * as every other attribute. `usd-prim-type` requires `is_array == false`;

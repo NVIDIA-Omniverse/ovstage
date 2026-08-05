@@ -139,9 +139,9 @@ def read_delta_groups(stage, paths, query, temperature, begin, end):
     """Range-read [begin, end] over the query and return the result as-is,
     group by group: (ordinal, is_delete, paths, values). The EXPLICIT begin
     makes it a delta ("what changed since begin - 1"); an open begin would be
-    a snapshot read. Payloads are the LATEST-COMMITTED values, and ordinal is
-    the column's latest write ordinal -- it can exceed the requested range
-    end. Tombstone groups carry no tensors, so their values list is empty."""
+    a snapshot read. If a selected (attribute, path) changed again after end,
+    the read raises OUT_OF_RANGE. Tombstone groups carry no tensors, so their
+    values list is empty."""
     groups = []
     with stage.read_attributes(query, [temperature], OrdinalRange.between(begin, end)) as read:
         read.wait()
@@ -153,8 +153,8 @@ def read_delta_groups(stage, paths, query, temperature, begin, end):
             covered = [group_paths[group.prim_index(i)] for i in range(group.prim_count)]
             values = []
             if not group.is_delete:
-                # One latest-committed row per covered prim; the row index
-                # honors data.index_map when present.
+                # One current row per covered prim; the row index honors
+                # data.index_map when present.
                 data = group.array(0)
                 for local in range(group.prim_count):
                     row = group.data_row_index(local) if group.has_data_index_map else local
@@ -175,9 +175,7 @@ def consume_deltas(stage, paths, query, temperature, last_seen) -> int:
     print(f"consumer: floor {floor}, last_seen {last_seen} -> reading delta [{last_seen + 1}, {floor}]")
     groups = read_delta_groups(stage, paths, query, temperature, last_seen + 1, floor)
 
-    # Example plumbing: report each group; S0..S3 = last path component. Note
-    # the tombstone group prints ordinal 6 though the delete landed at 5 --
-    # ordinal is the column's latest write ordinal, not a range clamp.
+    # Example plumbing: report each group; S0..S3 = last path component.
     changes = 0
     for ordinal, is_delete, group_paths, values in groups:
         names = [path.rsplit("/", 1)[-1] for path in group_paths]
@@ -197,10 +195,13 @@ def consume_deltas(stage, paths, query, temperature, last_seen) -> int:
 def run_threaded(stage, paths, query, sensor_queries, temperature) -> bool:
     """Concurrent mode (--threads): producer and consumer run on the SAME
     stage from two threads -- the ovstage API is thread-safe on a shared
-    instance, and the ctypes bindings release the GIL during calls. The
-    consumer only ever reads up to a floor it fetched, so it never observes a
-    half-written tick; only the batching varies run to run, which is why this
-    mode's output is not part of the expected-output block."""
+    instance, and the ctypes bindings release the GIL during calls. A pending
+    overlap fails with OP_FAILED. Once committed, a later change to the same
+    selected (attribute, path) after the requested end fails with OUT_OF_RANGE
+    whether or not it is sealed. A selected in-range unsealed change instead
+    reports WRITE_FLOOR_VIOLATION. This demo treats a race failure as terminal;
+    otherwise only batching varies, so threaded output is not part of the
+    expected-output block."""
     failed = threading.Event()
 
     def produce():
@@ -248,9 +249,10 @@ def run_threaded(stage, paths, query, sensor_queries, temperature) -> bool:
 
 # [snippet:poll-write-floor]
 def poll_write_floor(stage) -> int:
-    """Fetch the GLOBAL write floor (attribute=None) -- the only coordination
-    the consumer needs: everything at or below the floor is sealed, so reading
-    up to it can never race an in-flight producer write."""
+    """Fetch the GLOBAL write floor (attribute=None), the producer's publish
+    cursor for range membership. Payload storage is latest-only, so a later
+    change to the same selected (attribute, path) can make the fixed-range read
+    raise OUT_OF_RANGE."""
     with stage.get_attribute_write_floor(None) as floor_query:
         return floor_query.fetch()
 # [/snippet:poll-write-floor]

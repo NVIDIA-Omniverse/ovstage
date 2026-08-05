@@ -170,4 +170,106 @@ TEST_F(MinimalTest, WriteAdvanceRead)
     EXPECT_FLOAT_EQ(out[2], 3.0f);
 }
 
+TEST_F(MinimalTest, ConvenienceFixedShapesReadBackInCanonicalLaneForm)
+{
+    // [snippet:canonical-fixed-shapes-c]
+    const ovx_string_t attrNames[] = {
+        str("point3-convenience"),
+        str("matrix4-convenience"),
+        str("point3-flat-invalid"),
+    };
+    ovx_token_t attrs[3] = { OVX_INVALID_TOKEN, OVX_INVALID_TOKEN, OVX_INVALID_TOKEN };
+    ASSERT_EQ(path_dictionary_create_tokens_from_strings(dict_, attrNames, 3, attrs).status,
+              OVX_API_SUCCESS);
+
+    float points[] = {
+        1.0f, 2.0f, 3.0f,
+        4.0f, 5.0f, 6.0f,
+        7.0f, 8.0f, 9.0f,
+    };
+    int64_t pointShape[] = { 3, 3 };
+    DLTensor pointTensor{};
+    pointTensor.data = points;
+    pointTensor.device = { kDLCPU, 0 };
+    pointTensor.ndim = 2;
+    pointTensor.dtype = { kDLFloat, 32, 1 };
+    pointTensor.shape = pointShape;
+
+    double matrices[3 * 4 * 4]{};
+    for (size_t i = 0; i < 3 * 4 * 4; ++i)
+        matrices[i] = static_cast<double>(i);
+    int64_t matrixShape[] = { 3, 4, 4 };
+    DLTensor matrixTensor{};
+    matrixTensor.data = matrices;
+    matrixTensor.device = { kDLCPU, 0 };
+    matrixTensor.ndim = 3;
+    matrixTensor.dtype = { kDLFloat, 64, 1 };
+    matrixTensor.shape = matrixShape;
+
+    // A flat scalar tensor declares nine rows, not three float3 rows. Without
+    // an index map its leading dimension must match the three logical prims.
+    int64_t flatPointShape[] = { 9 };
+    DLTensor flatPointTensor = pointTensor;
+    flatPointTensor.ndim = 1;
+    flatPointTensor.shape = flatPointShape;
+    ovstage_write_data_t flatPointWrite{};
+    flatPointWrite.tensors = &flatPointTensor;
+    flatPointWrite.tensor_count = 1;
+    flatPointWrite.is_array = false;
+    flatPointWrite.semantic = OVSTAGE_SEMANTIC_POINT;
+    const ovstage_enqueue_result_t rejectedFlat = ovstage_write_attribute(
+        stage_, query_, { attrs[2], {} }, /*ordinal*/ 1, flatPointWrite, OVSTAGE_PRIM_MODE_UPSERT);
+    EXPECT_EQ(rejectedFlat.status, OVSTAGE_ERROR_INVALID_ARGUMENT);
+    EXPECT_EQ(rejectedFlat.op_index, OVSTAGE_INVALID_OP_ID);
+
+    DLTensor tensors[] = { pointTensor, matrixTensor };
+    const ovstage_attribute_semantic_t semantics[] = {
+        OVSTAGE_SEMANTIC_POINT,
+        OVSTAGE_SEMANTIC_MATRIX,
+    };
+    for (size_t i = 0; i < 2; ++i)
+    {
+        ovstage_write_data_t write{};
+        write.tensors = &tensors[i];
+        write.tensor_count = 1;
+        write.is_array = false;
+        write.semantic = semantics[i];
+        ASSERT_TRUE(waitOp(stage_,
+            ovstage_write_attribute(
+                stage_, query_, { attrs[i], {} }, /*ordinal*/ 1, write, OVSTAGE_PRIM_MODE_UPSERT),
+            "write convenience-shaped fixed attribute"));
+    }
+
+    ovstage_write_floor_desc_t writeFloor{};
+    writeFloor.ordinal = 1;
+    writeFloor.scope = OVSTAGE_SCOPE_ALL;
+    ASSERT_TRUE(waitOp(stage_, ovstage_advance_write_floor(stage_, &writeFloor), "advance_write_floor"));
+
+    const uint16_t expectedLanes[] = { 3, 16 };
+    for (size_t i = 0; i < 2; ++i)
+    {
+        ovstage_ordinal_range_t range{};
+        range.end_ordinal = 1;
+        ovstage_read_handle_t read = OVSTAGE_INVALID_READ_HANDLE;
+        ASSERT_TRUE(waitOp(
+            stage_, ovstage_read_attributes(stage_, query_, &attrs[i], 1, range, &read), "read attribute"));
+
+        ovstage_read_group_t group{};
+        ASSERT_EQ(ovstage_fetch_read_next(stage_, read, OVSTAGE_TIMEOUT_INFINITE, &group), OVSTAGE_OK);
+        ASSERT_EQ(group.data.tensor_count, 1u);
+        ASSERT_NE(group.data.tensors, nullptr);
+        const DLTensor& canonical = group.data.tensors[0];
+        EXPECT_EQ(canonical.ndim, 1);
+        ASSERT_NE(canonical.shape, nullptr);
+        EXPECT_EQ(canonical.shape[0], 3);
+        EXPECT_EQ(canonical.dtype.lanes, expectedLanes[i]);
+        EXPECT_EQ(group.semantic, semantics[i]);
+        ASSERT_EQ(ovstage_release_group(stage_, &group), OVSTAGE_OK);
+        EXPECT_EQ(ovstage_fetch_read_next(stage_, read, OVSTAGE_TIMEOUT_INFINITE, &group),
+                  OVSTAGE_ERROR_END_OF_ITERATION);
+        ASSERT_TRUE(waitOp(stage_, ovstage_release_read(stage_, read), "release_read"));
+    }
+    // [/snippet:canonical-fixed-shapes-c]
+}
+
 } // namespace

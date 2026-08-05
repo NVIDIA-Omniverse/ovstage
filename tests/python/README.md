@@ -19,6 +19,8 @@ wheel (not the build tree).
   (`log-callback-filter`).
 - `test_support_api.py` — asserts `library_version` + the DLPack round-trip
   (`dlpack-round-trip`).
+- `test_config.py` — asserts process configuration selects the runtime-default
+  hierarchy model (`configure-transform-updates`).
 - `test_clone.py` — asserts clone copies attribute values (`clone-and-verify`).
 - `test_queries.py` — asserts `usd-path` IN / HAS on client-written prims, plus
   the population-backed predicate matrix and query introspection

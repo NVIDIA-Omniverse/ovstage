@@ -37,7 +37,7 @@ groups) and ``ovstage_write_data_t`` (writes) both carry:
      - Tensor layout
    * - Fixed-size (scalar / fixed vector)
      - ``false``
-     - A single tensor with all prims stacked along the leading dimension (``tensor_count == 1``).
+     - A single tensor with all transported data rows stacked along the leading dimension (``tensor_count == 1``).
    * - Array / ragged
      - ``true``
      - One tensor per row, or a single packed tensor for all rows — ``tensor_count`` selects the transport, not the attribute kind.
@@ -46,6 +46,67 @@ groups) and ``ovstage_write_data_t`` (writes) both carry:
 (``{kDLCPU, 0}`` or ``{kDLCUDA, ordinal}``), ``ndim``, ``dtype``
 (``{code, bits, lanes}`` — ``lanes`` is the tuple width, e.g. 3 for a float3),
 ``shape``, ``strides``, and ``byte_offset``.
+
+Fixed-Size Canonical Layout
+^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Fixed-size tensors returned by raw reads and maps use a lane-canonical layout:
+
+- ``tensor_count == 1`` and ``ndim == 1``.
+- ``shape[0] == N``, where ``N`` is the transported data-row count.
+- ``dtype.lanes`` is the complete tuple width.
+
+Logical prims select those data rows one-to-one when ``index_map`` is NULL. If
+``index_map`` is present, logical prim ``i`` selects row ``index_map[i]`` and
+``N`` may differ from ``count``: it can be smaller when rows are shared, or
+larger when a query touches only part of a transported bucket.
+
+Copy-in writes may use either the canonical form or compact convenience
+dimensions. Convenience dimensions are folded into ``dtype.lanes`` and are not
+preserved as schema.
+
+Without ``index_map``, the leading dimension must equal the logical element
+count. A flat ``shape = [N * L]``, ``lanes = 1`` tensor is not a convenience
+encoding of ``N`` rows of width ``L``; use ``shape = [N, L]``, ``lanes = 1`` or
+the canonical ``shape = [N]``, ``lanes = L`` form.
+
+.. list-table::
+   :header-rows: 1
+
+   * - Value per data row
+     - Canonical write / raw read / raw map
+     - Accepted convenience write
+     - Python DLPack export
+   * - Scalar
+     - ``shape = [N]``, ``lanes = 1``
+     - Same
+     - ``(N,)``
+   * - ``point3f``
+     - ``shape = [N]``, ``lanes = 3``
+     - ``shape = [N, 3]``, ``lanes = 1``
+     - ``(N, 3)``
+   * - ``matrix4d``
+     - ``shape = [N]``, ``lanes = 16``
+     - ``shape = [N, 4, 4]``, ``lanes = 1`` (or ``[N, 4]`` with 4 lanes)
+     - ``(N, 16)``
+
+Python DLPack export expands a multi-lane dtype by exactly one trailing axis;
+it does not reconstruct the convenience input shape. Array/ragged attributes
+are outside this fixed-size layout rule.
+
+.. important::
+
+   In raw OVStage fixed-size transport, ``dtype.lanes`` is the canonical
+   encoding of the complete component width; the attribute semantic separately
+   supplies the geometric role. For example, three ``point3f`` data rows use
+   ``shape = [3]``, ``lanes = 3``, and ``OVSTAGE_SEMANTIC_POINT``.
+
+   ``shape = [3, 3]``, ``lanes = 1`` is accepted as a convenience write, but
+   OVStage normalizes it. Raw reads and maps return ``shape = [3]``,
+   ``lanes = 3`` — not ``shape = [9]``, ``lanes = 1``. The original trailing
+   shape is not preserved. Python's ``ReadGroup.array(0)`` is a separate flat
+   base-element view of length 9; use ``ReadGroup.dlpack(0)`` when a consumer
+   should see the expanded ``(3, 3)`` lane axis.
 
 Copy-In Write and Copy-Out Read
 -------------------------------
@@ -81,6 +142,23 @@ In Python, the bindings accept and return DLPack-compatible arrays, so NumPy,
 PyTorch, and Warp tensors interchange through ``from_dlpack`` with the same
 residency model.
 
+Some producers expose library vector types as scalar DLPack tensors with a
+trailing component axis. For example, Warp exports ``vec3f`` as ``(N, 3)`` with
+``lanes = 1``. For an array-valued ``point3f[]`` row, first create
+``float3 = DLDataType(code=DLDataTypeCode.kDLFloat, bits=32, lanes=3)``, then
+call ``make_dltensor(warp_points, dtype=float3)``. The adapter aliases the same
+allocation while folding only complete compact trailing axes into
+``dtype.lanes``. It validates the unchanged base type, a positive bit width, and
+byte extent, and requires byte-aligned source elements; no automatic shape-based
+inference is performed, so a scalar array with shape ``(N, 3)`` keeps its
+original meaning unless the caller requests the lane fold.
+When folding consumes every source axis, such as ``(3,)`` into a three-lane
+dtype, the adapter normalizes the mathematically rank-zero result to
+``shape=(1,)``, ``ndim=1``: a one-element tensor view compatible with ovstage's
+leading-dimension transport.
+Explicit overrides for this view must use ``shape=[1]``, ``ndim=1``, and compact
+``strides=[1]``.
+
 GPU Residency and Synchronization
 ---------------------------------
 
@@ -113,6 +191,24 @@ Sparsity
 ``index_map`` (gather / reorder / dedup) and ``mask`` (per-element validity) are
 **mutually exclusive**. Set ``count`` (the logical element count) whenever either
 is present.
+
+They address different axes. ``index_map`` picks the **source row** each logical
+element reads (``index_map[i]`` is a row of the payload, not a prim), so it
+gathers, reorders, or broadcasts data. ``mask`` picks the **target elements** to
+write, leaving the rest untouched. To write a subset of a query's prims, use
+``mask``.
+
+Where the payload declares a transported row count — ``shape[0]`` for a
+fixed-size payload, ``tensor_count`` for per-row array transport — every
+``index_map`` entry must be below it, and an out-of-range entry is rejected with
+``OVSTAGE_ERROR_INVALID_ARGUMENT``. Unreferenced rows are left unused, so the
+payload may be wider than the query. Packed array transport carries no row count
+of its own, so the map defines the partition instead: the payload is cut into
+``max(index_map) + 1`` uniform rows, and a partition the payload cannot support
+(one that does not divide evenly, or whose rows are not a whole number of
+``dtype`` elements) is rejected with ``OVSTAGE_ERROR_INVALID_ARGUMENT``. A
+``mask`` leaves the row partition alone, so a masked payload must still carry a
+row for every logical element, including the unselected ones.
 
 Zero-Copy Map/Unmap
 -------------------

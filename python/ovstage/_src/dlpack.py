@@ -29,6 +29,7 @@ Two interchange paths are provided:
 """
 
 import ctypes
+import operator
 from typing import Any, Callable, Optional
 
 __all__ = [
@@ -271,16 +272,27 @@ class _ConsumedDLManagedTensor:
 
 
 # ── DLPack protocol export (capsule creation) ───────────────────────────────
-# Python C-API bindings used to build/consume DLPack PyCapsules. Mirrors the
-# proven ovrtx implementation (ovrtx/_src/dlpack.py) so the two sibling packages
-# stay behaviourally identical.
-PyMem_Malloc = ctypes.pythonapi.PyMem_Malloc
-PyMem_Malloc.argtypes = [ctypes.c_size_t]
-PyMem_Malloc.restype = ctypes.c_void_p
+# Python C-API bindings used to build/consume DLPack PyCapsules.
+# AUTOREMOVE: BEGIN
+# Derived from the sibling ovrtx implementation (ovrtx/_src/dlpack.py), but
+# deliberately *diverged* as of OMPE-102796: ovrtx still allocates with PyMem_Malloc
+# and installs a Python ctypes callback as the DLPack deleter, which reproduces the
+# bug fixed here (writing into a read-only np.from_dlpack view raises "SystemError:
+# error return without exception set" and strands the capsule context). Do not
+# resync this file to ovrtx until the same fix lands there.
+# AUTOREMOVE: END
+# The DLManagedTensor block is allocated and freed in the *raw* allocator domain.
+# PyMem_Malloc/PyMem_Free would require the GIL, and the DLPack deleter below is a
+# bare C function pointer that cannot acquire it the way a ctypes callback does, so
+# a consumer releasing the tensor off-GIL would be calling a GIL-requiring free.
+# The two must stay a matched pair: allocate raw, free raw.
+PyMem_RawMalloc = ctypes.pythonapi.PyMem_RawMalloc
+PyMem_RawMalloc.argtypes = [ctypes.c_size_t]
+PyMem_RawMalloc.restype = ctypes.c_void_p
 
-PyMem_Free = ctypes.pythonapi.PyMem_Free
-PyMem_Free.argtypes = [ctypes.c_void_p]
-PyMem_Free.restype = None
+PyMem_RawFree = ctypes.pythonapi.PyMem_RawFree
+PyMem_RawFree.argtypes = [ctypes.c_void_p]
+PyMem_RawFree.restype = None
 
 Py_IncRef = ctypes.pythonapi.Py_IncRef
 Py_IncRef.argtypes = [ctypes.py_object]
@@ -322,16 +334,55 @@ _PyCapsule_GetContext_raw = ctypes.pythonapi["PyCapsule_GetContext"]
 _PyCapsule_GetContext_raw.argtypes = [ctypes.c_void_p]
 _PyCapsule_GetContext_raw.restype = ctypes.c_void_p
 
+# Bound here, at import time, on purpose: see _drain_pending_exception.
+_PyErr_Clear = ctypes.pythonapi.PyErr_Clear
+_PyErr_Clear.argtypes = []
+_PyErr_Clear.restype = None
+
+
+# A DLPack deleter must not execute Python: the consumer can invoke it while a Python
+# exception is propagating (e.g. numpy rejecting an in-place write into a read-only
+# view). ctypes cannot enter a Python callback with the error indicator set, so the
+# callback aborts at its first call, its cleanup never runs, and the pending exception
+# is reported unraisable and cleared -- surfacing to the caller as "SystemError: error
+# return without exception set". PyMem_RawFree has a compatible void(*)(void*)
+# signature and frees the block with no Python involved.
+_C_FREE_DELETER = ctypes.cast(PyMem_RawFree, _DLPACK_DELETER)
+
+
+def _drain_pending_exception() -> None:
+    """Clear any exception pending on entry to a ctypes callback.
+
+    The capsule destructor is itself a ctypes callback, so it hits the same wall the
+    DLPack deleter did: with an exception already set, CPython aborts the callback at
+    its first C call and the cleanup below never runs, stranding the capsule context
+    and the tensor block. Clearing the error indicator up front is what makes that
+    cleanup deterministic.
+
+    This does not preserve the caller's exception, and cannot: ctypes reports and
+    clears whatever is set when a callback returns, so nothing can be handed back
+    across that boundary.
+
+    ``PyErr_Clear`` is bound at *import* time deliberately. Resolving it through
+    ``ctypes.pythonapi`` here would itself be a C call and would trip on the very
+    exception being drained. Detecting the pending exception first — by provoking the
+    ``SystemError`` that ``_Py_CheckFunctionResult`` raises for a call that returns a
+    result with the error set — is not viable either: CPython 3.11+ specializes a
+    warmed-up builtin call site to an opcode whose equivalent check is an ``assert``
+    compiled out of release builds, so that guard silently stops firing after the
+    first few calls.
+    """
+    _PyErr_Clear()
+
 
 class _CapsuleCtx:
     """Keepalive for a capsule's callbacks and the caller's ``manager_ctx``."""
 
-    __slots__ = ("manager_ctx", "deleter_callback", "c_deleter", "capsule_destructor")
+    __slots__ = ("manager_ctx", "deleter_callback", "capsule_destructor")
 
     def __init__(self, manager_ctx: Any, deleter_callback: Optional[Callable]) -> None:
         self.manager_ctx = manager_ctx
         self.deleter_callback = deleter_callback
-        self.c_deleter = None
         self.capsule_destructor = None
 
 
@@ -345,12 +396,20 @@ def _to_dlpack_capsule(
 ) -> Any:
     """Create a DLPack ``PyCapsule`` wrapping ``dl_tensor``.
 
-    ``manager_ctx`` is a Python object kept alive for the lifetime of the capsule
-    (prevents GC of the underlying data); ``deleter_callback(manager_ctx)`` — if
-    given — runs when the tensor is released. ``versioned`` selects the DLPack 1.0
+    ``manager_ctx`` is a Python object kept alive for the lifetime of the capsule;
+    ``deleter_callback(manager_ctx)`` — if given — runs when the capsule is
+    destroyed. Note that a *consumed* capsule is destroyed as soon as the consumer
+    has taken ownership of the managed tensor, which is generally before that
+    consumer releases the tensor: the DLPack deleter itself must not run Python
+    (see ``_C_FREE_DELETER``), so it cannot drive a Python callback at release
+    time. Callers needing cleanup tied to the consumer's lifetime must arrange it
+    themselves. ``versioned`` selects the DLPack 1.0
     ``DLManagedTensorVersioned`` layout (with a read-only flag) over the legacy
-    ``DLManagedTensor``. Vector dtypes (``lanes > 1``) are expanded to a trailing
-    shape dimension with ``lanes = 1``, which is how array libraries consume them.
+    ``DLManagedTensor``. Vector dtypes (``lanes > 1``) are expanded by adding
+    exactly one trailing shape dimension and setting ``lanes = 1``, which is how
+    array libraries consume them. This is lane expansion, not reconstruction of
+    a convenience write shape: a fixed matrix stored as ``shape=(N,)``,
+    ``lanes=16`` exports as ``(N, 16)``, not ``(N, 4, 4)``.
     """
     actual_ndim = dl_tensor.ndim + (1 if dl_tensor.dtype.lanes > 1 else 0)
 
@@ -363,7 +422,7 @@ def _to_dlpack_capsule(
 
     managed_size = ctypes.sizeof(ManagedTensor)
     shape_size = actual_ndim * ctypes.sizeof(ctypes.c_int64)
-    mem_ptr = PyMem_Malloc(managed_size + shape_size)
+    mem_ptr = PyMem_RawMalloc(managed_size + shape_size)
     if not mem_ptr:
         raise MemoryError("failed to allocate DLManagedTensor")
 
@@ -389,41 +448,51 @@ def _to_dlpack_capsule(
     managed_tensor.dl_tensor.shape = shape_ptr
     managed_tensor.dl_tensor.strides = None
 
-    # Two manual refs keep _capsule_ctx (and its CFUNCTYPEs) alive: one for the
-    # C deleter, one for the capsule destructor stored in the capsule context.
+    # One manual ref keeps _capsule_ctx (and its CFUNCTYPE) alive: held by the capsule
+    # destructor stored in the capsule context.
     _capsule_ctx = _CapsuleCtx(manager_ctx, deleter_callback)
-    Py_IncRef(_capsule_ctx)  # held by c_deleter
-    managed_tensor.manager_ctx = id(_capsule_ctx)
 
-    @_DLPACK_DELETER
-    def c_deleter(managed_ptr):
-        mt = ManagedTensor.from_address(managed_ptr)
-        ctx = ctypes.cast(mt.manager_ctx, ctypes.py_object).value
-        try:
-            if ctx.deleter_callback is not None:
-                ctx.deleter_callback(ctx.manager_ctx)
-        finally:
-            Py_DecRef(ctx)
-            PyMem_Free(managed_ptr)
+    # manager_ctx stays NULL. It exists for a deleter that needs producer state, and
+    # this deleter is a bare C free that needs none — it is never read back. Storing
+    # id(_capsule_ctx) here would outlive what it points at: the capsule destructor
+    # drops the context's only reference when the capsule dies, which for a consumed
+    # capsule is while the consumer still owns this block. The destructor reaches the
+    # context through the capsule's own context pointer instead, which it releases in
+    # the same call.
+    managed_tensor.manager_ctx = None
 
     @PyCapsule_Destructor
     def capsule_destructor(capsule_ptr):
-        ctx_id = _PyCapsule_GetContext_raw(capsule_ptr)
-        if ctx_id:
-            ctx = ctypes.cast(ctx_id, ctypes.py_object).value
-            Py_DecRef(ctx)
-        # Skip the deleter when the capsule was already consumed (renamed by the consumer).
-        if not _PyCapsule_IsValid_raw(capsule_ptr, capsule_name):
-            return
-        managed_ptr = _PyCapsule_GetPointer_raw(capsule_ptr, capsule_name)
-        if managed_ptr:
-            mt = ManagedTensor.from_address(managed_ptr)
-            if mt.deleter:
-                mt.deleter(managed_ptr)
+        # Runs before anything else: an unconsumed capsule can be dropped while an
+        # exception propagates, which would otherwise abort this callback and leak
+        # both the context and the tensor block. This makes the cleanup below run; it
+        # does not rescue the caller's exception, which ctypes discards at the callback
+        # boundary either way.
+        _drain_pending_exception()
+        # Both cleanup steps must run even if the caller's deleter_callback raises,
+        # otherwise a failing callback strands the context and the tensor block. The
+        # exception still propagates (as it did when the deleter owned this call), so
+        # a broken callback is reported rather than silently swallowed.
+        try:
+            ctx_id = _PyCapsule_GetContext_raw(capsule_ptr)
+            if ctx_id:
+                ctx = ctypes.cast(ctx_id, ctypes.py_object).value
+                try:
+                    if ctx.deleter_callback is not None:
+                        ctx.deleter_callback(ctx.manager_ctx)
+                finally:
+                    Py_DecRef(ctx)
+        finally:
+            # Skip the deleter when the capsule was already consumed (renamed by the consumer).
+            if _PyCapsule_IsValid_raw(capsule_ptr, capsule_name):
+                managed_ptr = _PyCapsule_GetPointer_raw(capsule_ptr, capsule_name)
+                if managed_ptr:
+                    mt = ManagedTensor.from_address(managed_ptr)
+                    if mt.deleter:
+                        mt.deleter(managed_ptr)
 
-    _capsule_ctx.c_deleter = c_deleter
     _capsule_ctx.capsule_destructor = capsule_destructor
-    managed_tensor.deleter = c_deleter
+    managed_tensor.deleter = _C_FREE_DELETER
 
     capsule = PyCapsule_New(mem_ptr, capsule_name, capsule_destructor)
     Py_IncRef(_capsule_ctx)  # held by capsule_destructor
@@ -442,6 +511,26 @@ class ManagedDLTensor:
     The tensor data is **borrowed** from ovstage and valid only until the owning
     read/map group is released — copy it if it must outlive the read. A read
     group is exported ``readonly=True``; a (writable) map group ``readonly=False``.
+    DLPack consumers see one trailing dimension added for a multi-lane dtype;
+    for example, a raw fixed matrix ``shape=(N,)``, ``lanes=16`` is exported as
+    ``(N, 16)`` rather than as any convenience input shape.
+    ``ManagedDLTensor.shape`` and its representation report the raw, unexpanded
+    ``(N,)`` shape; the trailing lane axis materializes only in a DLPack consumer
+    such as ``np.from_dlpack()``.
+
+    ``manager_ctx`` is retained by this object and by any capsule it exports, but a
+    capsule is destroyed as soon as a consumer takes ownership of it — which is
+    *before* that consumer releases the tensor. The DLPack deleter runs no Python
+    (see ``_C_FREE_DELETER``), so it cannot release a Python reference at that later
+    point. If ``manager_ctx`` is the sole owner of the backing memory, keep this
+    ``ManagedDLTensor`` alive for as long as the consumer's view is used::
+
+        managed = ManagedDLTensor(tensor, manager_ctx=owner)
+        view = np.from_dlpack(managed)  # `managed` must outlive `view`
+
+    This does not invalidate ``np.from_dlpack(group.dlpack(0))`` for ovstage
+    read/map groups: their ``manager_ctx`` does not own the backing allocation,
+    and the view remains valid while the owning read/map operation is alive.
     """
 
     def __init__(
@@ -584,12 +673,177 @@ _NUMPY_TO_DL = {
 
 
 def numpy_to_dldatatype(np_dtype, lanes: int = 1) -> DLDataType:
-    """Build a :class:`DLDataType` from a numpy dtype (with optional vector lanes)."""
+    """Build a :class:`DLDataType` from a numpy dtype (with optional vector lanes).
+
+    ``lanes`` must be an integer in ``[1, 65535]``: the value lands in the DLPack
+    ``uint16`` lane field, so anything outside that range raises
+    :class:`ValueError` (:class:`TypeError` for non-integers) instead of silently
+    wrapping to a bogus lane count (e.g. ``-1`` becoming ``65535``).
+    """
+    lanes = operator.index(lanes)
+    if not 1 <= lanes <= 0xFFFF:
+        raise ValueError(f"DLDataType lanes must be in [1, 65535], got {lanes}")
     name = str(np_dtype)
+    if name not in _NUMPY_TO_DL and np_dtype is not None:
+        # A numpy scalar *type* (np.float32) stringifies as "<class 'numpy.float32'>",
+        # not "float32". Normalize type objects, char codes ("f4") and builtins (float)
+        # through np.dtype; the fast path above keeps numpy optional for callers that
+        # already pass a dtype name. None is excluded: np.dtype(None) is float64 ("the
+        # default dtype"), and this factory must describe a buffer exactly, so an unset
+        # dtype has to stay an error rather than silently become f8.
+        try:
+            import numpy as np
+
+            name = str(np.dtype(np_dtype))
+        except Exception:
+            pass
     if name not in _NUMPY_TO_DL:
-        raise ValueError(f"Unsupported numpy dtype for DLPack: {name}")
+        raise ValueError(f"Unsupported numpy dtype for DLPack: {np_dtype!r}")
     code, bits = _NUMPY_TO_DL[name]
     return DLDataType(code=code, bits=bits, lanes=lanes)
+
+
+def _compact_row_major_strides(shape: tuple) -> tuple:
+    result = [0] * len(shape)
+    stride = 1
+    for dim in range(len(shape) - 1, -1, -1):
+        result[dim] = stride
+        stride *= shape[dim]
+    return tuple(result)
+
+
+def _fold_dlpack_producer_layout(
+    tensor: DLTensor,
+    *,
+    dtype: Optional[DLDataType],
+    shape: Optional[list],
+    ndim: Optional[int],
+    strides: Optional[list],
+) -> DLTensor:
+    """Apply a validated trailing-shape-to-lanes fold to a consumed producer."""
+    if dtype is None:
+        raise ValueError(
+            "DLPack producer layout overrides require dtype; only validated "
+            "trailing-dimension-to-lanes folds are supported"
+        )
+    if not isinstance(dtype, DLDataType):
+        raise TypeError("dtype must be a DLDataType")
+
+    source_shape = tensor.shape_tuple
+    if tensor.ndim < 0 or (tensor.ndim > 0 and not tensor.shape) or any(dim < 0 for dim in source_shape):
+        raise ValueError("cannot override an invalid DLPack producer shape")
+    if tensor.strides:
+        source_strides = tuple(tensor.strides[i] for i in range(tensor.ndim))
+        if source_strides != _compact_row_major_strides(source_shape):
+            raise ValueError("DLPack producer layout overrides require compact row-major source strides")
+
+    source_dtype = tensor.dtype
+    if source_dtype.bits == 0 or dtype.bits == 0:
+        raise ValueError(
+            "DLPack producer dtype override requires positive source and requested bit widths "
+            f"(source={source_dtype.bits}, requested={dtype.bits})"
+        )
+    if dtype.code != source_dtype.code or dtype.bits != source_dtype.bits:
+        raise ValueError(
+            "DLPack producer dtype override must preserve the source base type and bit width "
+            f"(source=({source_dtype.code}, {source_dtype.bits}), "
+            f"requested=({dtype.code}, {dtype.bits}))"
+        )
+    if source_dtype.lanes == 0 or dtype.lanes == 0 or dtype.lanes < source_dtype.lanes:
+        raise ValueError("DLPack producer dtype override must preserve or increase a positive lane count")
+    if dtype.lanes % source_dtype.lanes != 0:
+        raise ValueError("requested lanes must be an integer multiple of the source lanes")
+
+    lane_factor = dtype.lanes // source_dtype.lanes
+    if lane_factor > 1 and (source_dtype.bits * source_dtype.lanes) % 8 != 0:
+        raise ValueError(
+            "DLPack producer lane folds require a byte-aligned source element; "
+            "sub-byte element padding cannot be reinterpreted safely"
+        )
+    folded_factor = 1
+    fold_start = len(source_shape)
+    while folded_factor < lane_factor and fold_start > 0:
+        trailing_dim = source_shape[fold_start - 1]
+        next_factor = folded_factor * trailing_dim
+        if trailing_dim <= 0 or lane_factor % next_factor != 0:
+            break
+        folded_factor = next_factor
+        fold_start -= 1
+    if folded_factor != lane_factor:
+        raise ValueError(
+            f"requested lanes={dtype.lanes} cannot be formed by folding complete trailing "
+            f"dimensions of source shape {source_shape} with lanes={source_dtype.lanes}"
+        )
+
+    folded_shape = source_shape[:fold_start]
+    if lane_factor > 1 and fold_start == 0:
+        # ovstage transports logical elements along a leading tensor dimension.
+        # A fold that consumes every source axis therefore keeps a size-one
+        # dimension instead of forwarding the mathematically rank-zero view.
+        folded_shape = (1,)
+    if shape is None:
+        target_shape = folded_shape
+    else:
+        try:
+            target_shape = tuple(operator.index(dim) for dim in shape)
+        except TypeError as exc:
+            raise TypeError("shape entries must be integers") from exc
+        if any(dim < 0 for dim in target_shape):
+            raise ValueError("shape entries must be non-negative")
+        if target_shape != folded_shape:
+            raise ValueError(
+                f"DLPack producer shape override must equal the canonical folded shape {folded_shape} "
+                "after folding complete trailing dimensions"
+            )
+
+    try:
+        target_ndim = len(target_shape) if ndim is None else operator.index(ndim)
+    except TypeError as exc:
+        raise TypeError("ndim must be an integer") from exc
+    if target_ndim != len(target_shape):
+        raise ValueError(
+            f"DLPack producer ndim ({target_ndim}) must equal the folded shape rank ({len(target_shape)})"
+        )
+
+    target_strides = None
+    if strides is not None:
+        try:
+            target_strides = tuple(operator.index(stride) for stride in strides)
+        except TypeError as exc:
+            raise TypeError("stride entries must be integers") from exc
+        expected_strides = _compact_row_major_strides(target_shape)
+        if target_strides != expected_strides:
+            raise ValueError(
+                f"DLPack producer stride override must be compact row-major {expected_strides}, "
+                f"got {target_strides}"
+            )
+
+    source_element_count = 1
+    for dim in source_shape:
+        source_element_count *= dim
+    target_element_count = 1
+    for dim in target_shape:
+        target_element_count *= dim
+    source_byte_extent = source_element_count * ((source_dtype.bits * source_dtype.lanes + 7) // 8)
+    target_byte_extent = target_element_count * ((dtype.bits * dtype.lanes + 7) // 8)
+    if source_byte_extent != target_byte_extent:
+        raise ValueError("DLPack producer layout override must preserve the payload byte extent")
+
+    tensor.ndim = target_ndim
+    tensor.dtype = dtype
+    if target_ndim > 0:
+        tensor._shape_storage = (ctypes.c_int64 * target_ndim)(*target_shape)
+        tensor.shape = ctypes.cast(tensor._shape_storage, ctypes.POINTER(ctypes.c_int64))
+    else:
+        tensor._shape_storage = None
+        tensor.shape = None
+    if target_strides is not None:
+        tensor._strides_storage = (ctypes.c_int64 * target_ndim)(*target_strides)
+        tensor.strides = ctypes.cast(tensor._strides_storage, ctypes.POINTER(ctypes.c_int64))
+    else:
+        tensor._strides_storage = None
+        tensor.strides = None
+    return tensor
 
 
 def make_dltensor(
@@ -608,12 +862,22 @@ def make_dltensor(
     tensor are linked by reference so the C-visible pointers stay valid for as long
     as the returned tensor is alive. ``shape``/``ndim``/``dtype``/``strides`` may be
     overridden to describe vector (multi-lane) layouts a plain numpy dtype cannot
-    express — mirroring how ``stage_api_test_utils.h`` authors its write tensors.
+    express, matching an explicitly authored multi-lane ``DLTensor`` descriptor.
+    A fixed-size ovstage write may also accept the numpy shape directly as a
+    convenience layout (for example, ``(N, 4, 4)`` with ``lanes=1``); subsequent
+    raw reads/maps normalize it to ``shape=(N,)``, ``lanes=16``.
 
     Any *non-numpy* object exposing the DLPack protocol (warp / torch / cupy / jax,
     CPU **or** CUDA) is ingested zero-copy via :meth:`DLTensor.from_dlpack` instead,
-    so a GPU device buffer can be written without a host round-trip. The
-    numpy-specific overrides are not accepted on that path.
+    so a GPU device buffer can be written without a host round-trip. Such a
+    producer may be re-described with a vector ``dtype`` only through a validated
+    fold of complete trailing dimensions into ``dtype.lanes``. The source must be
+    compact row-major with byte-aligned elements, its base type and positive bit
+    width are unchanged, and any explicit ``shape``/``ndim``/``strides`` must match the
+    folded compact view. For example, a Warp ``vec3f`` export shaped ``(N, 3)``
+    can be viewed as ``shape=(N,)`` with ``lanes=3`` without copying its CPU or
+    CUDA allocation. A lane fold that consumes every source axis is normalized
+    to ``shape=(1,)``, ``ndim=1``.
 
     The caller owns the data: it must keep the returned tensor (and thus the
     backing array) alive until the consuming op completes.
@@ -623,12 +887,16 @@ def make_dltensor(
     # DLPack producers (other than numpy, which keeps the override-capable fast path
     # below) are ingested through the protocol rather than force-copied via numpy.
     if not isinstance(array, np.ndarray) and hasattr(array, "__dlpack__"):
+        tensor = DLTensor.from_dlpack(array)
         if any(x is not None for x in (dtype, shape, ndim, strides)):
-            raise ValueError(
-                "shape/dtype/ndim/strides overrides are not supported for DLPack producers; "
-                "pass a numpy array to use them"
+            return _fold_dlpack_producer_layout(
+                tensor,
+                dtype=dtype,
+                shape=shape,
+                ndim=ndim,
+                strides=strides,
             )
-        return DLTensor.from_dlpack(array)
+        return tensor
 
     array = np.ascontiguousarray(array)
     tensor = DLTensor()
@@ -667,6 +935,12 @@ def dltensor_to_numpy(tensor: DLTensor):
     matching the raw-buffer indexing the C++ tests perform. Vector lanes are
     folded into the element count rather than the dtype. The data is owned by
     ovstage and only valid until the owning group/result is released.
+
+    An invalid dtype (``lanes == 0``) is rejected with :class:`ValueError`. A
+    tensor wrapping a numpy array (built by :func:`make_dltensor`) is also
+    checked against the array's real size, so the returned view can never extend
+    past that backing buffer; tensors from other producers carry no buffer size
+    to check against and are trusted to describe themselves.
     """
     import numpy as np
 
@@ -680,14 +954,30 @@ def dltensor_to_numpy(tensor: DLTensor):
     if ctype is None:
         raise ValueError(f"Unsupported DLDataType for numpy conversion: {tensor.dtype!r}")
 
+    lanes = int(tensor.dtype.lanes)
+    if lanes < 1:
+        raise ValueError(f"Invalid DLDataType lanes for numpy conversion: {tensor.dtype!r}")
+
     count = 1
     for i in range(tensor.ndim):
         count *= tensor.shape[i]
-    count *= max(1, tensor.dtype.lanes)
+    count *= lanes
 
     np_dtype = np.dtype(ctype)
     if count == 0 or not tensor.data:
         return np.empty(0, dtype=np_dtype)
+
+    # When the backing buffer is known (a numpy array wrapped by make_dltensor),
+    # refuse to build a view extending past it: a mis-described dtype/shape would
+    # otherwise become an out-of-bounds read at first element access.
+    backing = getattr(tensor, "_array", None)
+    if backing is not None:
+        described_bytes = int(tensor.byte_offset) + count * ctypes.sizeof(ctype)
+        if described_bytes > backing.nbytes:
+            raise ValueError(
+                f"DLTensor describes {described_bytes} bytes (shape {tensor.shape_tuple}, "
+                f"dtype {tensor.dtype!r}) but its backing buffer holds {backing.nbytes} bytes"
+            )
 
     base_addr = int(tensor.data) + int(tensor.byte_offset)
     buffer = (ctype * count).from_address(base_addr)

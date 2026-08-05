@@ -5,8 +5,7 @@ ovstage skills. Built with CMake + GoogleTest and run via `ctest`, against the
 *produced* ovstage C SDK (not the build tree).
 
 - `CMakeLists.txt` — CMake + GoogleTest, `find_package(ovstage)` (point
-  `CMAKE_PREFIX_PATH` at an unpacked package), modeled on
-  `rendering/ovrtx/public/tests/docs/c/CMakeLists.txt`.
+  `CMAKE_PREFIX_PATH` at an unpacked package).
 - `test_minimal.cpp` — asserts the write → advance-write-floor → read round-trip
   (snippet `write-read-roundtrip-c`).
 - `test_population.cpp` — asserts USD population → query-back by usd-path, plus

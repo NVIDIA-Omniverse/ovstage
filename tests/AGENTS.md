@@ -2,9 +2,7 @@
 
 This directory is the **public-contract test layer** for ovstage: tests that run
 against the *produced* ovstage package (headers + wheel), double as the single
-source of truth for doc/skill snippets, and ship to the GitHub mirror. It mirrors
-the ovrtx `tests/docs/` model — see `rendering/ovrtx/public/tests/docs/AGENTS.md`
-for the reference implementation.
+source of truth for doc/skill snippets, and are included in the public source.
 
 > **Status: active.** The public C + Python suites (write→read round-trip and USD
 > population) run in CI against the produced package/wheel, and their snippets feed
@@ -42,13 +40,13 @@ public tests that require a GPU.
 | `c/`      | CMake, GoogleTest, ovstage C API | Test the C API snippets (create instance → path dictionary → write/advance floor/read → clone) |
 | `python/` | `pytest`, `numpy`, `ovstage` wheel | Test the Python API snippets (same workflows via the ctypes bindings) |
 
-The C suite builds via CMake + GoogleTest and runs via `ctest` (parity with
-ovrtx). The Python suite runs via `pytest`. Both build/run against the produced
-package, not the build tree ("current mode" in CI).
+The C suite builds via CMake + GoogleTest and runs via `ctest`. The Python suite
+runs via `pytest`. Both build and run against the produced package, not the build
+tree.
 
-> ovrtx also has a `usd/` (no-GPU, `usd-core`) suite for USDA validation. ovstage
-> does not author raw USDA for its public surface today, so there is no `usd/`
-> suite. Add one only if a public workflow starts shipping standalone `.usda`.
+There is no `usd/` suite because ovstage does not author raw USDA for its public
+surface today. Add one only if a public workflow starts shipping standalone
+`.usda` files.
 
 ### Data flow: test → snippet → skill → doc
 
@@ -69,7 +67,7 @@ you add or change a snippet, update every skill that references it.
 
 ## Rules
 
-These mirror the ovrtx contract and are mandatory.
+These rules are mandatory.
 
 1. **Snippets are the source of truth.** Never write inline API code blocks in a
    skill or RST doc. Substantial examples live in a test file with snippet markers
@@ -78,7 +76,7 @@ These mirror the ovrtx contract and are mandatory.
    headers and wheel, so a signature drift fails the test.
 3. **Snippet naming.** kebab-case, unique across the whole `tests/` tree. The C
    equivalent of a Python snippet appends `-c` (e.g. `minimal-write-read` /
-   `minimal-write-read-c`) — matching the ovrtx convention.
+   `minimal-write-read-c`).
 4. **Preserve markers.** Moving/restructuring marked code moves the markers with
    it. Removing a marker requires removing/updating every `skills/`/`docs/`
    reference to it in the same change.
@@ -128,6 +126,8 @@ feeds an ovstage skill.
 | `query-predicate-matrix` | `tests/python/test_queries.py` | `skills/stage-queries` |
 | `query-result-introspection-c` | `tests/c/test_queries.cpp` | `skills/stage-queries` |
 | `query-result-introspection` | `tests/python/test_queries.py` | `skills/stage-queries` |
+| `canonical-fixed-shapes-c` | `tests/c/test_minimal.cpp` | `skills/dlpack-tensor-exchange` |
+| `canonical-fixed-shapes` | `tests/python/test_minimal.py` | `skills/dlpack-tensor-exchange` |
 | `attribute-shapes-fixed-c` | `tests/c/test_attribute_shapes.cpp` | `skills/dlpack-tensor-exchange` |
 | `attribute-shapes-fixed` | `tests/python/test_attribute_shapes.py` | `skills/dlpack-tensor-exchange` |
 | `attribute-shapes-ragged-c` | `tests/c/test_attribute_shapes.cpp` | `skills/dlpack-tensor-exchange` |
@@ -136,6 +136,7 @@ feeds an ovstage skill.
 | `semantic-roles` | `tests/python/test_attributes.py` | `skills/dlpack-tensor-exchange` |
 | `map-unmap-cpu-c` | `tests/c/test_map_attribute.cpp` | `skills/dlpack-tensor-exchange` |
 | `map-unmap-cpu` | `tests/python/test_map_attribute.py` | `skills/dlpack-tensor-exchange` |
+| `map-dlpack-readonly` | `tests/python/test_map_attribute.py` | `skills/dlpack-tensor-exchange` |
 | `upsert-vs-insert-c` | `tests/c/test_write_modes.cpp` | `skills/error-handling` |
 | `upsert-vs-insert` | `tests/python/test_write_modes.py` | `skills/error-handling` |
 | `sparse-index-map-and-mask-c` | `tests/c/test_sparse_writes.cpp` | _(test only)_ |
@@ -146,6 +147,7 @@ feeds an ovstage skill.
 | `log-callback-filter` | `tests/python/test_logging.py` | `skills/logging` |
 | `version-and-error-c` | `tests/c/test_support_api.cpp` | `skills/error-handling` |
 | `dlpack-round-trip` | `tests/python/test_support_api.py` | `skills/dlpack-tensor-exchange` |
+| `configure-transform-updates` | `tests/python/test_config.py` | `docs/guides/project_setup_python.rst` |
 
 These are asserted tested snippets (they verify behavior, not just print it). Most
 feed an ovstage skill; a few are `(test only)` until a matching skill exists. New

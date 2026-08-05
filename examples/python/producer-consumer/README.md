@@ -3,8 +3,8 @@
 A small, headless Python program that shows the ovstage **producer/consumer**
 pattern. The producer stamps every write with an **ordinal** (a version number
 the application picks; one per tick here) and seals each tick by advancing the
-**write floor** (which commits everything up to that ordinal, so readers can
-trust it); a pull-based consumer polls the floor and reads only the **delta**
+**write floor** (which publishes everything up to that ordinal as sealed); a
+pull-based consumer polls the floor and reads only the **delta**
 — "what changed since ordinal N" — with `OrdinalRange.between`. It is the
 Python sibling of `../../c/producer-consumer/main.cpp` (same flow,
 byte-identical default-mode output).
@@ -18,7 +18,7 @@ byte-identical default-mode output).
 5. Consumer catches up again: the delta is bigger (it lagged three ticks) and includes the delete as a tombstone.
 6. The same flow runs concurrently with --threads: producer and consumer on one shared stage.
 
-The write floor is the only coordination between the two roles:
+The write floor is the producer's publish signal to the consumer:
 
 ```text
 producer                        ovstage                      consumer
@@ -50,18 +50,20 @@ consumer: floor 6, last_seen 3 -> reading delta [4, 6]
 consumer: last_seen -> 6
 ```
 
-- **A lagging consumer never misses a change.** It sat out three ticks before
-  the second catch-up, so it just gets a bigger delta: 4 prim changes instead
-  of 3.
-- **Values are latest-committed.** The first catch-up prints `S1 = 21.0`
-  (written at tick 2) inside a group stamped `ordinal 3`; `group.ordinal` is
-  the column's latest write ordinal and can land outside the requested range
-  (the tombstone group says `ordinal 6` though the delete happened at tick 5).
+- **A lagging consumer within the retained membership window does not miss a
+  change.** It sat out three ticks before the second catch-up, so it just gets
+  a bigger delta: 4 prim changes instead of 3.
+- **Successful groups carry current state.** The first catch-up includes
+  `S1 = 21.0`, written at tick 2.
 - **A whole-prim delete arrives as a tombstone**: a read group with
   `is_delete=True` and no tensors.
-- **The consumer reads only up to the floor it fetched.** Data at or below the
-  floor is sealed and never changes, so the consumer never sees a half-written
-  tick — even with a concurrent producer.
+- **A fixed range rejects a later change to the same selected key.** With a
+  concurrent producer, a pending overlapping write can fail with `OP_FAILED`.
+  Once committed, a later change to the same selected `(attribute, path)` after
+  the requested end produces `OUT_OF_RANGE` whether or not it is sealed; a
+  selected in-range unsealed change produces `WRITE_FLOOR_VIOLATION`. A
+  production consumer should re-poll and widen/rebase its range, or explicitly
+  request current state if that is the intended recovery.
 
 ## Build and run
 
@@ -97,10 +99,12 @@ ovstage skills under `../../../skills/`; keep them intact when editing.
 
 - `--threads` runs both roles concurrently on the same stage — the API is
   thread-safe on a shared instance, and the ctypes bindings release the GIL
-  during calls. Its output varies run to run: only the batching changes (how
-  many sealed ticks each catch-up happens to see). Under load a producer write
-  can be rejected when it overlaps an outstanding consumer read; the run then
-  reports the rejection and exits nonzero.
+  during calls. When no overlap rejection occurs, only the batching varies
+  (how many sealed ticks each catch-up happens to see). Under load, a producer
+  write can be rejected while a consumer read is outstanding; a read can
+  likewise reject a pending overlap or a committed change to a selected
+  `(attribute, path)` after the polled range end. This demo reports the
+  rejection and exits nonzero rather than retrying.
 - The explicit begin of the range read is what makes it a delta; an open begin
   would be a snapshot read.
 - Prim positions come from the group itself: `group.prim_index(local)` applies

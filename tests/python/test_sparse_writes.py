@@ -7,8 +7,9 @@
 # is the workflow tour; this file asserts the sparse semantics.
 
 import numpy as np
+import pytest
 
-from ovstage import OrdinalRange, PathDictionary
+from ovstage import ErrorCode, OrdinalRange, PathDictionary
 
 
 def _values(stage, query, attr, end_ordinal, order):
@@ -64,6 +65,48 @@ def test_index_map_and_mask(stage):
             # [/snippet:sparse-index-map-and-mask]
 
             assert _values(stage, query, heat, 3, order) == [222.0, 333.0, 111.0, 44.0]
+        finally:
+            stage.release_query(query).wait()
+            paths.destroy_path_list(plist)
+
+
+def test_index_map_entries_must_be_in_range(stage):
+    """An index_map entry past the transported rows is a rejected request.
+
+    index_map gathers SOURCE rows, so an entry is only meaningful if the payload
+    actually transports that row. Out-of-range entries are rejected as invalid
+    arguments rather than silently redefining how the payload is cut into rows.
+    """
+    with PathDictionary(stage) as paths:
+        order = ["/World/Range/A", "/World/Range/B"]
+        plist = paths.create_path_list_from_strings(order)
+        query = stage.query_from_path_list(plist)
+        try:
+            heat = paths.intern_token("range-heat")
+
+            # One transported row, two prims: broadcasting it is in range.
+            stage.write_attribute(
+                query, heat, ordinal=1, tensors=np.array([10.0], np.float32),
+                is_array=False, index_map=[0, 0], count=2,
+            ).wait()
+            stage.advance_write_floor(ordinal=1).wait()
+            assert _values(stage, query, heat, 1, order) == [10.0, 10.0]
+
+            # Row 1 does not exist in a single-row payload.
+            rejected = stage.write_attribute(
+                query, heat, ordinal=2, tensors=np.array([20.0], np.float32),
+                is_array=False, index_map=[1], count=1,
+            )
+            assert rejected.status == ErrorCode.INVALID_ARGUMENT
+            assert "index_map" in rejected.error_message()
+
+            # mask is how a caller targets a subset of the query's prims, and it
+            # requires an explicit count.
+            with pytest.raises(ValueError):
+                stage.write_attribute(
+                    query, heat, ordinal=2, tensors=np.array([10.0, 20.0], np.float32),
+                    is_array=False, mask=[0b10],
+                )
         finally:
             stage.release_query(query).wait()
             paths.destroy_path_list(plist)

@@ -85,12 +85,13 @@ This skill has no scripts.
   documenting new API usage.
 - **Create-only, all-or-nothing.** Every target must be new; a batch mixing fresh and existing
   targets clones nothing (rejected before any prim is created).
-- **Relationships are copied verbatim, not retargeted.** Relationship attributes (e.g.
-  `material:binding`, `skel:skeleton`) are copied as-is — bindings to targets *outside* the
-  cloned subtree resolve correctly (the common case, e.g. a shared materials scope), but targets
-  *inside* the subtree are **not** retargeted to the clone's own copies (matches `ovrtx_clone_usd`).
-- **Only value attributes are change-tracked.** Relationship changes, and connectivity changes
-  such as the source/target parents' child lists, are not ordinal-change-tracked.
+- **Internal paths are rebased; external paths are shared.** Relationship targets, scalar
+  and array path values, and USD attribute connections that point inside the source subtree are
+  retargeted to each clone's corresponding prim or property. Paths outside the subtree stay
+  unchanged, preserving bindings to shared material and resource scopes.
+- **Cloned attribute values are change-tracked.** This includes relationship targets and
+  attribute connections. Scene hierarchy changes, such as the source/target parents' child
+  lists, are not ordinal-change-tracked.
 - **Latest-snapshot build** — clones become visible at/below the write floor once you advance it;
   don't design around reading historical ordinals.
 - **⚠️ Draft — API in flux.** Treat exact symbols/ordering as provisional against the headers.
@@ -104,8 +105,8 @@ subtree (e.g. one scene/robot per RL environment) in a single enqueue.
 
 Like `write_attribute`, clone is an **ordinal-keyed write**: it carries an `ordinal`, is sealed
 by the write floor, and can never mutate sealed ordinals. The source must exist; each target must
-be new (create-only). Relationship targets are cloned (copied verbatim), so a clone's bindings to
-a shared scope outside the subtree still resolve.
+be new (create-only). Internal path-bearing values are rebased per clone, while bindings to
+shared scopes outside the subtree stay unchanged.
 
 ## C
 
@@ -156,9 +157,9 @@ seal, then read back the copied value on each target:
 - **Enqueue succeeded but the clones aren't there** — enqueue success means *accepted*, not
   *executed*. Await the op (C `ovstage_wait_op`; Python `.wait()`), and advance the write floor
   to/above the clone ordinal to read the clones.
-- **A clone's relationship points at the original, not the clone** — relationships are copied
-  verbatim, not retargeted; targets inside the cloned subtree still point at the source's copies
-  (matches `ovrtx_clone_usd`).
+- **A clone still points at the original** — verify the target is actually inside the cloned
+  source subtree. Only paths with the source root as a path prefix are rebased; references to
+  shared scopes outside that subtree intentionally stay unchanged.
 
 ## References
 

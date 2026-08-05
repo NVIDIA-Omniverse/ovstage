@@ -97,7 +97,7 @@ Resolve inputs in this order: existing repository files and referenced snippets,
 |-----------|--------------------|------|
 | `stage.DefinePrim(path, type)` | INSERT-mode `Stage.write_attribute(query, "usd-prim-type", ordinal, tokens, is_array=False, prim_mode=PrimMode.INSERT)` | No create-prim call — prims come into existence via any attribute write; INSERT is create-only (fails on existing prims), and the reserved `usd-prim-type` column stamps one interned token id per prim (uint64, semantic NONE) |
 | `prim.CreateAttribute(name, type).Set(value)` | `Stage.write_attribute(query, attr, ordinal, tensors, is_array=...)` | One call authors the whole column: one tensor row per prim in the query, at a caller-owned ordinal; the write creates the column (and, in UPSERT mode, any absent prims) |
-| `attr.Get()` | `Stage.read_attributes(query, [attr], OrdinalRange.latest(N))` | One read op returns the whole column — the latest committed value at/below ordinal N per prim; reads only see data at/below the write floor |
+| `attr.Get()` | `Stage.read_attributes(query, [attr], OrdinalRange.latest(N))` | One read op returns the current latest committed column; `N` is not a historical upper bound. Recorded payloads must be covered by the write floor. |
 | `stage.RemovePrim(path)` | `Stage.delete_attributes(query, [], ordinal)` | An **empty attribute list** deletes the prims entirely; a non-empty list removes just those attributes; ordinal-keyed like any write, surfaced to range readers as an `is_delete` tombstone group |
 | `Sdf.ChangeBlock()` around N edits | `Stage.write_attributes(query, [WriteDesc, ...], ordinal)` | ChangeBlock batches only change *notification* — still one `Set` call per attribute per prim; `write_attributes` lands several columns in ONE op (a grouping, not an atomic transaction) |
 
@@ -195,9 +195,9 @@ This skill has no scripts.
 
 - **`PRIM_NOT_FOUND` on the create write** — INSERT is create-only: some queried prim already
   exists. Use UPSERT (the default) when "define or update" semantics are wanted.
-- **Read returns nothing after a write** — advance the write floor to the write ordinal first;
-  reads only see sealed data at/below the floor (there is no USD-style immediate
-  read-after-write).
+- **Read fails with `OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION` after a write** — advance the write floor
+  to the write ordinal first; reads only see sealed data at/below the floor (there is no USD-style
+  immediate read-after-write).
 - **`OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION`** — a write used an ordinal at/below the floor. Keep
   ordinals monotonic across migrated steps.
 - **Type stamp did not land / garbage type names** — `usd-prim-type` takes interned token ids

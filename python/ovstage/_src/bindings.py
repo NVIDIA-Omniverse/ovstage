@@ -9,8 +9,7 @@
 """Raw ctypes layer for the ovstage C ABI.
 
 ovstage's data plane is a *vtable* contract (``ovstage_api/ovstage_api.h``):
-``libovstage.so`` exports only the instance lifecycle —
-``ovstage_create_instance`` / ``ovstage_destroy_instance`` — as flat symbols,
+``libovstage.so`` exports the process and instance lifecycle as flat symbols,
 and ``ovstage_create_instance`` hands back an ``ovstage_instance_t`` bundle
 (``{const ovstage_vtable_t* vtable; ovstage_context_t* context;}``). Every
 data-plane operation (query/read/write/map/ordinal/diagnostics) is reached
@@ -32,6 +31,7 @@ Everything here is intentionally low-level; the Pythonic surface lives in
 """
 
 import ctypes
+import operator
 import os
 import sys
 from pathlib import Path
@@ -60,6 +60,37 @@ ovstage_population_usd_reference_handle_t = ctypes.c_uint64
 
 OVSTAGE_TIMEOUT_INFINITE = 0xFFFFFFFFFFFFFFFF
 
+
+def check_timeout(timeout: int) -> int:
+    """Validate and normalize a timeout to a ``uint64_t`` nanosecond count.
+
+    ovstage timeouts (``ovstage_timeout_ns_t``) are unsigned nanoseconds:
+    ``0`` polls without blocking, ``OVSTAGE_TIMEOUT_INFINITE`` blocks until
+    completion, and any other value waits at most that many nanoseconds. Python
+    passes the value through ctypes as ``c_uint64``, which would silently wrap
+    a negative value or one ``>= 2**64`` (``-1`` happened to wrap to
+    ``OVSTAGE_TIMEOUT_INFINITE``); reject non-integers and out-of-range values
+    here instead. Lives in this module (not ``types.py``, which re-exports it)
+    so :func:`flush_log` can use it without an import cycle.
+    """
+    try:
+        value = operator.index(timeout)
+    except TypeError:
+        raise TypeError(
+            "timeout must be an int (nanoseconds; 0 polls, TIMEOUT_INFINITE "
+            f"blocks), got {type(timeout).__name__}"
+        ) from None
+    if value < 0:
+        raise ValueError(
+            f"timeout must be non-negative, got {timeout}; pass TIMEOUT_INFINITE to block"
+        )
+    if value > OVSTAGE_TIMEOUT_INFINITE:
+        raise ValueError(
+            f"timeout must fit in uint64 (<= {OVSTAGE_TIMEOUT_INFINITE}), got {timeout}"
+        )
+    return value
+
+
 # ── Error codes (ovstage_api_types.h) ──────────────────────────────────────
 OVSTAGE_OK = 0
 OVSTAGE_ERROR_INVALID_ARGUMENT = 1
@@ -74,6 +105,7 @@ OVSTAGE_ERROR_OUT_OF_MEMORY = 9
 OVSTAGE_ERROR_LAYOUT_CHANGED = 10
 OVSTAGE_ERROR_TIMEOUT = 11
 OVSTAGE_ERROR_OP_FAILED = 12
+OVSTAGE_ERROR_OUT_OF_RANGE = 13
 OVSTAGE_ERROR_INTERNAL = 99
 
 OVSTAGE_INVALID_OP_ID = 0
@@ -88,9 +120,19 @@ OVSTAGE_HIERARCHY_COMPUTATION_MODEL_INVALID = 0
 OVSTAGE_HIERARCHY_COMPUTATION_MODEL_CPU_INCREMENTAL = 1
 OVSTAGE_HIERARCHY_COMPUTATION_MODEL_GPU_INCREMENTAL = 2
 OVSTAGE_HIERARCHY_COMPUTATION_MODEL_GPU_GLOBAL = 3
+OVSTAGE_HIERARCHY_COMPUTATION_MODEL_RUNTIME_DEFAULT = 4
 OVSTAGE_HIERARCHY_COMPUTATION_MODEL_DEFAULT_CPU = OVSTAGE_HIERARCHY_COMPUTATION_MODEL_CPU_INCREMENTAL
 OVSTAGE_HIERARCHY_COMPUTATION_MODEL_DEFAULT_GPU = OVSTAGE_HIERARCHY_COMPUTATION_MODEL_GPU_GLOBAL
 OVSTAGE_INVALID_HIERARCHY_COMPUTATION_MODEL_ID = OVSTAGE_HIERARCHY_COMPUTATION_MODEL_INVALID
+
+OVSTAGE_CONFIG_KEY_TYPE_BOOL = 0
+OVSTAGE_CONFIG_KEY_TYPE_INT64 = 1
+OVSTAGE_CONFIG_KEY_TYPE_UINT64 = 2
+OVSTAGE_CONFIG_KEY_TYPE_DOUBLE = 3
+OVSTAGE_CONFIG_KEY_TYPE_STRING = 4
+OVSTAGE_CONFIG_KEY_TYPE_BLOB = 5
+
+OVSTAGE_CONFIG_RUNTIME_DEFAULT_HIERARCHY_COMPUTATION_MODEL = 0
 
 OVSTAGE_HIERARCHY_PARENT = 0
 OVSTAGE_HIERARCHY_CHILDREN = 1
@@ -179,6 +221,72 @@ def make_string_or_token(value) -> ovx_string_or_token_t:
         out.string = s
         out._string_ref = s  # keepalive: s._bytes backs out.string.ptr
     return out
+
+
+# ── Process configuration (ovstage_initialize) ─────────────────────────────
+class ovstage_config_blob_value_t(ctypes.Structure):
+    _fields_ = [
+        ("data", ctypes.c_void_p),
+        ("size", ctypes.c_size_t),
+    ]
+
+
+class ovstage_config_entry_t(ctypes.Structure):
+    """Single typed ovstage process-configuration entry."""
+
+    class _KeyUnion(ctypes.Union):
+        _fields_ = [
+            ("bool_key", ctypes.c_int),
+            ("int64_key", ctypes.c_int),
+            ("uint64_key", ctypes.c_int),
+            ("double_key", ctypes.c_int),
+            ("string_key", ctypes.c_int),
+            ("blob_key", ctypes.c_int),
+        ]
+
+    class _ValueUnion(ctypes.Union):
+        _fields_ = [
+            ("bool_value", ctypes.c_bool),
+            ("int_value", ctypes.c_int64),
+            ("uint_value", ctypes.c_uint64),
+            ("double_value", ctypes.c_double),
+            ("string_value", ovx_string_t),
+            ("blob_value", ovstage_config_blob_value_t),
+        ]
+
+    _fields_ = [
+        ("key_type", ctypes.c_int),
+        ("key", _KeyUnion),
+        ("value", _ValueUnion),
+    ]
+
+
+def ovstage_config_entry_uint64(key: int, value: int) -> ovstage_config_entry_t:
+    """Build a config entry for an unsigned 64-bit setting."""
+    entry = ovstage_config_entry_t()
+    entry.key_type = OVSTAGE_CONFIG_KEY_TYPE_UINT64
+    entry.key.uint64_key = key
+    entry.value.uint_value = value
+    return entry
+
+
+class ovstage_config_t(ctypes.Structure):
+    """Config container passed to ``ovstage_initialize``."""
+
+    _fields_ = [
+        ("entries", ctypes.POINTER(ovstage_config_entry_t)),
+        ("entry_count", ctypes.c_size_t),
+    ]
+
+    def __init__(self, entries: List[ovstage_config_entry_t]):
+        if entries:
+            self._array = (ovstage_config_entry_t * len(entries))(*entries)
+            self._entries = entries
+            super().__init__(entries=self._array, entry_count=len(entries))
+        else:
+            self._array = None
+            self._entries = []
+            super().__init__(entries=None, entry_count=0)
 
 
 # ── Opaque handles ─────────────────────────────────────────────────────────
@@ -734,11 +842,29 @@ class _LibraryLoader:
         raise RuntimeError(msg)
 
     def _add_dll_directories(self, lib_dir: Path) -> None:
-        """Register the DLL's directory (and sibling ``plugins``) for dependency
-        resolution on Windows. No-op on other platforms (which use rpath/PATH)."""
+        """Register the DLL's directory (and its ``plugins`` subtree) for
+        dependency resolution on Windows. No-op on other platforms (which use
+        rpath/PATH).
+
+        Each optional plugin ships in its own ``plugins/<name>`` directory, and a
+        plugin's own bundled runtime dependencies sit in a *sibling* directory
+        (e.g. a plugin in ``plugins/foo/`` depends on ``plugins/foo.lib/foo.dll``).
+        Windows' loader only searches directories that have been explicitly
+        registered — it does not walk sibling plugin dirs — so registering just
+        ``plugins`` leaves those bundled deps unresolvable and the plugin fails to
+        load. Register every immediate ``plugins/*`` subdirectory as well so each
+        plugin can find its own dependencies, without hardcoding individual plugin
+        names."""
         if not sys.platform.startswith("win"):
             return
-        for d in (lib_dir, lib_dir / "plugins"):
+        plugins_dir = lib_dir / "plugins"
+        dirs = [lib_dir, plugins_dir]
+        try:
+            if plugins_dir.is_dir():
+                dirs.extend(sorted(p for p in plugins_dir.iterdir() if p.is_dir()))
+        except OSError:
+            pass
+        for d in dirs:
             try:
                 if d.is_dir():
                     self._dll_dir_cookies.append(os.add_dll_directory(str(d)))
@@ -758,6 +884,13 @@ def _configure_prototypes(lib: ctypes.CDLL) -> None:
     """
     inst = ovstage_instance_p
     err = ovstage_api_status_t
+
+    # Stage uses process lifecycle internally when a StageConfig is supplied.
+    # The entry points remain absent from the top-level Python API.
+    lib.ovstage_initialize.argtypes = [ctypes.POINTER(ovstage_config_t)]
+    lib.ovstage_initialize.restype = err
+    lib.ovstage_shutdown.argtypes = []
+    lib.ovstage_shutdown.restype = err
 
     # Instance lifecycle (the only flat ovstage_* data-plane entry points). The
     # bundle ovstage_create_instance returns drives the vtable for everything else.
@@ -818,10 +951,7 @@ def _configure_prototypes(lib: ctypes.CDLL) -> None:
 
     # Logging (ovstage_set_log_callback / ovstage_flush_log): process-global flat
     # exports, not tied to an instance. Guarded so an older libovstage without
-    # them still loads (the wrappers raise NOT_SUPPORTED instead). The runtime is
-    # bootstrapped on demand by creating a Stage, so the process-lifecycle
-    # entry points (ovstage_initialize / ovstage_shutdown) are intentionally not
-    # bound here.
+    # them still loads (the wrappers raise NOT_SUPPORTED instead).
     if hasattr(lib, "ovstage_set_log_callback"):
         # severity is signed (ovstage_log_severity_t spans -2..3); channel_filter
         # is a nullable ovx_string_t pointer; callback is nullable to disable.
@@ -933,9 +1063,8 @@ def library_version() -> Optional[tuple]:
 # ── Logging (ovstage_set_log_callback / ovstage_flush_log) ───────────────────
 # Process-global free functions, so they live at module scope rather than on
 # Stage. The runtime is bootstrapped on demand by creating a Stage; there is no
-# public initialize()/shutdown() (the C process-lifecycle entry points are not
-# bound). Errors surface as OvstageError (imported lazily to avoid a
-# bindings <- types import cycle at module load).
+# public initialize()/shutdown(). Errors surface as OvstageError (imported
+# lazily to avoid a bindings <- types import cycle at module load).
 
 
 def _require(lib: ctypes.CDLL, name: str) -> None:
@@ -1068,11 +1197,14 @@ def flush_log(timeout: int = OVSTAGE_TIMEOUT_INFINITE) -> bool:
         ``0`` polls.
     :returns: ``True`` if drained (or no callback installed); ``False`` if not
         drained within ``timeout``.
+    :raises TypeError: if ``timeout`` is not an integer (e.g. ``None``).
+    :raises ValueError: if ``timeout`` is negative or does not fit in uint64.
     :raises OvstageError: on any error other than a timeout.
     """
+    timeout = check_timeout(timeout)
     lib = _loader.load()
     _require(lib, "ovstage_flush_log")
-    code = lib.ovstage_flush_log(int(timeout))
+    code = lib.ovstage_flush_log(timeout)
     if code == OVSTAGE_ERROR_TIMEOUT:
         return False
     _check_process_status(code, "ovstage_flush_log")
