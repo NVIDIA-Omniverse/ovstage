@@ -85,9 +85,11 @@ The software and materials are governed by the `NVIDIA Software License Agreemen
    scene/path_dictionary
    scene/queries
    scene/writing_attributes
+   scene/transforms
    scene/reading_attributes
    scene/cloning
    scene/population
+   scene/exporting_to_usd
    scene/instancing
 
 .. toctree::

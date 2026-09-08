@@ -151,11 +151,51 @@ Attribute Semantics
 -------------------
 
 Writes carry an ``ovstage_attribute_semantic_t`` (``AttributeSemantic`` in
-Python; ``NONE`` by default). Geometric semantics stamp a role on the column —
-for example a 4×4 transform is written with the ``MATRIX`` semantic. Identity
-semantics (token / relationship / connection path ids) pin the column's base
-type and require pre-interned id payloads. For a worked transform-write example
-over successive ordinals, refer to :doc:`/guides/runtime_loop`.
+Python; ``NONE`` by default). Geometric semantics stamp a role on the attribute —
+for example a 4×4 transform is written with the ``MATRIX`` semantic.
+
+**ID semantics take pre-interned ids, never text.** Intern through the path
+dictionary before writing; a payload of any other shape is rejected with
+``OVSTAGE_ERROR_INVALID_ARGUMENT``.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 34 26 40
+
+   * - Semantic
+     - Required dtype
+     - Notes
+   * - ``TOKEN_ID``
+     - ``{kDLUInt, 64, 1}``
+     - One token id per value.
+   * - ``RELATIONSHIP_PATH_ID``
+     - ``{kDLUInt, 64, 1}``
+     - Path ids; always ``is_array = true``.
+   * - ``CONNECTION_PATH_ID``
+     - ``{kDLUInt, 64, 2}``
+     - One ``(path id, token id)`` pair per element; always ``is_array = true``.
+   * - ``ASSET_PATH_ID``
+     - ``{kDLUInt, 64, 2}``
+     - One ``(authored, resolved)`` token-id pair. ``is_array`` is a real choice
+       here: ``false`` is a scalar ``asset``, ``true`` is ``asset[]`` with one
+       pair per element.
+   * - ``PATH_EXPRESSION_STRING``
+     - ``{kDLUInt, 64, 1}``
+     - One id for the authored expression text. ``is_array = false`` is a scalar
+       ``pathExpression``, ``true`` is ``pathExpression[]`` with one id per
+       element. ovstage stores the id and does not evaluate the expression.
+
+An id of 0 means "authored, but empty" — no token, no path, no expression — so a
+value that is legitimately empty is written as 0 rather than omitted.
+
+The first four pin the attribute's underlying type, so the semantic is what
+selects it: a token-pair write that leaves the semantic as ``NONE`` produces an
+ordinary ``uint64`` pair rather than an asset. ``PATH_EXPRESSION_STRING`` does
+not pin a type; it labels what the id means, so an expression stays
+distinguishable from a plain token.
+
+For transform authoring, see :doc:`transforms`. For a worked local-transform
+write over successive ordinals, see :doc:`/guides/runtime_loop`.
 
 Passing the Attribute as String or Token
 -----------------------------------------
@@ -184,5 +224,6 @@ Where to Go Next
 ----------------
 
 - :doc:`reading_attributes` — read the sealed column back.
+- :doc:`transforms` — author local transforms or effective world transforms.
 - :doc:`/concepts/dlpack_tensors` — tensor layout, residency, and the zero-copy map/unmap alternative.
 - :doc:`/concepts/async_model` — ordinals, the write floor, and observing the write.

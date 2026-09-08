@@ -16,7 +16,7 @@
 import numpy as np
 import pytest
 
-from ovstage import AttributeSemantic, ErrorCode, OrdinalRange, OvxError, PathDictionary
+from ovstage import AttributeSemantic, ErrorCode, OrdinalRange, OVX_API_ERROR, OvxError, PathDictionary
 
 
 @pytest.mark.parametrize("value", ["pre\x00post", "\x00lead", "trail\x00"])
@@ -34,6 +34,34 @@ def test_path_dictionary_errors_are_actionable(stage):
             paths.intern_path("")
         with pytest.raises(OvxError, match="Path list handle was not found"):
             paths.path_list_count(0xDEADBEEF)
+        for handle in (0, 0xDEADBEEF):
+            with pytest.raises(
+                OvxError, match="Prim path handle was not found in this dictionary"
+            ) as exc:
+                paths.path_to_string(handle)
+            assert exc.value.code == OVX_API_ERROR
+
+
+def test_path_dictionary_root_succeeds_while_invalid_raises(stage):
+    """A valid root path and a bad handle must stay distinguishable.
+
+    The root path decodes to zero tokens, and an invalid handle used to be
+    reported the same way, so both surfaced as "". The zero-token root is a
+    success; only the bad handle is an error.
+
+    In C the root decomposes to one processed path with zero component tokens;
+    get_tokens_from_paths returns tokens, not a path string. Python joins that
+    result and spells the root "/", matching SdfPath, so every valid handle
+    round-trips back through intern_path and the empty string is never a
+    successful result.
+    """
+    with PathDictionary(stage) as paths:
+        root = paths.intern_path("/")
+        assert paths.path_to_string(root) == "/"
+        assert paths.intern_path(paths.path_to_string(root)) == root
+
+        with pytest.raises(OvxError, match="Prim path handle was not found in this dictionary"):
+            paths.path_to_string(0xDEADBEEF)
 
 
 def test_path_dictionary_creates_empty_path_lists(stage):
@@ -85,6 +113,46 @@ def test_write_advance_read(stage):
         finally:
             # Release every handle before the stage is destroyed (on `with` exit):
             # the query handle and the path-list reference.
+            stage.release_query(query).wait()
+            paths.destroy_path_list(prim_paths)
+
+
+def test_read_group_array_is_read_only(stage):
+    with PathDictionary(stage) as paths:
+        attr = paths.intern_token("read-only-array")
+        prim_paths = paths.create_path_list_from_strings(["/World/ReadOnly"])
+        query = stage.query_from_path_list(prim_paths)
+        try:
+            stage.write_attribute(
+                query,
+                attr,
+                ordinal=1,
+                tensors=np.array([1.0], np.float32),
+                is_array=False,
+            ).wait()
+            stage.advance_write_floor(ordinal=1).wait()
+
+            read = stage.read_attributes(query, [attr], OrdinalRange.latest(1))
+            group = None
+            try:
+                read.wait()
+                group = read.fetch_next()
+                assert group is not None
+                tensor = group.tensor(0)
+                values = group.array(0)
+
+                assert values.ctypes.data == int(tensor.data) + int(tensor.byte_offset)
+                assert not values.flags.writeable
+                with pytest.raises(ValueError):
+                    values[0] = 2.0
+                with pytest.raises(ValueError):
+                    values.setflags(write=True)
+                np.testing.assert_array_equal(values, [1.0])
+            finally:
+                if group is not None:
+                    stage.release_group(group)
+                read.release().wait()
+        finally:
             stage.release_query(query).wait()
             paths.destroy_path_list(prim_paths)
 

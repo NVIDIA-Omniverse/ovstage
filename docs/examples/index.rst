@@ -72,3 +72,61 @@ referenced by the ovstage skills.
       ``examples/python/runtime-loop``
 
       :doc:`Read the guide → <../guides/runtime_loop>`
+
+   .. grid-item-card:: Authoring Hierarchy :bdg-primary:`C`
+      :class-card: sd-shadow-sm
+
+      Author and clone a hierarchy without USD, then explicitly derive world
+      transforms with a supported GPU computation model.
+
+      +++
+
+      .. rst-class:: sd-text-secondary sd-fs-6
+
+      ``examples/c/authoring-hierarchy``
+
+      :doc:`Read the transform contract → <../scene/transforms>`
+
+   .. grid-item-card:: Authoring Hierarchy :bdg-primary:`Python`
+      :class-card: sd-shadow-sm
+
+      The Python equivalent, including absent and stale derived-world rows
+      before hierarchy computation.
+
+      +++
+
+      .. rst-class:: sd-text-secondary sd-fs-6
+
+      ``examples/python/authoring-hierarchy``
+
+      :doc:`Read the transform contract → <../scene/transforms>`
+
+   .. grid-item-card:: USD Export :bdg-primary:`C`
+      :class-card: sd-shadow-sm
+
+      Populate ovstage from USD, select ``/World/Props`` with a shared
+      population predicate, and export its typed hierarchy to a one-shot saved
+      file through the public C ABI without rule tables.
+
+      +++
+
+      .. rst-class:: sd-text-secondary sd-fs-6
+
+      ``examples/c/usd-export``
+
+      :doc:`Read the guide → <../scene/exporting_to_usd>`
+
+   .. grid-item-card:: USD Export :bdg-primary:`Python`
+      :class-card: sd-shadow-sm
+
+      Populate ovstage from USD and export the typed ``/World/Props`` hierarchy
+      with the metadata-driven helper, preserving recorded prim types, applied
+      schemas, and supported schema-declared attributes in a one-shot file.
+
+      +++
+
+      .. rst-class:: sd-text-secondary sd-fs-6
+
+      ``examples/python/usd-export``
+
+      :doc:`Read the guide → <../scene/exporting_to_usd>`

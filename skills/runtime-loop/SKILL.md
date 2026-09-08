@@ -100,9 +100,10 @@ This skill has no scripts.
   translation in row `[3][0..2]`). A compact `shape = [1, 4, 4]`, `lanes = 1` copy-in is also
   accepted, but the trailing dimensions are folded and not preserved: raw reads and maps return
   the canonical `shape = [1]`, `lanes = 16` layout.
-- **Reading populated transforms.** This loop reads back the transform **it wrote itself** (works).
-  The *populated* transform (`omni:fabric:localMatrix` / `omni:fabric:worldMatrix`) is not surfaced via
-  `read_attributes` (computed downstream in ovrtx) — don't rely on reading a scene-authored transform.
+- **Transform scope.** This loop reads back only the local `omni:xform` value **it wrote itself**.
+  It does not validate hierarchy-derived world-transform reads. Derived world rows may be absent or
+  stale until their owning workflow materializes them and runs hierarchy computation; follow
+  `docs/scene/transforms.rst` for the authoring and freshness contract.
 - **Inline USDA for `add_usd_reference` must be multi-line.** A single-line layer-metadata + prim
   body does not parse through the anonymous-layer import path.
 - **`apply_usd_time` / structural edits.** For the RENDERING domain, `apply_usd_changes` /
@@ -180,8 +181,9 @@ Update path 2 — edit the USD source and propagate it through:
   the floor. Keep ordinals monotonic (populate 1 → writes 2..N → USD edit N+1).
 - **USD edit didn't show up in reads** — `add_usd_reference` only edits USD; you must call
   `apply_usd_changes` at a fresh ordinal and advance the floor before re-reading.
-- **Transform read looks wrong / empty** — see Limitations: reading a *populated* transform may not
-  be surfaced; confirm the `omni:xform` recipe and that you're reading a column you wrote.
+- **Transform read looks wrong / empty** — confirm the `omni:xform` recipe and that the query
+  reads a column written or populated for the selected prims. For derived world rows, see
+  **Transform scope** under Limitations and `docs/scene/transforms.rst`.
 
 ## References
 

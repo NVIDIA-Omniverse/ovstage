@@ -14,6 +14,7 @@
 # https://www.sphinx-doc.org/en/master/usage/configuration.html
 
 import os
+import re
 import sys
 
 # Add the package to the path for autodoc
@@ -26,11 +27,39 @@ project = "ovstage"
 copyright = "2025-2026, NVIDIA Corporation"
 author = "NVIDIA Corporation"
 
-# The version info
+# -- Version ------------------------------------------------------------------
+# VERSION.md is the single source of truth for the ovstage version (the wheel
+# packaging CI derives the wheel version from it). Read it directly: docs always
+# build from a source checkout, where the generated ovstage/_version.py does not
+# exist and ovstage.__version__ resolves to a hand-written fallback literal that
+# could silently drift from VERSION.md.
+_docs_dir = os.path.dirname(os.path.abspath(__file__))
+with open(os.path.join(_docs_dir, "..", "VERSION.md"), encoding="utf-8") as _fh:
+    release = _fh.read().strip()
+if not re.fullmatch(r"\d+\.\d+\.\d+", release):
+    raise ValueError(f"VERSION.md must contain a MAJOR.MINOR.PATCH version, got {release!r}")
+version = release
+
+# Fail the build if the other hand-maintained version copies disagree with
+# VERSION.md, so a release bump that misses one is caught by every docs build
+# (local `make html` and the GitHub docs workflow) instead of publishing docs
+# with a stale version. Installed wheels append a build number to the version,
+# hence the prefix tolerance on __version__.
 from ovstage import __version__
 
-version = __version__
-release = __version__
+if __version__ != release and not __version__.startswith(release + "."):
+    raise ValueError(
+        f"ovstage.__version__ is {__version__!r} but VERSION.md says {release!r}; "
+        "update the fallback version in python/ovstage/__init__.py"
+    )
+with open(os.path.join(_docs_dir, "..", "python", "pyproject.toml"), encoding="utf-8") as _fh:
+    _match = re.search(r'^version\s*=\s*"([^"]*)"', _fh.read(), re.MULTILINE)
+_pyproject_version = _match.group(1) if _match else None
+if _pyproject_version != release:
+    raise ValueError(
+        f"python/pyproject.toml version is {_pyproject_version!r} but VERSION.md says "
+        f"{release!r}; keep them in sync"
+    )
 
 # -- General configuration ---------------------------------------------------
 extensions = [
@@ -58,12 +87,13 @@ mdinclude_transform = True
 # README.md is the build guide for this directory, not a page in the site.
 exclude_patterns = ["_build", "Thumbs.db", ".DS_Store", "README.md"]
 
-# Suppress warnings for known issues
-suppress_warnings = [
-    "autodoc.duplicate_object",  # Dataclass fields documented twice by autodoc
-    "duplicate_declaration.cpp",  # Breathe generates duplicate typedef/enum declarations for C typedef patterns
-    "duplicate_declaration.c",  # Same, for C domain (breathe_domain_by_extension maps .h to C)
-]
+# Keep this empty so -W stays meaningful. In particular, do NOT re-add
+# duplicate_declaration.*: Sphinx < 8.2 emits those warnings untyped (the
+# suppression is silently ignored and -W still fails at the declared floor),
+# and on >= 8.2 it hides genuinely double-rendered symbols. Duplicates from the
+# C `typedef struct X {...} X;` pattern are fixed at the Doxygen level instead
+# (TYPEDEF_HIDES_STRUCT in Doxyfile).
+suppress_warnings = []
 
 # -- Options for autodoc -----------------------------------------------------
 autodoc_default_options = {
@@ -133,6 +163,11 @@ napoleon_attr_annotations = True
 # -- Options for HTML output -------------------------------------------------
 html_theme = "nvidia_sphinx_theme"
 
+# The theme renders no version anywhere by default. It uses html_title as the
+# header brand text on every page (Python and C API reference alike) and in the
+# browser tab title, so this makes the version visible across the whole site.
+html_title = f"{project} {release}"
+
 html_theme_options = {
     "collapse_navigation": False,
     "navigation_depth": 4,
@@ -146,6 +181,9 @@ html_theme_options = {
             "type": "fontawesome",
         },
     ],
+    # Must be a list: the theme's footer template iterates this option, and a
+    # bare string would render one character per line.
+    "extra_footer": [f"<p>{project} {release} documentation</p>"],
 }
 
 html_static_path = ["_static"]
@@ -165,9 +203,6 @@ autosummary_generate = True
 
 
 # -- Convert Markdown code blocks in docstrings to RST -----------------------
-import re
-
-
 def convert_markdown_codeblocks(app, what, name, obj, options, lines):
     """Convert Markdown fenced code blocks to RST code-block directives.
 

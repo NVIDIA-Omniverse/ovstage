@@ -39,7 +39,7 @@
  * - Same prims.offset, prims.count, prims.index_map across all attrs within a group index.
  * - data (tensors, count, index_map, mask) remains per-attribute (different storage density).
  *
- * @version 0.1.1
+ * @version 0.2.0
  * @date 2026-05-23
  */
 

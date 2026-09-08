@@ -110,3 +110,42 @@ def test_index_map_entries_must_be_in_range(stage):
         finally:
             stage.release_query(query).wait()
             paths.destroy_path_list(plist)
+
+
+def test_sparse_write_rejects_out_of_range_inputs(stage):
+    """`count` is a uint32 C field and `index_map` entries are uint32 elements.
+
+    ctypes wraps an out-of-range int rather than raising, so before this was
+    guarded `count=2**32` became `0` — which the contract reads as "every prim
+    the query covers", so the write silently widened instead of erroring —
+    `count=2**32 + n` aliased `count=n`, and an `index_map` entry of `2**32`
+    aliased source row 0. Each was accepted, and each wrote something the caller
+    did not ask for.
+    """
+    with PathDictionary(stage) as paths:
+        order = ["/World/SparseGuard/A", "/World/SparseGuard/B"]
+        plist = paths.create_path_list_from_strings(order)
+        query = stage.query_from_path_list(plist)
+        try:
+            heat = paths.intern_token("sparse-guard-heat")
+            values = np.array([10.0, 20.0], np.float32)
+
+            with pytest.raises(ValueError):
+                stage.write_attribute(query, heat, ordinal=1, tensors=values, is_array=False, count=2**32)
+
+            with pytest.raises(ValueError):
+                stage.write_attribute(query, heat, ordinal=1, tensors=values, is_array=False, count=-1)
+
+            with pytest.raises(ValueError):
+                stage.write_attribute(
+                    query, heat, ordinal=1, tensors=values, is_array=False, index_map=[2**32, 0]
+                )
+
+            # Omitting count — not passing the 0 the wrap used to produce — is
+            # how a write addresses the whole query.
+            stage.write_attribute(query, heat, ordinal=1, tensors=values, is_array=False).wait()
+            stage.advance_write_floor(ordinal=1).wait()
+            assert _values(stage, query, heat, 1, order) == [10.0, 20.0]
+        finally:
+            stage.release_query(query).wait()
+            paths.destroy_path_list(plist)

@@ -15,8 +15,13 @@ PROJECT_ROOT  = $(abspath ..)
 PYTHON_DIR    = $(PROJECT_ROOT)/python
 
 # uv command and docs dependencies (cd into python/ for pyproject.toml, use absolute paths for sphinx)
+# Pin the interpreter to match the published-site build (.github/workflows/docs.yml):
+# the package's requires-python is deliberately wide, and the Python version decides
+# which Sphinx the resolver picks (e.g. 3.10 caps it at 8.1.x). uv downloads a
+# managed 3.12 when none is installed.
 UV            ?= uv
-UVRUN         = cd $(PYTHON_DIR) && $(UV) run --extra docs
+UV_PYTHON     ?= 3.12
+UVRUN         = cd $(PYTHON_DIR) && $(UV) run --python $(UV_PYTHON) --extra docs
 
 # Sphinx source and build dirs as absolute paths (needed because UVRUN changes cwd)
 DOCS_DIR      = $(PROJECT_ROOT)/docs

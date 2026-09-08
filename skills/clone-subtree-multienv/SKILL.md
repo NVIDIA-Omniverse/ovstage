@@ -89,9 +89,9 @@ This skill has no scripts.
   and array path values, and USD attribute connections that point inside the source subtree are
   retargeted to each clone's corresponding prim or property. Paths outside the subtree stay
   unchanged, preserving bindings to shared material and resource scopes.
-- **Cloned attribute values are change-tracked.** This includes relationship targets and
-  attribute connections. Scene hierarchy changes, such as the source/target parents' child
-  lists, are not ordinal-change-tracked.
+- **Change tracking.** Cloned attribute values, including relationship targets,
+  are ordinal-change-tracked. Attribute connections and scene hierarchy changes,
+  such as parent child lists, are not.
 - **Latest-snapshot build** — clones become visible at/below the write floor once you advance it;
   don't design around reading historical ordinals.
 - **⚠️ Draft — API in flux.** Treat exact symbols/ordering as provisional against the headers.

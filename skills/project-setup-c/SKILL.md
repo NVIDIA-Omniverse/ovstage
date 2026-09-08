@@ -90,7 +90,7 @@ ovstage is a pure **C API**:
   path-dictionary/DLPack *types*), plus `<ovx/path_dictionary/path_dictionary.h>`
   (+ `path_dictionary_utils.h`) to call the path-dictionary functions, and
   `<dlpack/dlpack.h>` for tensor types.
-- **Library:** consumers link the ovstage shared library and include the public headers.
+- **Library:** consumers link a public ovstage loader and include the public headers.
   The released package ships a CMake config (`lib/cmake/ovstage/`), so a standalone
   consumer uses `find_package(ovstage REQUIRED)` + `target_link_libraries(<target>
   PRIVATE ovstage::ovstage)`.
@@ -110,10 +110,10 @@ ovstage_setup_runtime(myapp)
 ```
 
 `ovstage_setup_runtime()` sets an rpath onto the package `bin/` on Linux; on
-Windows put the package `bin/` on `PATH` at runtime. **Never copy the ovstage
-shared library next to the executable** — it discovers its bundled plugins
-relative to the directory it loads from, so it must stay in the package `bin/`
-beside `plugins/`.
+Windows put the package `bin/` on `PATH` at runtime. `ovstage::ovstage` is the
+shared forwarding loader; it opens the colocated runtime on the first
+initialize/create call. Keep the package `bin/` layout intact so the runtime
+remains beside its `plugins/` closure.
 
 To consume a manually downloaded package without the examples' fetch module, see
 "Standalone build and run (published package)" below.
@@ -154,11 +154,10 @@ is never inferred from tensor shape or count.
 
 ## Standalone build and run (published package)
 
-An external C/C++ consumer builds against the **published ovstage package** — public headers, the
-prebuilt `libovstage` shared library, and a CMake config — with no ovstage source or monorepo
-checkout. The package ships the headers this skill covers, `bin/libovstage.so` (`ovstage.dll` on
-Windows), and `lib/cmake/ovstage/ovstageConfig.cmake`, which exports the `ovstage::ovstage`
-imported target (carrying both the include dir and the library).
+An external C/C++ consumer builds against the **published ovstage package** — public headers,
+the shared loader, runtime, and a CMake config — with no ovstage source checkout.
+The config exports `ovstage::ovstage` (shared loader) and
+`ovstage::ovstage_static` (static loader).
 
 ### Get the package
 
@@ -169,7 +168,7 @@ Download the ovstage package archive for your platform — `manylinux_2_35_x86_6
 
 
 The unzipped tree has `include/` (ovstage + `ovx` + `dlpack` headers), `bin/` (the shared
-library), and `lib/cmake/ovstage/` (the CMake config). Pin the exact package version your
+loader, runtime, and runtime closure), and `lib/cmake/ovstage/` (the CMake config). Pin the exact package version your
 code targets — it tracks the build the API matches — the same way the Python example pins
 its wheel.
 
@@ -194,7 +193,7 @@ LD_LIBRARY_PATH="$PWD/ovstage-pkg/bin" ./build/app   # Linux
 ```
 
 No manual `-I`/`-l` is needed — the `ovstage::ovstage` target carries the include directory and
-links the shared library. Note the path-dictionary split: `<ovstage/ovstage.h>` pulls the
+links the shared loader. Note the path-dictionary split: `<ovstage/ovstage.h>` pulls the
 path-dictionary *types* but not the `path_dictionary_*` *functions* — include
 `<ovx/path_dictionary/path_dictionary.h>` directly to call them (see Headers above).
 
@@ -203,11 +202,27 @@ path-dictionary *types* but not the `path_dictionary_*` *functions* — include
 - **Headers not found** (`ovstage/ovstage.h` missing): ensure the consumer's include path
   contains ovstage's `include/`; the data-plane API is reached transitively via
   `<ovstage/ovstage.h>` → `ovstage_api/ovstage_api.h`.
-- **Link errors for `ovstage_*` symbols**: link the ovstage library. `ovstage.runtimestage`
-  is an internal static lib and must not be linked directly.
+- **Link errors for `ovstage_*` symbols**: link `ovstage::ovstage` or
+  `ovstage::ovstage_static`; do not link runtime implementation libraries directly.
 - **`ovstage_get_error_string` / diagnostics need an instance**: these are vtable-dispatched
   and take the `ovstage_instance_t*`; you cannot stringify an error before
   `ovstage_create_instance` returns — print the numeric code in that window.
+- **Linux link fails with `libX11.so.6/libGL.so.1 ... not found (try using -rpath or
+  -rpath-link)` or undefined `XOpenDisplay`/`glX*` references against
+  `libov_*usd_ms.so`**: the linker cannot resolve the pre-packaged runtime's system
+  dependencies. Either the host is missing `libx11-6`/`libgl1`/`libgomp1`
+  (install them), or a Homebrew/Linuxbrew `ld` on `PATH` replaced the distribution
+  linker (see next bullet).
+- **Linux build fails with `GLIBC_2.xx' not found` (possibly already at compile
+  time, from `as`) or X11/GL link errors although the system libraries are
+  installed, and Homebrew/Linuxbrew exists on the host**: GCC finds `as` and `ld`
+  via `PATH`, and Homebrew links its own `binutils` by default (since June 2026),
+  so the system compiler silently uses Homebrew's tools and resolves
+  glibc/libgomp against Homebrew's copies. Fix: `brew unlink binutils`, or strip
+  the Homebrew `bin` dir from `PATH` for the build, or add `-B/usr/bin` to
+  compiler flags. `find_package(ovstage)` warns at configure time when it
+  detects a Homebrew linker; pass `-DOVSTAGE_SKIP_LINKER_CHECK=ON` to CMake (or
+  set that environment variable) to silence the check.
 
 ## References
 

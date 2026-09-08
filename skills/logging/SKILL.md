@@ -94,6 +94,10 @@ This skill has no scripts.
   dispatcher; a Python callback that raises has its traceback printed and is then suppressed.
 - **Not an error channel.** Logging is diagnostic output; operation success/failure is
   reported via return codes / `OvstageError` (see `error-handling`).
+- **Silent by default (standalone).** With no callback installed, the standalone runtime
+  prints nothing to the console — there is no default stderr/stdout sink to silence, and
+  the callback is the only way to observe diagnostics. Inside a host application that
+  configures its own logging, the host's console configuration governs.
 - **⚠️ Draft — API in flux.** Treat exact symbols/ordering as provisional against the headers.
 
 ## Overview
@@ -105,6 +109,18 @@ for channels not matched by a rule in `channel_filter` (messages below it are dr
 `"omni.ovstage=verbose"`), `NULL` applying `severity` uniformly. Delivery is
 asynchronous on a dispatcher thread; `ovstage_flush_log(timeout)` blocks until messages
 emitted before the call have drained.
+
+When ovstage runs standalone (the shipped package used directly), no callback means
+no output: the console (stdout/stderr) stays silent at every severity — a final
+sanitized message on a fatal process abort is the only exception — and diagnostics
+exist only for callback subscribers. When ovstage is embedded in a host application
+that configures its own logging, console behavior follows the host's configuration.
+Operation failures do not depend on logging — they surface through return codes and
+the error string accessors (see `error-handling`). USD-support-layer statuses arrive
+at `INFO` (warnings and USD coding errors at `WARNING`, other errors at `ERROR`), so
+a callback whose threshold is the default `WARNING` will not see statuses; lower the
+threshold (or add a channel rule such as `omni.ovstage.usd=info`) to observe
+asset-resolution traffic.
 
 Severities (`ovstage_log_severity_t` / `LogSeverity`): `VERBOSE` (-2), `INFO` (-1),
 `WARNING` (0), `ERROR` (1), `NONE` (3, a threshold sentinel that disables all logging and

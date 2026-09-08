@@ -21,16 +21,97 @@ released automatically when the stage is destroyed (no manual detach).
 
 import ctypes
 import math
+import os
+from typing import Optional
 
 from . import bindings as _b
-from .types import OvstageError, PopulationDomain, check_ordinal, check_timeout
+from .population_export import (
+    OVSTAGE_POPULATION_EXPORT_DESTINATION_EMPTY,
+    OVSTAGE_POPULATION_EXPORT_DESTINATION_OPEN_EXISTING,
+    OVSTAGE_POPULATION_EXPORT_LAYER_MODE_DEF,
+    OVSTAGE_POPULATION_EXPORT_LAYER_MODE_OVER,
+    OVSTAGE_POPULATION_EXPORT_METADATA_LAYER_CUSTOM_DATA,
+    OVSTAGE_POPULATION_EXPORT_METADATA_LAYER_STANDARD,
+    OVSTAGE_POPULATION_EXPORT_METADATA_PRIM,
+    OVSTAGE_POPULATION_EXPORT_METADATA_REFERENCES,
+    OVSTAGE_POPULATION_EXPORT_NAME_MATCH_EXACT,
+    OVSTAGE_POPULATION_EXPORT_NAME_MATCH_GLOB,
+    OVSTAGE_POPULATION_EXPORT_PATH_MATCH_EXACT,
+    OVSTAGE_POPULATION_EXPORT_PATH_MATCH_PREFIX,
+    OVSTAGE_POPULATION_EXPORT_PROPERTY_CONNECTION,
+    OVSTAGE_POPULATION_EXPORT_PROPERTY_MATERIAL_BINDING,
+    OVSTAGE_POPULATION_EXPORT_PROPERTY_RELATIONSHIP,
+    OVSTAGE_POPULATION_EXPORT_RULE_DERIVED_ALLOWED,
+    OVSTAGE_POPULATION_EXPORT_RULE_EXPORT_DEFAULT_VALUE,
+    OVSTAGE_POPULATION_EXPORT_RULE_INFER_CUSTOM_TYPE,
+    OVSTAGE_POPULATION_EXPORT_RULE_NONE,
+    OVSTAGE_POPULATION_EXPORT_RULE_REQUIRED,
+    OVSTAGE_POPULATION_EXPORT_SELECTION_CHANGED_PROPERTIES_SINCE_ORDINAL,
+    OVSTAGE_POPULATION_EXPORT_SELECTION_EXPLICIT_PREDICATE,
+    OVSTAGE_POPULATION_EXPORT_TRANSFORM_NONE,
+    OVSTAGE_POPULATION_EXPORT_TRANSFORM_USD_MATRIX_OP,
+    OVSTAGE_POPULATION_EXPORT_TRANSFORM_USD_XFORM_OP,
+    OVSTAGE_POPULATION_EXPORT_UNKNOWN_METADATA_DROP,
+    OVSTAGE_POPULATION_EXPORT_UNKNOWN_METADATA_FAIL,
+    OVSTAGE_POPULATION_EXPORT_UNKNOWN_METADATA_PRESERVE,
+    OVSTAGE_POPULATION_EXPORT_SOURCE_API_SCHEMAS_EXPLICIT_ONLY,
+    OVSTAGE_POPULATION_EXPORT_SOURCE_API_SCHEMAS_APPLY_RECORDED,
+    OVSTAGE_POPULATION_EXPORT_PROJECTION_EXPLICIT_RULES,
+    OVSTAGE_POPULATION_EXPORT_PROJECTION_SCHEMA_DECLARED,
+    OVSTAGE_POPULATION_EXPORT_UNKNOWN_APPLIED_API_SCHEMAS_CUSTOM_DATA_KEY,
+    DestinationCreateOperation,
+    DestinationOperation,
+    ExportDestination,
+    ExportDestinationMode,
+    ExportOperation,
+    ExportProjection,
+    SourceApiSchemaPolicy,
+    create_export_destination,
+    create_export_destination_async,
+    export_available,
+    export_to_destination,
+    export_to_destination_async,
+    export_to_usd_file,
+    export_to_usd_file_async,
+    export_typed_hierarchy_to_usd_file,
+    export_typed_hierarchy_to_usd_file_async,
+)
+from .selectors import Desc, PrimPredicate, PropertyPredicate, Selector, build_descs
+from .types import (
+    OvstageError,
+    PopulationDomain,
+    PrimPredicateKind,
+    PropertyPredicateKind,
+    check_domains,
+    check_handle,
+    check_int,
+    check_ordinal,
+    check_timeout,
+)
 
 __all__ = [
     "Operation",
+    "ExportOperation",
+    "ExportProjection",
+    "SourceApiSchemaPolicy",
+    "DestinationCreateOperation",
+    "DestinationOperation",
+    "ExportDestination",
+    "ExportDestinationMode",
+    "PrimPredicate",
+    "PrimPredicateKind",
+    "PropertyPredicate",
+    "PropertyPredicateKind",
+    "Selector",
+    "Desc",
     "open_usd",
     "open_usd_async",
     "open_usd_from_string",
     "open_usd_from_string_async",
+    "open_usd_with_desc",
+    "open_usd_with_desc_async",
+    "open_usd_from_string_with_desc",
+    "open_usd_from_string_with_desc_async",
     "add_usd_reference",
     "add_usd_reference_async",
     "add_usd_reference_from_string",
@@ -43,8 +124,51 @@ __all__ = [
     "update_from_usd_time_async",
     "apply_usd_changes",
     "apply_usd_changes_async",
+    "register_usd_schemas",
     "last_error",
     "available",
+    "export_available",
+    "create_export_destination",
+    "create_export_destination_async",
+    "export_to_destination",
+    "export_to_destination_async",
+    "export_to_usd_file",
+    "export_to_usd_file_async",
+    "export_typed_hierarchy_to_usd_file",
+    "export_typed_hierarchy_to_usd_file_async",
+    "OVSTAGE_POPULATION_EXPORT_SELECTION_EXPLICIT_PREDICATE",
+    "OVSTAGE_POPULATION_EXPORT_SELECTION_CHANGED_PROPERTIES_SINCE_ORDINAL",
+    "OVSTAGE_POPULATION_EXPORT_LAYER_MODE_OVER",
+    "OVSTAGE_POPULATION_EXPORT_LAYER_MODE_DEF",
+    "OVSTAGE_POPULATION_EXPORT_DESTINATION_EMPTY",
+    "OVSTAGE_POPULATION_EXPORT_DESTINATION_OPEN_EXISTING",
+    "OVSTAGE_POPULATION_EXPORT_PATH_MATCH_EXACT",
+    "OVSTAGE_POPULATION_EXPORT_PATH_MATCH_PREFIX",
+    "OVSTAGE_POPULATION_EXPORT_NAME_MATCH_EXACT",
+    "OVSTAGE_POPULATION_EXPORT_NAME_MATCH_GLOB",
+    "OVSTAGE_POPULATION_EXPORT_TRANSFORM_USD_XFORM_OP",
+    "OVSTAGE_POPULATION_EXPORT_TRANSFORM_NONE",
+    "OVSTAGE_POPULATION_EXPORT_TRANSFORM_USD_MATRIX_OP",
+    "OVSTAGE_POPULATION_EXPORT_UNKNOWN_METADATA_DROP",
+    "OVSTAGE_POPULATION_EXPORT_UNKNOWN_METADATA_PRESERVE",
+    "OVSTAGE_POPULATION_EXPORT_UNKNOWN_METADATA_FAIL",
+    "OVSTAGE_POPULATION_EXPORT_SOURCE_API_SCHEMAS_EXPLICIT_ONLY",
+    "OVSTAGE_POPULATION_EXPORT_SOURCE_API_SCHEMAS_APPLY_RECORDED",
+    "OVSTAGE_POPULATION_EXPORT_PROJECTION_EXPLICIT_RULES",
+    "OVSTAGE_POPULATION_EXPORT_PROJECTION_SCHEMA_DECLARED",
+    "OVSTAGE_POPULATION_EXPORT_UNKNOWN_APPLIED_API_SCHEMAS_CUSTOM_DATA_KEY",
+    "OVSTAGE_POPULATION_EXPORT_RULE_NONE",
+    "OVSTAGE_POPULATION_EXPORT_RULE_EXPORT_DEFAULT_VALUE",
+    "OVSTAGE_POPULATION_EXPORT_RULE_DERIVED_ALLOWED",
+    "OVSTAGE_POPULATION_EXPORT_RULE_INFER_CUSTOM_TYPE",
+    "OVSTAGE_POPULATION_EXPORT_RULE_REQUIRED",
+    "OVSTAGE_POPULATION_EXPORT_PROPERTY_RELATIONSHIP",
+    "OVSTAGE_POPULATION_EXPORT_PROPERTY_CONNECTION",
+    "OVSTAGE_POPULATION_EXPORT_PROPERTY_MATERIAL_BINDING",
+    "OVSTAGE_POPULATION_EXPORT_METADATA_PRIM",
+    "OVSTAGE_POPULATION_EXPORT_METADATA_LAYER_CUSTOM_DATA",
+    "OVSTAGE_POPULATION_EXPORT_METADATA_REFERENCES",
+    "OVSTAGE_POPULATION_EXPORT_METADATA_LAYER_STANDARD",
 ]
 
 
@@ -61,12 +185,35 @@ def last_error() -> str:
     return str(_b.load().ovstage_population_get_last_error())
 
 
+def descs_available() -> bool:
+    """True when the loaded ``libovstage`` exports the description-taking entry points.
+
+    A library older than the descriptions still answers :func:`available`, so the two are
+    probed separately. Both entry points are required: the binding layer configures their
+    prototypes as a unit, so a library exporting one without the other leaves neither
+    callable.
+    """
+    try:
+        lib = _b.load()
+        return all(hasattr(lib, name) for name in _b.POPULATION_DESC_ENTRY_POINTS)
+    except Exception:  # noqa: BLE001 — library not loadable in this environment
+        return False
+
+
 def _require(stage):
     if not available():
-        raise OvstageError(
-            _b.OVSTAGE_ERROR_NOT_SUPPORTED, "libovstage was built without the ovstage population bridge"
-        )
+        raise OvstageError(_b.OVSTAGE_ERROR_NOT_SUPPORTED, "libovstage was built without the ovstage population bridge")
     return stage._lib, stage._inst
+
+
+def _require_descs(stage):
+    lib, inst = _require(stage)
+    if not descs_available():
+        raise OvstageError(
+            _b.OVSTAGE_ERROR_NOT_SUPPORTED,
+            "libovstage predates the description-taking population entry points",
+        )
+    return lib, inst
 
 
 class Operation:
@@ -81,8 +228,8 @@ class Operation:
 
     def __init__(self, stage, status: int, op_id: int, *, value=True, keepalive=None, name: str = ""):
         self._stage = stage
-        self.status = int(status)
-        self.op_id = int(op_id)
+        self.status = check_int(status, "status")
+        self.op_id = check_handle(op_id, "op_id")
         self._value = value
         self._keepalive = keepalive  # holds ovx_string_t input buffers alive until waited
         self._name = name
@@ -132,8 +279,9 @@ def _enqueue(stage, name: str, result, *, value=True, keepalive=None) -> Operati
 
 
 # ── open (load + populate) ───────────────────────────────────────────────────
-def open_usd(stage, path: str, ordinal: int = 1, time_code: float = math.nan,
-             domains: int = PopulationDomain.RENDERING) -> None:
+def open_usd(
+    stage, path: str, ordinal: int = 1, time_code: float = math.nan, domains: int = PopulationDomain.RENDERING
+) -> None:
     """Open a USD file and populate the stage (blocking).
 
     ``time_code`` is in **seconds** (converted via the stage's
@@ -144,17 +292,21 @@ def open_usd(stage, path: str, ordinal: int = 1, time_code: float = math.nan,
     open_usd_async(stage, path, ordinal, time_code, domains).wait()
 
 
-def open_usd_async(stage, path: str, ordinal: int = 1, time_code: float = math.nan,
-                   domains: int = PopulationDomain.RENDERING) -> Operation:
+def open_usd_async(
+    stage, path: str, ordinal: int = 1, time_code: float = math.nan, domains: int = PopulationDomain.RENDERING
+) -> Operation:
     """Open a USD file and populate the stage (asynchronous). See :func:`open_usd`."""
     lib, inst = _require(stage)
     path_s = _b.ovx_string_t(path)
-    res = lib.ovstage_population_open_usd_from_file(inst, path_s, check_ordinal(ordinal), float(time_code), int(domains))
+    res = lib.ovstage_population_open_usd_from_file(
+        inst, path_s, check_ordinal(ordinal), float(time_code), check_domains(domains)
+    )
     return _enqueue(stage, "open_usd", res, keepalive=[path_s])
 
 
-def open_usd_from_string(stage, usda: str, ordinal: int = 1, time_code: float = math.nan,
-                         domains: int = PopulationDomain.RENDERING) -> None:
+def open_usd_from_string(
+    stage, usda: str, ordinal: int = 1, time_code: float = math.nan, domains: int = PopulationDomain.RENDERING
+) -> None:
     """Open inline USDA content and populate the stage (blocking).
 
     ``time_code`` follows the same contract as :func:`open_usd`: seconds, with
@@ -163,13 +315,75 @@ def open_usd_from_string(stage, usda: str, ordinal: int = 1, time_code: float = 
     open_usd_from_string_async(stage, usda, ordinal, time_code, domains).wait()
 
 
-def open_usd_from_string_async(stage, usda: str, ordinal: int = 1, time_code: float = math.nan,
-                               domains: int = PopulationDomain.RENDERING) -> Operation:
+def open_usd_from_string_async(
+    stage, usda: str, ordinal: int = 1, time_code: float = math.nan, domains: int = PopulationDomain.RENDERING
+) -> Operation:
     """Open inline USDA content and populate the stage (asynchronous). See :func:`open_usd_from_string`."""
     lib, inst = _require(stage)
     usda_s = _b.ovx_string_t(usda)
-    res = lib.ovstage_population_open_usd_from_string(inst, usda_s, check_ordinal(ordinal), float(time_code), int(domains))
+    res = lib.ovstage_population_open_usd_from_string(
+        inst, usda_s, check_ordinal(ordinal), float(time_code), check_domains(domains)
+    )
     return _enqueue(stage, "open_usd_from_string", res, keepalive=[usda_s])
+
+
+def _build_descs(descs):
+    """Convert `descs` to the C array plus the keepalive that owns what it points at."""
+    if isinstance(descs, Desc):
+        descs = (descs,)
+    try:
+        resolved = tuple(descs)
+    except TypeError:
+        # Without this the failure is "'Selector' object is not iterable", which names
+        # neither the parameter nor what it wanted -- and passing a bare Selector where a
+        # Desc goes is the likely mistake.
+        raise TypeError(f"descs must be a Desc or a sequence of Desc, got {type(descs).__name__}") from None
+    for desc in resolved:
+        if not isinstance(desc, Desc):
+            raise TypeError(f"descs entries must be Desc, got {type(desc).__name__}")
+    return build_descs(resolved)
+
+
+def open_usd_with_desc(stage, path: str, ordinal: int, time_code: float, descs) -> None:
+    """Open a USD file and populate the stage through a description (blocking).
+
+    ``descs`` is a :class:`Desc` or a sequence of them, mirroring the C entry point:
+    each contributor supplies one, their ``domains`` are OR-ed and their selectors and
+    stage metadata paths combined. A description carrying only ``domains`` is exactly
+    :func:`open_usd`. An empty sequence selects nothing. ``time_code`` follows the same
+    contract as :func:`open_usd`.
+    """
+    open_usd_with_desc_async(stage, path, ordinal, time_code, descs).wait()
+
+
+def open_usd_with_desc_async(stage, path: str, ordinal: int, time_code: float, descs) -> Operation:
+    """Open a USD file through a description (asynchronous). See :func:`open_usd_with_desc`."""
+    lib, inst = _require_descs(stage)
+    path_s = _b.ovx_string_t(path)
+    array, count, keepalive = _build_descs(descs)
+    res = lib.ovstage_population_open_usd_from_file_with_desc(
+        inst, path_s, check_ordinal(ordinal), float(time_code), array, count
+    )
+    return _enqueue(stage, "open_usd_with_desc", res, keepalive=[path_s, keepalive])
+
+
+def open_usd_from_string_with_desc(stage, usda: str, ordinal: int, time_code: float, descs) -> None:
+    """Open inline USDA and populate the stage through a description (blocking).
+
+    See :func:`open_usd_with_desc`.
+    """
+    open_usd_from_string_with_desc_async(stage, usda, ordinal, time_code, descs).wait()
+
+
+def open_usd_from_string_with_desc_async(stage, usda: str, ordinal: int, time_code: float, descs) -> Operation:
+    """Open inline USDA through a description (asynchronous). See :func:`open_usd_with_desc`."""
+    lib, inst = _require_descs(stage)
+    usda_s = _b.ovx_string_t(usda)
+    array, count, keepalive = _build_descs(descs)
+    res = lib.ovstage_population_open_usd_from_string_with_desc(
+        inst, usda_s, check_ordinal(ordinal), float(time_code), array, count
+    )
+    return _enqueue(stage, "open_usd_from_string_with_desc", res, keepalive=[usda_s, keepalive])
 
 
 # ── add / remove USD references (USD-source edits; no ordinal) ────────────────
@@ -212,8 +426,7 @@ def add_usd_reference_from_string_async(stage, ref_str: str, target_path: str) -
     target_s = _b.ovx_string_t(target_path)
     handle = _b.ovstage_population_usd_reference_handle_t()
     res = lib.ovstage_population_add_usd_reference_from_string(inst, usda_s, target_s, ctypes.byref(handle))
-    return _enqueue(stage, "add_usd_reference_from_string", res, value=int(handle.value),
-                    keepalive=[usda_s, target_s])
+    return _enqueue(stage, "add_usd_reference_from_string", res, value=int(handle.value), keepalive=[usda_s, target_s])
 
 
 def remove_usd(stage, handle: int) -> None:
@@ -224,7 +437,7 @@ def remove_usd(stage, handle: int) -> None:
 def remove_usd_async(stage, handle: int) -> Operation:
     """Remove a USD reference previously added by ``add_usd_reference*`` (asynchronous)."""
     lib, inst = _require(stage)
-    res = lib.ovstage_population_remove_usd_reference(inst, int(handle))
+    res = lib.ovstage_population_remove_usd_reference(inst, check_handle(handle, "handle"))
     return _enqueue(stage, "remove_usd", res)
 
 
@@ -268,3 +481,61 @@ def apply_usd_changes_async(stage, ordinal: int = 1) -> Operation:
     lib, inst = _require(stage)
     res = lib.ovstage_population_apply_usd_changes(inst, check_ordinal(ordinal))
     return _enqueue(stage, "apply_usd_changes", res)
+
+
+# ── USD schema registration (process-scoped, no stage) ───────────────────────
+def register_usd_schemas(paths) -> None:
+    """Register USD schema definitions with the USD runtime population reads through.
+
+    Population registers only what its USD build provides (the core ``Usd*``
+    schemas). Register any additional family your stages use, so population
+    resolves each prim's full schema-declared property set rather than only its
+    authored properties.
+
+    Registering does not load schema code, so a family that ships a C++ library
+    or Python module is usable for its definitions alone.
+
+    .. warning::
+       **Call this before the first ovstage call that reads USD schema
+       definitions** -- populating a stage and exporting one both do. A family
+       registered after that contributes nothing and raises
+       :class:`~ovstage.OvstageError`. One registered after some *other* USD
+       consumer in the process has read schemas cannot be detected and fails
+       silently.
+
+    Registration is irreversible. Re-registering an already-registered family is
+    a no-op, not an error.
+
+    :param paths: one path, or an iterable of paths. Each is either a USD plugin
+        descriptor (``plugInfo.json``) or a directory containing one. A
+        descriptor's ``Includes`` are followed, so a single entry can bring in a
+        whole tree of schema families.
+    :raises OvstageError: if a path names no readable descriptor, or the call
+        came too late to take effect.
+
+    .. note::
+       Only the paths themselves are checked. What a descriptor contains is
+       USD's to validate: a malformed one, or an ``Includes`` pattern matching
+       nothing, raises a USD diagnostic, contributes no plugins, and still
+       returns normally — surfacing later as schema properties that never
+       resolve.
+    """
+    if isinstance(paths, (str, bytes, os.PathLike)):
+        paths = [paths]
+    views = [_b.ovx_string_t(os.fsdecode(path)) for path in paths]
+    if not views:
+        return
+
+    lib = _b.load()
+    if not hasattr(lib, "ovstage_population_register_usd_schemas"):
+        raise OvstageError(
+            _b.OVSTAGE_ERROR_NOT_SUPPORTED,
+            "libovstage does not export ovstage_population_register_usd_schemas",
+        )
+
+    # `views` keeps the encoded buffers alive for the duration of the call; the
+    # array only borrows them.
+    array = (_b.ovx_string_t * len(views))(*views)
+    code = lib.ovstage_population_register_usd_schemas(array, len(views))
+    if code != _b.OVSTAGE_OK:
+        raise OvstageError(code, last_error() or "ovstage_population_register_usd_schemas")

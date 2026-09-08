@@ -137,6 +137,9 @@ ovstage — see the `string-handling` skill.
 - A list **returned by an ovstage read result** is a **borrow** held by the producing op. Do
   not release ovstage's reference; to keep the list beyond the producing handle, call
   `path_dictionary_add_path_list_reference` first and release that added reference when finished.
+- In Python, `create_path_list*` returns an `ovstage.PathList` that owns its reference and
+  releases it on `with`-exit or via a finalizer; see "Path-list ownership in Python" below.
+  The C contract is unchanged — C callers pair every create/add with exactly one release.
 
 ## C — intern and resolve
 
@@ -168,20 +171,62 @@ comparable:
 ## Python
 
 The path dictionary is `ovstage.PathDictionary` — a context manager wrapping the same
-interning service. Tokens/paths/lists are Python `int` handles; strings are `str`. Errors
+interning service. Tokens and prim paths are Python `int` handles; strings are `str`. Errors
 raise `ovstage.OvxError`.
 
 > **Source:** `examples/python/minimal/main.py` snippet `intern-and-resolve`
 >
 > Followed by: `examples/python/minimal/main.py` snippet `path-list-query`
 
-Resolve a path list back to strings with `paths.get_path_strings(list)`, and release a
-caller-created list with `paths.destroy_path_list(list)` (path lists are refcounted).
+Resolve a path list back to strings with `paths.get_path_strings(list)`.
 
-Construct standalone (`PathDictionary()`) or bind to a stage's shared dictionary via
-`PathDictionary(stage)` / `stage.get_path_dictionary()` for zero-conversion sharing. Same
-ownership rule as C: destroy **caller-created** lists; do not destroy lists handed back by
-an ovstage read result.
+Construct standalone (`PathDictionary()`) or bind to a stage's shared dictionary with
+`PathDictionary(stage)` for zero-conversion sharing. Same ownership rule as C: release
+**caller-created** lists; do not release lists handed back by an ovstage read result.
+
+### Path-list ownership in Python
+
+`create_path_list` / `create_path_list_from_strings` return an `ovstage.PathList`. It
+subclasses `int` and **is** the handle — it passes into `query_from_path_list` and every
+other slot unchanged, and `isinstance(handle, int)` still holds — but it also owns the
+reference the create call minted, and releases it on `with`-exit:
+
+> **Source:** `tests/python/test_path_lists.py` snippet `path-list-context-manager`
+
+`plist.release()` and `paths.destroy_path_list(plist)` are equivalent explicit forms. A
+`PathList` whose reference is still outstanding when it is garbage-collected releases it and
+emits a `ResourceWarning` — a bug report, not a strategy.
+
+Only `create_path_list*` mints a `PathList`. Borrowed lists from read results stay plain
+`int`, so the finalizer can never release a reference the caller does not own.
+
+A `PathList` owns exactly one reference: the one `create_path_list*` minted. A reference you
+add with `add_path_list_reference` is yours — pair it with one extra `destroy_path_list`, and
+note that dropping the `PathList` never reclaims it, so a bare handle you hand to a
+longer-lived consumer keeps working. Passing the `PathList` to `destroy_path_list` releases
+its own reference; passing the plain `int` releases one of your added references while any
+are outstanding.
+
+`query_from_path_list` wraps a **caller-owned** list, so keep your list alive for as long as
+the query and release it yourself. The returned `Query` holds a reference so the list cannot
+be finalized under a live query, but that is a safety net, not a transfer of ownership —
+releasing the query does not release your list. Bind the list rather than passing a freshly
+created one inline: an inline list leaves no handle to release, so it is reclaimed by the
+finalizer with a `ResourceWarning`.
+
+### Per-frame loops: create once, reuse
+
+Recreating the path list (and the query built from it) each iteration mints a reference per
+iteration. Python's GC does **not** reclaim these on its own — dropping a plain `int` handle
+does not decrement the C refcount — so under the pre-`PathList` bare-`int` contract the
+references accumulate for the life of the dictionary. Create both once outside the loop:
+
+> **Source:** `tests/python/test_path_lists.py` snippet `path-list-loop-reuse`
+>
+> Full runtime pattern: `examples/python/runtime-loop/main.py`
+
+Reuse is the point — the `PathList` finalizer is a safety net that bounds the damage of the
+anti-pattern, not a licence to keep writing it.
 
 ## Key Types / Functions
 
@@ -213,6 +258,16 @@ never returned on success.
   a valid empty list; their input array may be null when the count is zero.
   `get_*` slots require a live
   handle — calling one on a released/unknown path list returns `OVX_API_ERROR`.
+- On the dictionary ovstage hands out, `path_dictionary_get_tokens_from_paths` rejects
+  `OVX_INVALID_PRIMPATH` and unknown or expired prim-path handles with an actionable
+  `OVX_API_ERROR` and leaves the caller's output buffers untouched; Python
+  `PathDictionary.path_to_string` propagates that failure as `OvxError` instead of silently
+  returning an empty string. A valid root path still succeeds, with a zero-token decomposition,
+  which Python joins to `/` (matching `SdfPath`) — so `path_to_string` never returns an empty
+  string on success, and every valid handle round-trips back through `intern_path`.
+  Scope note: this is ovstage's implementation of the shared `ovx` vtable slot. Other
+  implementations behind the same slot may still report a successfully processed zero-token
+  path for a bad handle, so do not carry this guarantee into non-ovstage code.
 - Pair every `path_dictionary_create_path_list_from_*` / `..._add_path_list_reference` with
   exactly one `..._release_path_list_reference`; the list is freed when its refcount reaches
   zero. `OVX_INVALID_PRIMPATH_LIST` is a no-op on add/release. Do not release ovstage's

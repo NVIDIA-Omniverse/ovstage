@@ -23,10 +23,6 @@
 extern "C" {
 #endif
 
-/** @defgroup ovstage_config_helpers Configuration helper functions
- *  @{
- */
-
 /**
  * Build a config entry for a string setting.
  * @param key Config key from ovstage_config_string_t.
@@ -82,10 +78,9 @@ static inline ovstage_config_entry_t ovstage_config_entry_runtime_default_hierar
  * Configure the ovstage "binary package root" directory.
  *
  * This is used by the static loader (ovstage-static) to locate the ovstage
- * shared library and, transitively, its bundled runtime closure (plugins/,
- * ovstage_usd_schemas/), which ovstage resolves relative to the directory the
- * shared library is loaded from. If not provided, the loader defaults to its
- * own module directory.
+ * shared library and, transitively, its bundled runtime closure (plugins/),
+ * which ovstage resolves relative to the directory the shared library is loaded
+ * from. If not provided, the loader defaults to its own module directory.
  *
  * Pass this entry to ovstage_initialize(). The loader loads the shared library
  * once, from the root supplied on that first load — so static-loader consumers
@@ -120,8 +115,6 @@ static inline ovstage_config_entry_t ovstage_config_entry_binary_package_root_pa
  * Callable at any time, including before ovstage_initialize().
  */
 ovx_string_t ovstage_executable_dir(void);
-
-/** @} */ // end of ovstage_config_helpers
 
 #ifdef __cplusplus
 }

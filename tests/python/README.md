@@ -40,6 +40,19 @@ wheel (not the build tree).
   (`sparse-index-map-and-mask`).
 - `test_delete.py` — asserts attribute delete and whole-prim tombstones
   (`delete-attribute-then-prim`).
+- `test_asset_paths.py` — asserts the `ASSET_PATH_ID` contract: an
+  `(authored, resolved)` token pair round-trips for native and USD-populated
+  columns, an unresolved asset carries token id 0, and a byte-row payload is
+  rejected.
+- `test_read_groups.py` — asserts `ReadGroup` release ownership: `with` releases the pinned
+  storage (including when the body raises), double release is rejected, a dropped group is
+  reclaimed with a `ResourceWarning`, the release still happens when `ResourceWarning` is
+  escalated to an error, and a dropped group no longer blocks later writes
+  (`read-group-context-manager`).
+- `test_path_lists.py` — asserts `PathList` reference ownership: the handle is still an
+  `int`, `with`/`release` drop the create reference, double release is rejected, an added
+  reference is tracked, and a dropped list is reclaimed with a `ResourceWarning`
+  (`path-list-context-manager`, `path-list-loop-reuse`).
 
 Run via the cross-platform `../run_public_tests.py --wheel ...`, or directly with
 `ovstage` on `PYTHONPATH` and `libovstage` on the loader path:

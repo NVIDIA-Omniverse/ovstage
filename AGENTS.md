@@ -65,6 +65,7 @@ archive.
   `ovstage_api/*`,
   `ovstage_instancing.h` (high-level instancing queries; included from `ovstage.h`),
   `ovstage_population.h` (the population C API, USD -> ovstage; included from `ovstage.h`),
+  `ovstage_population_export.h` (selected ovstage -> USD authoring; included explicitly),
   and `ovalign.h`
 - `include/ovx/` - generated shared OVX headers shipped with the public mirror:
   `types.h`, `string_types.h`, `config_tokens.h`, `dlpack/dlpack.h`, and
@@ -80,6 +81,16 @@ archive.
   `THIRD-PARTY-NOTICES.txt` (generated third-party notice — do not edit)
 - `skills/` - task-oriented agent skills (`*/SKILL.md`)
 
+### USD workflow routing
+
+- Use `skills/loading-usd` for USD -> ovstage ingestion and live source edits.
+- Use `skills/exporting-to-usd` for ovstage -> USD selection, typed hierarchy
+  export, the saved-file and reusable-destination routes, destination ownership,
+  persistence, and export waits.
+- Use `skills/application-flow` for the general create/write/seal/read lifecycle,
+  `skills/error-handling` for status/diagnostics, and
+  `skills/usd-to-ovstage-migration` for direct-USD to data-plane migration.
+
 The internal implementation, unit tests, and benchmarks are
 maintained separately and are not part of this distribution; the `tests/` here
 are the public-contract suites that run against the produced package.
@@ -89,26 +100,12 @@ are the public-contract suites that run against the produced package.
 - Public headers are pure C: `extern "C"`, opaque handles, and no C++/STL/USD or
   host-framework types.
 - Renaming a public symbol is a breaking change.
-- Keep generic C API contracts implementation-neutral. Document current
-  limitations in explicit `@remark` sections, and
-  direct callers to runtime-reported capabilities such as the retention
-  frontier instead of promising implementation policy constants.
-- The public C API is the contract; alternate implementations may exist behind
-  it. Do not expose private implementation or host-framework component names in
-  public headers, docs, examples, bindings, or skills. Literal externally
-  defined attribute tokens are allowed where required by the data contract.
-  A concrete implementation identifier namespace needed to make an API usable
-  may appear only in an explicit implementation-scoped `@remark`.
 - `ovx_string_t` is an explicit pointer+length string view and is not required
   to be null-terminated. For string literals, prefer `literal_to_ovx_string(...)`
   or another explicit-length construction. Avoid helpers that accept arbitrary
   `const char*` and call `strlen`; pass `ovx_string_t` through helper layers, or
   use existing bounded storage such as `std::string::size()` in implementation
   code.
-- `<ovx/path_dictionary/path_dictionary.h>` and its sibling path-dictionary headers
-  are high-risk: the path dictionary is shared with downstream consumers (ovrtx,
-  physics, Isaac Sim). Flag any change to them explicitly. The canonical source
-  is `../../ovrtx/public/include/ovx/`; `include/ovx/` in this tree is generated.
 - The shipped headers are the source of truth. If a doc and a header disagree,
   the header wins and the doc must be corrected.
 

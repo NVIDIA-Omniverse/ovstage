@@ -40,11 +40,15 @@ jobs:
         uses: astral-sh/setup-uv@v4
 
       - name: Set up Python
-        run: uv python install 3.10
+        # 3.12+ so the resolver can reach current Sphinx (9.x requires it);
+        # older interpreters silently cap the "unbounded" resolution at 8.1.x.
+        run: uv python install 3.12
 
       - name: Build documentation
         working-directory: docs
-        run: make html
+        # Strict: any Sphinx/docutils warning fails the build instead of
+        # publishing a broken reference.
+        run: make html SPHINXOPTS="-W --keep-going"
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3

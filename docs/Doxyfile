@@ -35,6 +35,11 @@ MULTILINE_CPP_IS_BRIEF = YES
 
 # Optimize for C
 OPTIMIZE_OUTPUT_FOR_C  = YES
+# The public headers use the `typedef struct X { ... } X;` (and forward
+# `typedef struct X X;`) pattern. Without this, Doxygen emits both a compound
+# and a same-named typedef memberdef, Breathe renders both, and the Sphinx C
+# domain fails strict (-W) builds with "Duplicate C declaration".
+TYPEDEF_HIDES_STRUCT   = YES
 
 # Sort settings
 SORT_MEMBER_DOCS       = NO

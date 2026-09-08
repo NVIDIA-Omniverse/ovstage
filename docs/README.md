@@ -8,7 +8,7 @@ This directory contains the Sphinx source for the ovstage documentation publishe
 | Tool | Version | Install |
 |------|---------|---------|
 | [uv](https://docs.astral.sh/uv/getting-started/installation/) | ≥ 0.4 | `curl -LsSf https://astral.sh/uv/install.sh \| sh` (Linux/macOS) or `winget install astral-sh.uv` (Windows) |
-| [Doxygen](https://www.doxygen.nl/download.html) | ≥ 1.9 | `sudo apt-get install doxygen` (Ubuntu) or download the Windows installer |
+| [Doxygen](https://www.doxygen.nl/download.html) | ≥ 1.9 | `sudo apt-get install doxygen` (Ubuntu) or `winget install -e --id DimitriVanHeesch.Doxygen` (Windows) |
 
 Sphinx and all Python documentation dependencies (Breathe, nvidia-sphinx-theme, etc.) are
 declared in `python/pyproject.toml` under the `[docs]` extra and are installed
@@ -26,10 +26,6 @@ invokes Sphinx via `uv run`.
 
 ## Building on Windows
 
-> **Note:** Doxygen is not yet integrated into the Windows build. C API reference pages
-> will be absent from the output until Doxygen is wired into `make.bat`. All other pages
-> build normally.
-
 With `uv` on your `PATH` (see Prerequisites), `make.bat` automatically provisions
 Sphinx and the rest of the `[docs]` extra from `python/pyproject.toml` into a managed
 environment — no separate Sphinx install required:
@@ -38,6 +34,21 @@ environment — no separate Sphinx install required:
 cd docs
 make.bat html
 ```
+
+`make.bat html` runs Doxygen first, matching `make html` on Linux, and then invokes
+Sphinx. You can also run `make.bat doxygen` to generate only the C API XML.
+
+If you do not want to install Doxygen system-wide, download a pinned, project-local
+copy instead:
+
+```bat
+get-doxygen.bat
+make.bat html
+```
+
+The downloader verifies the archive's published SHA-256 checksum and extracts it to
+the ignored `docs\_tools` directory. `make.bat` discovers this copy automatically.
+You can also point `make.bat` at another executable by setting `%DOXYGEN%`.
 
 `make.bat` picks its Sphinx in this order:
 
@@ -82,5 +93,5 @@ make clean
 
 ```bat
 REM Windows
-rmdir /s /q _build _doxygen
+make.bat clean
 ```

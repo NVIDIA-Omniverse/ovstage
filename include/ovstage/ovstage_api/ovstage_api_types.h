@@ -35,7 +35,7 @@
  * The execution-model documentation lives at the top of `ovstage_api.h`
  * alongside the vtable definition.
  *
- * @version 0.1.1
+ * @version 0.2.0
  * @date 2026-05-28
  */
 
@@ -57,8 +57,8 @@
  * exactly these values, so a compile-time `#if` check and a runtime query
  * always agree. */
 #define OVSTAGE_VERSION_MAJOR 0
-#define OVSTAGE_VERSION_MINOR 1
-#define OVSTAGE_VERSION_PATCH 1
+#define OVSTAGE_VERSION_MINOR 2
+#define OVSTAGE_VERSION_PATCH 0
 
 /* Marks a deprecated public entry point: OVSTAGE_DEPRECATED("Use <new> instead")
  * on the old declaration. Emits a compiler warning at the call site where
@@ -487,24 +487,41 @@ typedef struct {
     *  the column at creation, read recovers it by decoding the column.
     *
     *    - Geometric semantics (POINT, VECTOR, NORMAL, COLOR, QUATERNION,
-    *      MATRIX, TEXTURE_COORDINATE) record a geometric role on the column.
-    *      Storage stays in the requested numeric `dtype`.
+    *      MATRIX, FRAME, TEXTURE_COORDINATE) record a geometric role on the
+    *      column. Storage stays in the requested numeric `dtype`.
+    *
+    *    - TIME_CODE marks a time code — a unitless time value — again with
+    *      storage in the requested numeric `dtype`. Only the plain numeric
+    *      value is carried: sentinel time codes have no portable numeric
+    *      encoding, so they are not representable.
     *
     *    - ID semantics select the corresponding ID storage type and
     *      require pre-interned id payloads (producers — e.g. ovpopulation —
     *      must intern via the path or token dictionary before
     *      writing; ovstage does not stringify or resolve):
     *          * TOKEN_ID             → `dtype = {kDLUInt, 64, 1}`
-    *                                   (one 64-bit token id per row)
+    *                                   (one 64-bit token id per row; id 0 is
+    *                                    the empty token)
     *          * RELATIONSHIP_PATH_ID → `dtype = {kDLUInt, 64, 1}`
     *                                   (one 64-bit path id per row)
     *          * CONNECTION_PATH_ID   → `dtype = {kDLUInt, 64, 2}`
     *                                   (one `(path_id, token_id)` pair per row,
     *                                    using one 16-byte element per row)
+    *          * ASSET_PATH_ID        → `dtype = {kDLUInt, 64, 2}`
+    *                                   (one `(authored_token, resolved_token)`
+    *                                    pair per row, using one 16-byte element
+    *                                    per row)
     *
-    *    - Byte-string semantics (ASSET_STRING, PATH_EXPRESSION_STRING) keep
-    *      ragged `kDLUInt,8,1` byte-row storage with NUL-separated, authored
-    *      sub-values.
+    *      An asset has two paths: the path as authored, and the path after
+    *      resolution. ASSET_PATH_ID carries both as token ids. A token id of 0
+    *      means no path, so an unresolved asset has a resolved token id of 0.
+    *
+    *    - PATH_EXPRESSION_STRING carries the expression text as one interned
+    *      token id, dtype `{kDLUInt, 64, 1}`. `is_array = false` is a scalar
+    *      `pathExpression`; `true` is `pathExpression[]`, one id per element.
+    *      Other layouts return `OVSTAGE_ERROR_INVALID_ARGUMENT`. A token id of
+    *      0 means no expression. ovstage does not evaluate the expression; it
+    *      stores the id of the authored text.
     *
     *    - STRING carries a plain USD `string` value as raw UTF-8 bytes. The
     *      payload is a ragged `kDLUInt,8,1` byte array (one string per row,
@@ -518,7 +535,7 @@ typedef struct {
 typedef enum
 {
     OVSTAGE_SEMANTIC_NONE                   = 0,
-    OVSTAGE_SEMANTIC_ASSET_STRING           = 1,
+    OVSTAGE_SEMANTIC_ASSET_PATH_ID          = 1,
     OVSTAGE_SEMANTIC_TOKEN_ID               = 2,
     OVSTAGE_SEMANTIC_PATH_EXPRESSION_STRING = 3,
     OVSTAGE_SEMANTIC_RELATIONSHIP_PATH_ID   = 4,
@@ -531,6 +548,8 @@ typedef enum
     OVSTAGE_SEMANTIC_TEXTURE_COORDINATE     = 11,
     OVSTAGE_SEMANTIC_CONNECTION_PATH_ID     = 12,
     OVSTAGE_SEMANTIC_STRING                 = 13,
+    OVSTAGE_SEMANTIC_TIME_CODE              = 14,
+    OVSTAGE_SEMANTIC_FRAME                  = 15,
 } ovstage_attribute_semantic_t;
 
 /* ═══════════════════════════════════════════════════════════════════════════════

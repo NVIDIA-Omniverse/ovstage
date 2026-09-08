@@ -96,3 +96,48 @@ def test_write_below_floor_rejected(stage):
         finally:
             stage.release_query(query).wait()
             paths.destroy_path_list(plist)
+
+
+def test_write_rejects_fractional_ordinal_and_token(stage):
+    """Integer-only fields reject a float instead of truncating it.
+
+    An ordinal and an attribute token are integers, so `ordinal=5.25` is a
+    caller error, not a request to write at 5. Integral floats are rejected on
+    the same grounds: a float carries 53 bits of mantissa and these fields are
+    64-bit, so `5.0` is not a safe spelling of `5` either.
+    """
+    with PathDictionary(stage) as paths:
+        plist = paths.create_path_list_from_strings(["/World/StrictInts/A"])
+        query = stage.query_from_path_list(plist)
+        try:
+            score = paths.intern_token("score")
+            values = np.array([1.0], np.float32)
+
+            for bad in (5.25, 5.0):
+                with pytest.raises(TypeError):
+                    stage.write_attribute(query, score, ordinal=bad, tensors=values, is_array=False)
+                with pytest.raises(TypeError):
+                    stage.write_attribute(query, bad, ordinal=1, tensors=values, is_array=False)
+
+            with pytest.raises(TypeError):
+                stage.advance_write_floor(11.9)
+
+            # The integer forms still round-trip.
+            stage.write_attribute(
+                query, score, ordinal=5, tensors=np.array([12.5], np.float32), is_array=False
+            ).wait()
+            stage.advance_write_floor(5).wait()
+
+            read = stage.read_attributes(query, [score], OrdinalRange.latest(5))
+            read.wait()
+            with pytest.raises(TypeError):
+                stage.read_attributes(query, [score + 0.75], OrdinalRange.latest(5))
+            seen = []
+            for group in read.groups():
+                seen.extend(float(v) for v in group.array(0))
+                stage.release_group(group)
+            read.release().wait()
+            assert seen == [12.5]
+        finally:
+            stage.release_query(query).wait()
+            paths.destroy_path_list(plist)

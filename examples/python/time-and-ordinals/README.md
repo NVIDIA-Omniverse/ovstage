@@ -77,7 +77,7 @@ uv run main.py
 The wheel bundles the native library under `<package>/bin`, which the bindings
 search automatically, so no loader-path setup is needed. To run against a
 locally built `libovstage` instead, put the build output dir (the one holding
-`ovstage.dll` / `libovstage.so`) on the loader path — `PATH` on Windows,
+`ovstage-dynamic.dll` / `libovstage-dynamic.so`) on the loader path — `PATH` on Windows,
 `LD_LIBRARY_PATH` on Linux — and use a plain interpreter:
 
 ```bash

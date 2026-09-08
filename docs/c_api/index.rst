@@ -44,16 +44,26 @@ Backend-owned enums, handles, and result structures.
 Population (USD → ovstage)
 --------------------------
 
+Per-stage population state is created lazily on first use of any populate
+entry point and released automatically when the ovstage instance is
+destroyed via ``ovstage_destroy_instance``.
+
 .. doxygenfile:: ovstage_population.h
    :project: ovstage
 
-.. doxygengroup:: ovstage_population_lifecycle
+.. doxygenfile:: ovstage_population_predicate.h
    :project: ovstage
-   :content-only:
 
-.. doxygengroup:: ovstage_population_diagnostics
+Population Export (ovstage → USD)
+---------------------------------
+
+Selected current runtime state can be authored into a USD destination that
+ovstage opens and owns, without exposing OpenUSD C++ types through the C ABI.
+See :doc:`/scene/exporting_to_usd` for destination ownership and persistence
+rules.
+
+.. doxygenfile:: ovstage_population_export.h
    :project: ovstage
-   :content-only:
 
 Instancing
 ----------
@@ -62,10 +72,6 @@ High-level instancing queries.
 
 .. doxygenfile:: ovstage_instancing.h
    :project: ovstage
-
-.. doxygengroup:: ovstage_instancing
-   :project: ovstage
-   :content-only:
 
 API Types and Utilities
 -----------------------
@@ -88,10 +94,6 @@ Helpers for building the ``ovstage_config_t`` entries passed to
 .. doxygenfile:: ovstage_config.h
    :project: ovstage
 
-.. doxygengroup:: ovstage_config_helpers
-   :project: ovstage
-   :content-only:
-
 Alignment Helpers
 -----------------
 
@@ -105,6 +107,9 @@ The shared path dictionary: interning, tokens, and prim-path lists. These
 headers ship under ``include/ovx/`` and are shared with sibling OV libraries.
 
 .. doxygenfile:: path_dictionary/path_dictionary.h
+   :project: ovstage
+
+.. doxygenfile:: path_dictionary/path_dictionary_vtable.h
    :project: ovstage
 
 .. doxygenfile:: path_dictionary/path_dictionary_types.h

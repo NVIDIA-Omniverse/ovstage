@@ -44,9 +44,12 @@ The C suite builds via CMake + GoogleTest and runs via `ctest`. The Python suite
 runs via `pytest`. Both build and run against the produced package, not the build
 tree.
 
-There is no `usd/` suite because ovstage does not author raw USDA for its public
-surface today. Add one only if a public workflow starts shipping standalone
-`.usda` files.
+There is no separate `usd/` suite. Runtime-to-USD export is covered through both
+public-contract suites. Both use the saved-file and reusable-destination APIs and
+inspect the persisted USD through public test/report behavior and the saved text,
+without coupling to OpenUSD C++ ABI types. ovstage owns every export
+destination, so no public route authors into a caller-owned layer or stage and
+no public test may assume the caller shares ovstage's USD runtime.
 
 ### Data flow: test → snippet → skill → doc
 
@@ -59,11 +62,11 @@ test file (tests/c/*.cpp, tests/python/*.py)
 skill (../skills/*/SKILL.md)  — references snippets via > **Source:** directives
         |
         v
-RST doc (docs/*.rst, when docs land) — literalinclude with :start-after:/:end-before:
+RST doc (../docs/**/*.rst) — literalinclude with :start-after:/:end-before:
 ```
 
-Skills are the primary consumer today (docs are still coming for ovstage). When
-you add or change a snippet, update every skill that references it.
+Skills and RST docs are both live consumers. When you add or change a snippet,
+update every skill and doc that references it.
 
 ## Rules
 
@@ -72,6 +75,9 @@ These rules are mandatory.
 1. **Snippets are the source of truth.** Never write inline API code blocks in a
    skill or RST doc. Substantial examples live in a test file with snippet markers
    and are pulled in by reference. Small one-liners may stay inline.
+   A runnable shipped example may also carry a paired marker for a skill's
+   operational recipe, but it supplements rather than replaces asserted test
+   coverage; list the asserted test snippet in the inventory below.
 2. **Test against the produced package.** Suites build/run against the shipped
    headers and wheel, so a signature drift fails the test.
 3. **Snippet naming.** kebab-case, unique across the whole `tests/` tree. The C
@@ -99,8 +105,8 @@ These rules are mandatory.
 ## Snippet inventory
 
 **Agents MUST keep this table current** — update it in the same change that adds,
-renames, moves, or removes a snippet. Each entry is an asserted tested snippet that
-feeds an ovstage skill.
+renames, moves, or removes a snippet. Each entry is an asserted tested snippet
+consumed by an ovstage skill and/or public documentation.
 
 | Snippet | Source file | Used in |
 |---------|-------------|---------|
@@ -114,6 +120,23 @@ feeds an ovstage skill.
 | `reset-usd` | `tests/python/test_population.py` | `skills/loading-usd` |
 | `open-missing-file-c` | `tests/c/test_population.cpp` | `skills/loading-usd` |
 | `open-missing-file` | `tests/python/test_population.py` | `skills/loading-usd` |
+| `populate-by-schema-c` | `tests/c/test_population.cpp` | `skills/loading-usd` |
+| `populate-by-schema` | `tests/python/test_population.py` | `skills/loading-usd` |
+| `populate-narrowed-c` | `tests/c/test_population.cpp` | `skills/loading-usd` |
+| `populate-narrowed` | `tests/python/test_population.py` | `skills/loading-usd` |
+| `populate-stage-metadata` | `tests/python/test_population.py` | `skills/loading-usd` |
+| `populate-several-descs` | `tests/python/test_population.py` | `skills/loading-usd` |
+| `register-usd-schemas-c` | `tests/c/test_population.cpp` | `skills/loading-usd` |
+| `export-typed-hierarchy-to-usd-c` | `tests/c/test_population_export.cpp` | `skills/exporting-to-usd`, `docs/scene/exporting_to_usd.rst` |
+| `export-typed-hierarchy-to-usd-file` | `tests/python/test_population_export.py` | `skills/exporting-to-usd`, `docs/scene/exporting_to_usd.rst` |
+| `export-runtime-to-usd` | `tests/python/test_population_export.py` | `skills/exporting-to-usd`, `docs/scene/exporting_to_usd.rst` |
+| `export-reusable-destination` | `tests/python/test_population_export.py` | `skills/exporting-to-usd`, `docs/scene/exporting_to_usd.rst` |
+| `export-custom-attributes-to-usd` | `tests/python/test_population_export.py` | `docs/scene/exporting_to_usd.rst` |
+| `export-schema-attribute-to-usd` | `tests/python/test_population_export.py` | `docs/scene/exporting_to_usd.rst` |
+| `export-homogeneous-mesh-subtree` | `tests/python/test_population_export.py` | `skills/exporting-to-usd`, `docs/scene/exporting_to_usd.rst` |
+| `export-changed-properties-to-usd` | `tests/python/test_population_export.py` | `docs/scene/exporting_to_usd.rst` |
+| `export-runtime-to-usd-async-c` | `tests/c/test_population_export.cpp` | `skills/exporting-to-usd`, `docs/scene/exporting_to_usd.rst` |
+| `export-runtime-to-usd-async` | `tests/python/test_population_export.py` | `skills/exporting-to-usd`, `docs/scene/exporting_to_usd.rst` |
 | `clone-and-verify-c` | `tests/c/test_clone.cpp` | `skills/clone-subtree-multienv` |
 | `clone-and-verify` | `tests/python/test_clone.py` | `skills/clone-subtree-multienv` |
 | `clone-target-exists-error-c` | `tests/c/test_error_handling.cpp` | `skills/error-handling` |
@@ -134,6 +157,9 @@ feeds an ovstage skill.
 | `attribute-shapes-ragged` | `tests/python/test_attribute_shapes.py` | `skills/dlpack-tensor-exchange` |
 | `semantic-roles-c` | `tests/c/test_attributes.cpp` | `skills/dlpack-tensor-exchange` |
 | `semantic-roles` | `tests/python/test_attributes.py` | `skills/dlpack-tensor-exchange` |
+| `path-list-context-manager` | `tests/python/test_path_lists.py` | `skills/path-dictionary` |
+| `path-list-loop-reuse` | `tests/python/test_path_lists.py` | `skills/path-dictionary` |
+| `read-group-context-manager` | `tests/python/test_read_groups.py` | `skills/dlpack-tensor-exchange` |
 | `map-unmap-cpu-c` | `tests/c/test_map_attribute.cpp` | `skills/dlpack-tensor-exchange` |
 | `map-unmap-cpu` | `tests/python/test_map_attribute.py` | `skills/dlpack-tensor-exchange` |
 | `map-dlpack-readonly` | `tests/python/test_map_attribute.py` | `skills/dlpack-tensor-exchange` |

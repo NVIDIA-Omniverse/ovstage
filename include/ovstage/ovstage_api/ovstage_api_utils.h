@@ -30,7 +30,7 @@
 #ifndef OVSTAGE_API_UTILS_H
 #define OVSTAGE_API_UTILS_H
 
-#include "ovstage_api_types.h"
+#include "ovstage_api.h"
 
 #ifdef __cplusplus
 extern "C" {

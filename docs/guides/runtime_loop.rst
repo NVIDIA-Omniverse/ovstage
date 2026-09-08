@@ -109,18 +109,14 @@ the scene query and resolving each token to its type name:
          :exclude-pattern: ^\s*//\s*\[/?snippet:
          :dedent:
 
-.. note::
-
-   This example reads back the transform it wrote itself. Reading a *populated*
-   implementation-defined derived scene transform (``omni:fabric:localMatrix`` /
-   ``omni:fabric:worldMatrix``) back through
-   ``read_attributes`` is not part of this validated flow.
-
 3. Update the Table
 -------------------
 
-Animate a prim by writing ``omni:xform`` (a 4×4 matrix, ``MATRIX`` semantic)
-straight into the table over successive ordinals, advancing the floor each step:
+Animate a prim by writing its local ``omni:xform`` (a 4×4 matrix, ``MATRIX``
+semantic) straight into the table over successive ordinals, advancing the floor
+each step. This guide reads back only the local value it writes; it does not
+validate a hierarchy-derived world transform. See :doc:`/scene/transforms`
+before using this attribute to publish effective world transforms:
 
 .. tab-set::
 
@@ -193,5 +189,6 @@ Where to Go Next
 ----------------
 
 - :doc:`/scene/population` — the population API in detail.
+- :doc:`/scene/transforms` — local and effective-world transform authoring.
 - :doc:`/scene/writing_attributes` — the table-write path and attribute semantics.
 - :doc:`/scene/reading_attributes` — reading metadata and columns back.

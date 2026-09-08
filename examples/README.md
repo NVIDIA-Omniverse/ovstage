@@ -7,6 +7,12 @@ example keeps them inline so it stays self-contained. The examples fail fast —
 any unexpected API failure prints and exits, so the happy path reads straight
 through; a real application would propagate errors instead.
 
+Each example demonstrates an end-to-end workflow. The fine-grained API
+*contracts* — column shapes, UPSERT/INSERT admission, ragged arrays, sparse
+index-map and masked writes, delete tombstones, and the CPU map/unmap
+lifecycle — are asserted by the public test suites under [../tests/](../tests/)
+rather than by the examples.
+
 Each example is a self-contained project: the C examples build standalone with
 CMake against the released ovstage package, and the Python examples run with
 [uv](https://docs.astral.sh/uv/) against the released `ovstage` wheel. Per-example
@@ -47,7 +53,7 @@ READMEs carry the exact build and run commands.
       <b>Write Flavors</b>
       <br>
       <blockquote>
-        <p align="left"><em>“Create one ovstage example that tours every write path: scalar and fixed-lane columns, ragged arrays, semantic roles, upsert vs insert admission, sparse index-map and masked writes, batched multi-attribute writes, subtree cloning, attribute and whole-prim deletion, the CPU map/unmap lifecycle, pipelined asynchronous submission with zero-timeout polling, and — in Python — zero-copy CUDA ingest from warp.”</em></p>
+        <p align="left"><em>“Create one ovstage example that tours the higher-level write workflows: batched multi-attribute writes landing a scalar column and a fixed-lane column carrying a semantic role in one operation, subtree cloning followed by a re-query of the clones, pipelined asynchronous submission drained with zero-timeout polling, and — in Python — zero-copy CUDA ingest from warp.”</em></p>
       </blockquote>
       <sub>Build &amp; run in: <a href="c/write-flavors/">C →</a>, <a href="python/write-flavors/">Python →</a></sub>
     </td>
@@ -75,7 +81,7 @@ READMEs carry the exact build and run commands.
       <b>Queries</b>
       <br>
       <blockquote>
-        <p align="left"><em>“Create an ovstage example that discovers prims with filter queries instead of path lists — type, path-prefix, parent, children, and applied-schema predicates plus attribute presence — introspects what the query found, and — in C — maps scene-graph instancing structure.”</em></p>
+        <p align="left"><em>“Create an ovstage example that discovers prims with filter queries instead of path lists — type, path-prefix, parent, children, and applied-schema predicates plus attribute presence — introspects what the query found, and maps scene-graph instancing structure.”</em></p>
       </blockquote>
       <sub>Build &amp; run in: <a href="c/queries/">C →</a>, <a href="python/queries/">Python →</a></sub>
     </td>
@@ -86,6 +92,24 @@ READMEs carry the exact build and run commands.
         <p align="left"><em>“Create an example that runs one small workflow twice in one process — define typed prims, author attributes one by one, batch a group of edits, read the values back — first with the plain USD API on a stage never bound to ovstage, then with the ovstage equivalents, contrasting USD's per-prim calls with ovstage's vectorized and batched writes by op count.”</em></p>
       </blockquote>
       <sub>Build &amp; run in: <a href="python/usd-to-ovstage/">Python only →</a></sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="50%">
+      <b>Runtime to USD Export</b>
+      <br>
+      <blockquote>
+        <p align="left"><em>“Select a typed runtime subtree with shared population predicates and export it through metadata-driven projection, without rule tables, to a one-shot saved USD file, then inspect the report.”</em></p>
+      </blockquote>
+      <sub>Build &amp; run in: <a href="c/usd-export/">C →</a>, <a href="python/usd-export/">Python →</a></sub>
+    </td>
+    <td align="center" width="50%">
+      <b>Destination Ownership</b>
+      <br>
+      <blockquote>
+        <p align="left"><em>“Both examples use the one-shot file API, which creates a private destination, exports once, saves it, and closes it before returning.”</em></p>
+      </blockquote>
+      <sub>Read the <a href="../docs/scene/exporting_to_usd.rst">export guide →</a></sub>
     </td>
   </tr>
 </table>

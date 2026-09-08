@@ -39,10 +39,10 @@ ovstage is a building block — the application is always in control of what dat
 Core capabilities:
 
 - **Ordinal-keyed writes** — every write carries an ordinal used purely for ordering and change membership; payload reads always return the latest committed snapshot (no historical or per-version payload access)
-- **CPU/GPU tensor interchange** — DLTensor carries CPU or CUDA buffers without requiring a custom tensor format. The current 0.1 backend accepts zero-copy CUDA source tensors for writes, while payload reads and map/unmap buffers are CPU-resident; GPU array reads and CUDA array maps are not yet supported.
+- **CPU/GPU tensor interchange** — DLTensor carries CPU or CUDA buffers without requiring a custom tensor format. The current implementation accepts zero-copy CUDA source tensors for writes, while payload reads and map/unmap buffers are CPU-resident; GPU array reads and CUDA array maps are not yet supported.
 - **Built-in change detection** — change-membership queries ("what changed since ordinal N?") are a first-class operation (expressed as an ordinal-range read; see `ovstage_ordinal_range_t` in the C API reference) that report exact changed prims within the runtime-reported retention frontier; callers do not assume a fixed retention depth, and older markers may be coalesced per attribute and prim
 - **Uniform addressing** — shared prim path dictionary means handles pass between libraries with zero conversion
-- **Asynchronous submission** — state-mutating and data-producing work is enqueued, while fetch, status, lifecycle, and path-dictionary calls remain synchronous. The current 0.1 backend executes queued work serially; the API preserves ordinal ordering semantics for future concurrent backends.
+- **Asynchronous submission** — state-mutating and data-producing work is enqueued, while fetch, status, lifecycle, and path-dictionary calls remain synchronous. The current implementation executes queued work serially; the API preserves ordinal ordering semantics for future concurrent backends.
 - **Query filters** — queries filter on prim metadata (type, schema, path)
 
 ---
@@ -55,7 +55,7 @@ These principles guided the API design and are relevant for understanding trade-
 
 2. **No leaked implementation details.** The API does not expose internal storage layout. Read results are grouped by memory locality (for performance), not by schema bucketing (an implementation choice). Consumers never need to understand internal partitioning.
 
-3. **Zero-copy-capable tensor transport.** Read results return pointers into internal storage. DLTensor carries device type, pointer, and shape for CPU and GPU interchange without a custom tensor format. In the current 0.1 backend, reads and map/unmap buffers are CPU-resident; CUDA source tensors can be ingested without a host round-trip, while GPU array reads and CUDA array maps remain future work.
+3. **Zero-copy-capable tensor transport.** Read results return pointers into internal storage. DLTensor carries device type, pointer, and shape for CPU and GPU interchange without a custom tensor format. In the current implementation, reads and map/unmap buffers are CPU-resident; CUDA source tensors can be ingested without a host round-trip, while GPU array reads and CUDA array maps remain future work.
 
 4. **Optional complexity — implementations can subset.** An implementation supporting only latest-value reads uses the same API signatures. Value-based query filters are optional. Historical/per-version payload access is optional. The API contract is the same; the capability level is declared.
 
@@ -95,6 +95,7 @@ graph TD
 
     OVSTAGE --> PATHDICT
     OPENUSD -->|ovstage population API| OVSTAGE
+    OVSTAGE -->|selected runtime-to-USD export| OPENUSD
     OVSTAGE <--> DLPACK
 ```
 
@@ -106,7 +107,7 @@ graph TD
 | **ovphysx** | Optional integration consumer that can read scene setup and write simulation results through an application-owned ovstage. |
 | **ovrtx** | Optional integration consumer that can read changed render state from an application-owned ovstage. |
 | **ovx/path_dictionary** | Shared addressing API used by ovstage and participating consumers to exchange tokens and prim-path lists. |
-| **OpenUSD** | Optional source of composed scene data through the `ovstage_population_*` API. Direct runtime authoring does not require loading USD. |
+| **OpenUSD** | Optional source of composed scene data through the `ovstage_population_*` API and destination for explicitly selected runtime-to-USD export. Direct runtime authoring does not require loading USD. |
 | **DLPack** | Tensor interchange format for CPU and CUDA producers and consumers, subject to the current backend limitations described above. |
 
 This graph describes supported public integration boundaries, not a requirement that every OV library use ovstage. Additional library integrations should be documented when their public contracts and maturity are established.
@@ -143,7 +144,7 @@ graph LR
 - **Parse once:** The ovstage population API traverses USD once. Participating libraries consume the same populated data.
 - **Built-in change detection:** A consumer can ask "what changed since my last read?" and use change membership instead of performing a full-scene diff.
 - **Different rates with explicit coordination:** Producers and consumers can run at different cadences while the application owns ordinals, write-floor advancement, retention checks, and consumer scheduling.
-- **CPU/GPU interchange:** DLPack permits CPU or CUDA producers without a custom tensor format. In 0.1, CUDA source tensors can be written without a host round-trip, but reads and map/unmap buffers remain CPU-resident.
+- **CPU/GPU interchange:** DLPack permits CPU or CUDA producers without a custom tensor format. Currently, CUDA source tensors can be written without a host round-trip, but reads and map/unmap buffers remain CPU-resident.
 - **Shared addressing:** Participating libraries use the shared path dictionary so tokens and prim-path lists can cross integration boundaries without repeated string lookups.
 
 ---
@@ -192,6 +193,7 @@ ovstage stores **post-composition** USD data in a runtime-optimized format. It d
 
 - **USD** = persistent scene description (files, composition, layering)
 - **ovstage population API** = the optional bridge that traverses composed USD and writes attributes into ovstage
+- **ovstage population export API** = shared-predicate selection plus explicit, sparse projection into a one-shot saved file or a reusable destination, both opened and owned by ovstage
 - **ovstage** = runtime mirror (vectorized, CPU/GPU-capable, change-tracked, queryable)
 
 Libraries read from ovstage at runtime; they don't need to interact with USD directly.

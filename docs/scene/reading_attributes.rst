@@ -58,8 +58,29 @@ Groups and Lifetime
   each group carries a prim group and its ``ovstage_data_t`` tensors — until
   ``OVSTAGE_ERROR_END_OF_ITERATION``.
 - Release each group with ``ovstage_release_group``, then the read with
-  ``ovstage_release_read``. In Python the ``Read`` handle and its groups clean up
-  through their normal object lifetime.
+  ``ovstage_release_read``. A group's pinned storage is an independent resource:
+  releasing the read does **not** reclaim it, and an unreleased group keeps its
+  outstanding-read coverage, so later writes to the same attribute and prims fail
+  with an "overlapping outstanding read" error reported at the write site.
+- In Python, ``ReadGroup`` is a context manager that releases on block exit,
+  including when the body raises. ``fetch_next()`` returns ``None`` at end of
+  iteration, so bind it before entering the block (``group = read.fetch_next()``
+  → ``if group is not None:`` → ``with group:``), or iterate ``read.groups()``,
+  which yields only real groups. Dropping a group without releasing it triggers a
+  finalizer that releases it and emits a ``ResourceWarning``; treat that as a bug
+  report rather than a strategy.
+- ``group.array(i)`` **borrows** the group's storage and does not keep the group
+  alive. Bind the group for as long as you read through the view — a view taken
+  from a temporary (``read.fetch_next().array(0)``) outlives the group that backs
+  it, and reads storage the group released. Copy out (``np.array(...)``) anything
+  that must outlive the group. Accessing the *group* after release raises rather
+  than reading dangling memory, but a view already handed out cannot be guarded.
+- A **DLPack** consumer view follows the same borrowing rule and cannot be
+  tracked at all: the capsule is destroyed when the consumer takes ownership and
+  its deleter runs no Python, so nothing reports back when the consumer is done.
+  ``np.from_dlpack(read.fetch_next().dlpack(0))`` drops the group on that line and
+  leaves the result reading storage that has been handed back — bind the group
+  instead.
 
 A group's tensor data is a borrowed view into the latest committed snapshot.
 Copy it if you need it after the next commit (refer to :doc:`/concepts/dlpack_tensors`).

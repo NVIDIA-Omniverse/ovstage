@@ -24,7 +24,7 @@
  * call the generic `ovstage_*` wrappers declared in `ovstage_api.h` and the
  * backend-specific entry points declared here to drive it.
  *
- * @version 0.1.1
+ * @version 0.2.0
  * @date 2026-05-27
  */
 
@@ -106,6 +106,17 @@ ovstage_api_status_t ovstage_shutdown(void);
  * non-null callback and torn down when the callback is cleared, so a client that
  * never installs a callback pays nothing. Passing @p callback = NULL flushes any
  * pending messages to the current callback and then disables delivery.
+ *
+ * When ovstage runs standalone (the shipped package used directly), this
+ * callback is the only diagnostics sink: with no callback installed the runtime
+ * prints nothing to stdout/stderr — except a final sanitized message when a
+ * fatal error aborts the process — and operation failures are reported through
+ * status codes and the error string accessors regardless of logging. When
+ * ovstage is embedded in a host application that configures its own logging,
+ * console behavior follows the host's configuration. USD-support-layer messages
+ * carry the diagnostic text only (statuses at OVSTAGE_LOG_INFO, warnings and
+ * USD coding errors at OVSTAGE_LOG_WARNING, other errors at OVSTAGE_LOG_ERROR),
+ * never call-site file/line details.
  *
  * Requires the ovstage runtime to be bootstrapped (an ovstage_initialize() or a
  * live instance); otherwise returns OVSTAGE_ERROR_OP_FAILED. Keep a process
@@ -218,8 +229,8 @@ ovstage_api_status_t ovstage_get_usd_stage_id(
  * `skel:skeleton`), scalar/array path values, and USD attribute connections.
  * Paths outside the source subtree are copied unchanged, so clones can continue to
  * reference shared materials and other shared resources. Cloned attribute values,
- * including relationship targets and attribute connections, are ordinal-change-tracked.
- * Scene hierarchy changes, such as the source/target parents' child lists, are not.
+ * including relationship targets, are ordinal-change-tracked. Attribute connections and
+ * scene hierarchy changes, such as the source/target parents' child lists, are not.
  *
  * @param instance         The ovstage instance.
  * @param source_path      Path to the source subtree to clone.

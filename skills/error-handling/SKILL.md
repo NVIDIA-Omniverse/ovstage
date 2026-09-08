@@ -68,6 +68,11 @@ Resolve inputs in this order: existing repository files and referenced snippets,
 6. When changing code, run the narrow ovstage unit test that exercises the failing
    operation whenever practical.
 
+For USD export operations, wait with the matching export-specific wait to obtain
+its report. That wait does not consume unrelated generic population failures;
+observe and drain those separately with the generic population wait. Route
+destination ownership and save/rollback questions to `exporting-to-usd`.
+
 ## Output Format
 
 - For explanations, cite the relevant API names, source snippets, and caveats.

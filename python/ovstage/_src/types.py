@@ -16,9 +16,12 @@ zero-copy numpy access.
 """
 
 import ctypes
+import operator
+import sys
+import warnings
 from dataclasses import dataclass, field
 from enum import IntEnum, IntFlag
-from typing import Any, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, FrozenSet, List, Optional, Sequence, Tuple, Type, Union
 
 from . import bindings as _b
 from .bindings import check_timeout  # defined there to avoid an import cycle with flush_log
@@ -31,6 +34,8 @@ __all__ = [
     "PrimMode",
     "Scope",
     "PopulationDomain",
+    "PrimPredicateKind",
+    "PropertyPredicateKind",
     "AttributeSemantic",
     "HierarchyRelation",
     "HierarchyComputationModel",
@@ -53,7 +58,12 @@ __all__ = [
 TIMEOUT_INFINITE = _b.OVSTAGE_TIMEOUT_INFINITE
 
 
-_ORDINAL_MAX = (1 << 64) - 1  # ovstage_ordinal_t is uint64_t
+_UINT32_MAX = (1 << 32) - 1
+_UINT64_MAX = (1 << 64) - 1
+_SIZE_T_MAX = (1 << (8 * ctypes.sizeof(ctypes.c_size_t))) - 1
+_INT32_MIN, _INT32_MAX = -(1 << 31), (1 << 31) - 1  # the ovstage C enums are int
+
+_ORDINAL_MAX = _UINT64_MAX  # ovstage_ordinal_t is uint64_t
 
 
 def check_ordinal(ordinal: int) -> int:
@@ -63,13 +73,285 @@ def check_ordinal(ordinal: int) -> int:
     is a compile-time/type error. Python passes through ctypes as ``c_uint64`` and
     would silently wrap (both a negative value and one ``>= 2**64``); reject both
     here instead so the wrap can never reach the C API.
+
+    Delegates to :func:`_check_unsigned`, so a float is rejected rather than
+    truncated. This used to be ``int(ordinal)``, which turned ``5.25`` into a real
+    write at ordinal ``5``. Truncation toward zero also defeated the sign check
+    below: ``-0.5`` normalized to ``0`` and never reached the negative branch.
     """
-    value = int(ordinal)
+    return _check_unsigned(ordinal, _ORDINAL_MAX, "ordinal", "uint64")
+
+
+def _check_unsigned(value: int, maximum: int, name: str, ctype: str) -> int:
+    """Validate one caller int against a fixed-width unsigned C field.
+
+    ctypes never raises on an out-of-range int: struct fields, array elements,
+    and function arguments all wrap mod ``2**bits`` instead. A guard here is
+    what turns a silently wrong value into a rejected one, the same way
+    :func:`check_ordinal` and :func:`check_timeout` do for the wider fields.
+    """
+    try:
+        result = operator.index(value)
+    except TypeError:
+        raise TypeError(f"{name} must be an int, got {type(value).__name__}") from None
+    if result < 0:
+        raise ValueError(f"{name} must be non-negative, got {value}")
+    if result > maximum:
+        raise ValueError(f"{name} must fit in {ctype} (<= {maximum}), got {value}")
+    return result
+
+
+def check_write_count(count: int) -> int:
+    """Validate a write's logical element count (``ovstage_write_data_t.count``).
+
+    This is the representability guard only: it rejects what the ``uint32_t``
+    field cannot hold. Without it ``2**32`` silently became ``0`` (a whole-query
+    write) and ``2**32 + n`` aliased ``n``. ``0`` passes here because it *is*
+    representable — it is the C contract's "every prim the query covers", and
+    :meth:`Stage.write_attribute` rejects it separately, where the sparsity form
+    that gives it meaning is known.
+
+    Its own messages rather than :func:`_check_unsigned`'s: ``count`` is a
+    single named argument, so the wording names it directly instead of the
+    "entries"/"words" phrasing the sequence guards use.
+    """
+    try:
+        value = operator.index(count)
+    except TypeError:
+        raise TypeError(f"count must be an int, got {type(count).__name__}") from None
     if value < 0:
-        raise ValueError(f"ordinal must be non-negative, got {ordinal}")
-    if value > _ORDINAL_MAX:
-        raise ValueError(f"ordinal must fit in uint64 (<= {_ORDINAL_MAX}), got {ordinal}")
+        raise ValueError(f"count must not be negative; got {count}")
+    if value > _UINT32_MAX:
+        raise ValueError(f"count must fit in uint32 (<= {_UINT32_MAX}), got {count}")
     return value
+
+
+def _check_unsigned_sequence(values: Sequence[int], maximum: int, name: str, ctype: str) -> List[int]:
+    """Materialize and bound-check a sequence destined for a fixed-width C array.
+
+    ``min`` / ``max`` are C-level passes over the already-materialized list
+    rather than a per-element branch: sparsity inputs are per-prim, and this
+    path is already O(n) from the materialization itself.
+    """
+    try:
+        result = [operator.index(value) for value in values]
+    except TypeError as exc:
+        raise TypeError(f"{name} must be ints ({exc})") from None
+    if result:
+        _check_unsigned(min(result), maximum, name, ctype)
+        _check_unsigned(max(result), maximum, name, ctype)
+    return result
+
+
+def check_index_map(index_map: Sequence[int]) -> List[int]:
+    """Validate write ``index_map`` entries (``const uint32_t*``) and materialize them.
+
+    Entries are source-row indices. The native side rejects a row beyond the
+    transported row count, but only after ctypes has already wrapped, so an
+    entry of ``2**32`` silently aliased source row ``0`` and wrote the wrong
+    data with no error.
+    """
+    return _check_unsigned_sequence(index_map, _UINT32_MAX, "index_map entries", "uint32")
+
+
+def check_mask(mask: Sequence[int]) -> List[int]:
+    """Validate write ``mask`` words (``ovstage_mask_t``, ``uint64_t``) and materialize them.
+
+    A negative word silently became an all-bits-set word (write every element)
+    and ``2**64 + n`` aliased ``n``.
+    """
+    return _check_unsigned_sequence(mask, _UINT64_MAX, "mask words", "uint64")
+
+
+def check_token(token: int, name: str = "attribute") -> int:
+    """Validate an attribute token (``ovx_token_t``, ``uint64_t``).
+
+    Tokens are interned ids, so a wrong one names a different live attribute
+    rather than failing. ``int()`` here accepted a float and a ``str``; the token
+    also wrapped, so ``2**64`` addressed token ``0``.
+    """
+    return _check_unsigned(token, _UINT64_MAX, name, "uint64")
+
+
+def check_token_sequence(tokens: Sequence[int], name: str) -> List[int]:
+    """Validate a sequence of attribute tokens and materialize it for a C array."""
+    return _check_unsigned_sequence(tokens, _UINT64_MAX, name, "uint64")
+
+
+def check_handle(handle: int, name: str) -> int:
+    """Validate an opaque handle or op id (``uint64_t``).
+
+    Handle ids come from one monotonic counter, so a truncated or wrapped handle
+    lands on a live neighbour instead of failing as invalid.
+    """
+    return _check_unsigned(handle, _UINT64_MAX, name, "uint64")
+
+
+def check_uint32(value: int, name: str) -> int:
+    """Validate an integer for a generic ``uint32_t`` field."""
+    return _check_unsigned(value, _UINT32_MAX, name, "uint32")
+
+
+def check_uint64(value: int, name: str) -> int:
+    """Validate an integer for a generic ``uint64_t`` field."""
+    return _check_unsigned(value, _UINT64_MAX, name, "uint64")
+
+
+def check_int64(value: int, name: str) -> int:
+    """Validate an integer for a generic ``int64_t`` field."""
+    try:
+        result = operator.index(value)
+    except TypeError:
+        raise TypeError(f"{name} must be an int, got {type(value).__name__}") from None
+    minimum, maximum = -(1 << 63), (1 << 63) - 1
+    if not (minimum <= result <= maximum):
+        raise ValueError(f"{name} must fit in int64, got {value}")
+    return result
+
+
+def check_element_sizes(element_sizes: Sequence[int]) -> List[int]:
+    """Validate ``map_attribute`` per-element byte sizes (``size_t*``)."""
+    return _check_unsigned_sequence(element_sizes, _SIZE_T_MAX, "element_sizes entries", "size_t")
+
+
+def check_domains(domains: int) -> int:
+    """Validate a population domain bitmask (``uint32_t domains``).
+
+    The C parameter is ``uint32_t`` -- deliberately not
+    ``ovstage_population_domain_t`` -- and the header calls it a bitmask to OR
+    together, so the extra width is the contract's headroom for future domain
+    bits. The runtime bit-tests the bits it knows and ignores the rest, so
+    there is no ``& ~PopulationDomain.ALL`` mask here: masking would re-narrow
+    exactly what ``uint32_t`` widened, and a wheel older than the loaded
+    library would reject a domain that library implements.
+
+    :func:`check_enum` was the wrong guard. It bounds to *signed* int32, so it
+    rejected ``1 << 31`` -- representable in the field, and a legitimate future
+    flag -- while accepting ``-1``, which ctypes then wrapped to ``0xFFFFFFFF``:
+    every domain plus the 30 undefined bits. That is sticky rather than
+    transient, because the domain set chosen at open governs every later
+    ``apply_usd_*`` on the population state.
+
+    Note for Python 3.10: ``~PopulationDomain.PHYSICS`` is ``-3`` there (3.11+
+    gives ``1``), so it is now rejected rather than wrapped. Spell an exclusion
+    as ``PopulationDomain.ALL & ~PopulationDomain.PHYSICS``, which is ``1`` on
+    every supported interpreter.
+    """
+    return _check_unsigned(domains, _UINT32_MAX, "domains", "uint32")
+
+
+def check_enum(value: int, name: str) -> int:
+    """Index-guard a C enum value whose accepted set is *not* closed here.
+
+    ovstage enums are ``c_int`` and :class:`LogSeverity` runs to ``-2``, so this
+    is a *signed* guard rather than :func:`_check_unsigned`. Representability
+    only. What it stops is ``int()`` truncating a float into a neighbouring
+    enumerator -- ``1.9`` became ``PrimMode.INSERT``, and because truncation is
+    toward zero ``-1.9`` became ``LogSeverity.INFO`` where the caller meant
+    ``VERBOSE``.
+
+    A range guard is not value validation, so this is the *weaker* of the two
+    enum guards, kept only where the contract forbids the stronger one:
+    ``model`` (ids are advertised at runtime by
+    ``ovstage_get_hierarchy_computation_models``) and ``semantic`` (documented
+    to accept a raw ``ovstage_attribute_semantic_t``). Every closed C enum uses
+    :func:`check_enum_member` instead.
+    """
+    try:
+        result = operator.index(value)
+    except TypeError:
+        raise TypeError(f"{name} must be an int, got {type(value).__name__}") from None
+    if not (_INT32_MIN <= result <= _INT32_MAX):
+        raise ValueError(f"{name} must fit in int32, got {value}")
+    return result
+
+
+_ENUM_MEMBER_CACHE: Dict[type, Tuple[FrozenSet[int], str]] = {}
+
+
+def _enum_members(enum_type: Type[IntEnum]) -> Tuple[FrozenSet[int], str]:
+    """Return ``(accepted values, listing for the message)`` for a closed C enum.
+
+    Read off ``__members__`` rather than by iterating the class: iteration is
+    not stable across the interpreters this wheel supports, while
+    ``__members__`` is the same mapping on all of them. Cached because
+    :meth:`Filter.to_c` runs the predicate guard once per predicate.
+
+    :class:`IntFlag` is refused outright. A flag parameter's legal inputs are
+    arbitrary ORs, so it has no member set to validate against --
+    ``PopulationDomain(1 << 31)`` does not raise -- which is why a flag field
+    gets a width guard instead; see :func:`check_domains`.
+    """
+    cached = _ENUM_MEMBER_CACHE.get(enum_type)
+    if cached is None:
+        if issubclass(enum_type, IntFlag):
+            raise TypeError(
+                f"{enum_type.__name__} is an IntFlag; a flag field takes a width guard "
+                "(see check_domains), not a membership check"
+            )
+        values, names, seen = [], [], set()
+        for member_name, member in enum_type.__members__.items():
+            value = int(member)
+            values.append(value)
+            if value not in seen:  # aliases stay accepted, but only list them once
+                seen.add(value)
+                names.append(f"{member_name}={value}")
+        cached = (frozenset(values), ", ".join(names))
+        _ENUM_MEMBER_CACHE[enum_type] = cached
+    return cached
+
+
+def check_enum_member(value: int, enum_type: Type[IntEnum], name: str) -> int:
+    """Validate a caller value against a *closed* C enum's declared members.
+
+    :func:`check_enum` bounds representability only, so an in-range garbage
+    value passes as silently as a wrapped one. :class:`LogSeverity` is the case
+    that shows why: it has a real gap at ``2``, and the runtime's severity
+    switch has no ``default``, so ``severity=2`` installed an *INFO* threshold
+    -- a log flood -- for a caller who meant something stricter.
+
+    Use this only where the C enum is closed. Where the header advertises the
+    set at runtime, or documents that raw values are accepted, keep
+    :func:`check_enum`: otherwise a wheel older than the loaded library rejects
+    a value that library accepts, and nothing pins the two versions together.
+
+    No width check, because membership implies representability -- bounding
+    first would report ``must fit in int32`` for a value whose real problem is
+    that it is not a member.
+
+    Membership is by value, not by type: ``Scope.INCLUDE`` and
+    ``PrimMode.INSERT`` are both ``1``, so passing the wrong enum class still
+    passes. An ``isinstance`` gate would catch that only by also rejecting the
+    plain ``0``/``1`` spelling the write and map docstrings accept.
+    """
+    try:
+        result = operator.index(value)
+    except TypeError:
+        raise TypeError(f"{name} must be an int, got {type(value).__name__}") from None
+    values, listing = _enum_members(enum_type)
+    if result not in values:
+        raise ValueError(f"{name} must be a valid {enum_type.__name__} ({listing}), got {value}")
+    return result
+
+
+def check_int(value: int, name: str) -> int:
+    """Reject a non-integer for a field that never reaches a fixed-width C type.
+
+    Deliberately unbounded, unlike every other guard here. The width checks
+    exist because ctypes wraps instead of raising, and that hazard needs a C
+    field behind the value to be real. :attr:`Operation.status` has none: it is
+    only compared against ``OVSTAGE_OK`` and handed to :class:`OvstageError`,
+    which formats a code it does not recognize as ``ERROR_<n>`` so newer
+    statuses stay readable. Bounding it to some width would assert a boundary
+    that is not there and send the next reader looking for it.
+
+    What this *does* stop is the truncation. ``int(0.5)`` is ``0``, which is
+    ``OVSTAGE_OK``, so a fractional status read as success.
+    """
+    try:
+        return operator.index(value)
+    except TypeError:
+        raise TypeError(f"{name} must be an int, got {type(value).__name__}") from None
 
 
 class ErrorCode(IntEnum):
@@ -99,7 +381,10 @@ class OvstageError(RuntimeError):
     """
 
     def __init__(self, code: int, message: str = ""):
-        self.code = int(code)
+        # Guarded for the reason Operation.status is: a fractional code
+        # truncated, and int(0.5) is OVSTAGE_OK, so an error object built
+        # around a real failure formatted itself as "OK".
+        self.code = check_int(code, "code")
         self.message = message or ""
         try:
             name = ErrorCode(self.code).name
@@ -160,27 +445,90 @@ class PopulationDomain(IntFlag):
     ALL = (1 << 0) | (1 << 1)
 
 
+class PrimPredicateKind(IntEnum):
+    """How an ``ovstage_population_prim_predicate_t`` matches.
+
+    A kind that takes values matches when any one of them matches: the values of
+    a single predicate are a disjunction, never a conjunction. Requiring more
+    than one condition is what ``AND`` is for.
+    """
+
+    NONE = 0
+    ALL = 1
+    AND = 2
+    OR = 3
+    NOT = 4
+    HAS_PARENT = 5
+    HAS_ANCESTOR = 6
+    HAS_PROPERTY = 7
+    HAS_TYPE = 8
+    IS_A_TYPE = 9
+    HAS_SCHEMA = 10
+    HAS_APPLIED_SCHEMA = 11
+    HAS_APPLIED_SCHEMA_IN_NAMESPACE = 12
+    HAS_PATH = 13
+    IS_UNDER_PATH = 14
+    HAS_KIND = 15
+    HAS_PURPOSE = 16
+    HAS_METADATA = 17
+
+
+class PropertyPredicateKind(IntEnum):
+    """How an ``ovstage_population_property_predicate_t`` matches.
+
+    Values disjoin exactly as they do for :class:`PrimPredicateKind`.
+    """
+
+    NONE = 0
+    ALL = 1
+    AND = 2
+    OR = 3
+    NOT = 4
+    DECLARED_BY_SCHEMA = 5
+    HAS_NAME = 6
+    IN_NAMESPACE = 7
+    HAS_METADATA = 8
+    IS_ATTRIBUTE = 9
+    IS_RELATIONSHIP = 10
+    IS_CUSTOM = 11
+    IS_AUTHORED = 12
+
+
 class AttributeSemantic(IntEnum):
     """Authored USD interpretation of a column's bytes (``ovstage_attribute_semantic_t``).
 
-    Geometric semantics (POINT/VECTOR/NORMAL/COLOR/QUATERNION/MATRIX/
+    Geometric semantics (POINT/VECTOR/NORMAL/COLOR/QUATERNION/MATRIX/FRAME/
     TEXTURE_COORDINATE) record a geometric role on the column; storage
     stays in the requested numeric ``dtype``.
+
+    ``TIME_CODE`` marks a time code -- a unitless time value -- again with
+    storage in the requested numeric ``dtype``. Only the plain numeric value is
+    carried: sentinel time codes have no portable numeric encoding, so they are
+    not representable.
 
     ID semantics select the corresponding ID storage type and require
     pre-interned id payloads (producers must intern via the path dictionary /
     token dictionary before writing -- ovstage does not stringify or resolve):
 
     - ``TOKEN_ID`` → ``dtype = (kDLUInt, 64, 1)`` carrying one 64-bit token id
-      per row.
+      per row; id 0 is the empty token.
     - ``RELATIONSHIP_PATH_ID`` → ``dtype = (kDLUInt, 64, 1)`` carrying one
       64-bit path id per row.
     - ``CONNECTION_PATH_ID`` → ``dtype = (kDLUInt, 64, 2)`` carrying one
       ``(path_id, token_id)`` pair per row (one 16-byte element per row).
+    - ``ASSET_PATH_ID`` → ``dtype = (kDLUInt, 64, 2)`` carrying one
+      ``(authored_token, resolved_token)`` pair per row (one 16-byte element
+      per row).
 
-    Byte-string semantics (``ASSET_STRING``, ``PATH_EXPRESSION_STRING``) keep
-    ragged ``(kDLUInt, 8, 1)`` byte-row storage with NUL-separated authored
-    sub-values.
+    An asset has two paths: the path as authored, and the path after
+    resolution. ``ASSET_PATH_ID`` carries both as token ids. A token id of 0
+    means no path, so an unresolved asset has a resolved token id of 0.
+
+    ``PATH_EXPRESSION_STRING`` carries the expression text as one interned token
+    id, ``(kDLUInt, 64, 1)``. ``is_array = False`` is a scalar
+    ``pathExpression``; ``True`` is ``pathExpression[]``, one id per element.
+    Writes reject other layouts. A token id of 0 means no expression. ovstage
+    does not evaluate the expression; it stores the id of the authored text.
 
     ``STRING`` carries a plain USD ``string`` as raw UTF-8 bytes in a ragged
     ``(kDLUInt, 8, 1)`` byte array (``is_array = True``), not a token id. It
@@ -192,7 +540,7 @@ class AttributeSemantic(IntEnum):
     """
 
     NONE = 0
-    ASSET_STRING = 1
+    ASSET_PATH_ID = 1
     TOKEN_ID = 2
     PATH_EXPRESSION_STRING = 3
     RELATIONSHIP_PATH_ID = 4
@@ -205,6 +553,8 @@ class AttributeSemantic(IntEnum):
     TEXTURE_COORDINATE = 11
     CONNECTION_PATH_ID = 12
     STRING = 13
+    TIME_CODE = 14
+    FRAME = 15
 
 
 class HierarchyRelation(IntEnum):
@@ -298,6 +648,9 @@ class WriteDesc:
     prim mode are shared by the batch. Fixed-size convenience shapes are
     normalized to one source-data-row dimension with the tuple width in
     ``dtype.lanes``; their trailing dimensions are not preserved.
+
+    ``count``, ``index_map``, and ``mask`` carry the same bounds as
+    :meth:`Stage.write_attribute`.
     """
 
     attribute: Union[int, str]
@@ -327,16 +680,26 @@ class OrdinalRange:
     end_ordinal: int
     start_ordinal: Optional[int] = None
 
-    def _validate(self) -> None:
+    def _validate(self) -> Tuple[int, Optional[int]]:
+        """Validate both ends and return them normalized.
+
+        The normalized values are *returned* rather than discarded: this class is
+        a plain (unfrozen) dataclass, so ``latest()`` / ``between()`` cannot be
+        the only checkpoint -- a caller can build one directly or assign to the
+        field afterwards. Validating here and having :meth:`to_c` consume the
+        result is what makes every entry point converge on one check.
+        """
         # C read_attributes rejects reversed ranges with INVALID_ARGUMENT
-        # (ReadInterface.inl); ordinals are uint64_t on the C side.
-        check_ordinal(self.end_ordinal)
+        # (ReadInterface.cpp); ordinals are uint64_t on the C side.
+        end = check_ordinal(self.end_ordinal)
+        start = None
         if self.start_ordinal is not None:
-            check_ordinal(self.start_ordinal)
-            if self.start_ordinal > self.end_ordinal:
+            start = check_ordinal(self.start_ordinal)
+            if start > end:
                 raise ValueError(
                     f"start_ordinal ({self.start_ordinal}) must be <= end_ordinal ({self.end_ordinal})"
                 )
+        return end, start
 
     @classmethod
     def latest(cls, end_ordinal: int) -> "OrdinalRange":
@@ -350,11 +713,11 @@ class OrdinalRange:
         return rng
 
     def to_c(self) -> _b.ovstage_ordinal_range_t:
-        self._validate()
+        end, start = self._validate()
         raw = _b.ovstage_ordinal_range_t()
-        raw.end_ordinal = int(self.end_ordinal)
-        if self.start_ordinal is not None:
-            raw.start_ordinal = int(self.start_ordinal)
+        raw.end_ordinal = end
+        if start is not None:
+            raw.start_ordinal = start
             raw.has_start_ordinal = True
         else:
             raw.has_start_ordinal = False
@@ -392,7 +755,12 @@ class Filter:
             sot = _b.make_string_or_token(pred.attribute)
             cpred.attribute = sot
             keepalive.append(sot)  # keeps sot._string_ref alive
-            cpred.op = int(pred.op)
+            # A truncated op picks a neighbouring FilterOp, so the query resolves
+            # a different prim set and every write/read/map on the handle it
+            # returns targets the wrong prims.
+            # FilterOp is closed; the planner already rejects an unknown op with
+            # NOT_SUPPORTED, so this moves the error earlier and makes it a ValueError.
+            cpred.op = check_enum_member(pred.op, FilterOp, "predicate op")
             values = list(pred.values)
             cpred.value_count = len(values)
             if values:
@@ -423,9 +791,12 @@ class Operation:
     """
 
     def __init__(self, stage, status: int, op_id: int, keepalive=None):
+        # Normally both come straight from an enqueue result, but Operation is
+        # public and directly constructible, and a truncated op_id waits on (and
+        # releases) whichever live op that integer names.
         self._stage = stage
-        self.status = int(status)
-        self.op_id = int(op_id)
+        self.status = check_int(status, "status")
+        self.op_id = check_handle(op_id, "op_id")
         self._keepalive = keepalive  # holds input buffers alive until waited
         self._consumed = False
         # A rejected enqueue records its detail in the thread-local last-error
@@ -493,11 +864,35 @@ class AttributeMeta:
         self.layout_generation = int(raw.layout_generation)
 
 
+def _warn_dropped_resource(message: str) -> None:
+    """Report a resource dropped without release, without escaping ``__del__``.
+
+    The caller must have released the resource *before* calling this:
+    :func:`warnings.warn` raises when the caller escalates ``ResourceWarning``
+    (``-W error::ResourceWarning``), so warning first would skip the release for
+    exactly the users who asked to be strict about resources.
+
+    When it does raise, fall back to stderr rather than swallowing the report —
+    opting into strictness must not yield *less* diagnostic output than leaving
+    the default filters in place, which ignore ``ResourceWarning`` outright.
+    """
+    try:
+        warnings.warn(message, ResourceWarning, stacklevel=3)
+    except Exception:
+        try:
+            print(f"ResourceWarning: {message}", file=sys.stderr)
+        except Exception:
+            pass  # stderr gone (interpreter shutdown); nothing left to report through
+
+
 class _GroupBase:
     """Shared accessors over the ``prims`` / ``data`` sub-structs of a group."""
 
     def __init__(self, raw):
         self.raw = raw
+
+    def _check_live(self) -> None:
+        """Hook for subclasses whose storage can be released out from under them."""
 
     # prims -----------------------------------------------------------------
     @property
@@ -517,14 +912,24 @@ class _GroupBase:
         return bool(self.raw.prims.index_map)
 
     def prim_index(self, local: int) -> int:
-        """Resolve the list-relative prim index of the ``local``-th prim."""
+        """Resolve the list-relative prim index of the ``local``-th prim.
+
+        ``local`` is index-guarded before the range check, because the range
+        check does not reject a fraction: ``0 <= 1.5 < count`` is true. Without
+        this, ``int(local)`` truncated, and the shipped row-placement idiom
+        ``buffer[g.data_row_index(i)] = value[g.prim_index(i)]`` then wrote the
+        wrong row -- on a map that is committed stage state, not just a
+        misread.
+        """
+        self._check_live()
+        local = check_int(local, "local")
         p = self.raw.prims
         count = int(p.count)
         if not 0 <= local < count:
             raise IndexError(f"prim index {local} out of range [0, {count})")
         if p.index_map:
             return int(p.index_map[local])
-        return int(p.offset) + int(local)
+        return int(p.offset) + local
 
     # data ------------------------------------------------------------------
     @property
@@ -540,14 +945,20 @@ class _GroupBase:
         return bool(self.raw.data.index_map)
 
     def data_row_index(self, local: int) -> int:
-        """Resolve the data-tensor row index of the ``local``-th element."""
+        """Resolve the data-tensor row index of the ``local``-th element.
+
+        Index-guarded before the range check, for the reason in
+        :meth:`prim_index`.
+        """
+        self._check_live()
+        local = check_int(local, "local")
         d = self.raw.data
         count = int(d.count)
         if not 0 <= local < count:
             raise IndexError(f"data row index {local} out of range [0, {count})")
         if d.index_map:
             return int(d.index_map[local])
-        return int(local)
+        return local
 
     def tensor(self, index: int) -> DLTensor:
         """Raw :class:`DLTensor` at ``index`` (for shape/dtype/device checks).
@@ -558,6 +969,8 @@ class _GroupBase:
         group element through any data index map. Convenience write dimensions
         are not reconstructed.
         """
+        self._check_live()
+        index = check_int(index, "index")
         count = int(self.raw.data.tensor_count)
         if not 0 <= index < count:
             raise IndexError(f"tensor index {index} out of range [0, {count})")
@@ -597,7 +1010,132 @@ class ReadGroup(_GroupBase):
 
     Valid until released via :meth:`Stage.release_group`. Exposes the attribute
     token, ordinal, delete flag, prim grouping, and tensor data.
+
+    A group's pinned storage is an independent resource: it is reclaimed **only**
+    by ``release_group``. Releasing the owning :class:`Read` does not reclaim it,
+    so a dropped group stays pinned for the life of the :class:`Stage` — and,
+    because the pin also holds the group's outstanding-read coverage, later writes
+    to the same attribute and prims keep failing with an "overlapping outstanding
+    read" error reported at the *write* site, far from the group that caused it.
+
+    Use it as a context manager so the group is released even when an error
+    interrupts processing. ``fetch_next()`` returns ``None`` at end of iteration,
+    so bind it before entering the block::
+
+        group = read.fetch_next()
+        if group is not None:
+            with group:
+                values = np.array(group.array(0))  # copy out to outlive the group
+
+    or iterate, which only yields real groups::
+
+        for group in read.groups():
+            with group:
+                ...
+
+    If a group is dropped without release, :meth:`__del__` issues a best-effort
+    release and emits a :class:`ResourceWarning`; rely on the context manager (or
+    an explicit :meth:`Stage.release_group`) rather than the finalizer. Note the
+    zero-copy views handed out by :meth:`array` / :meth:`tensor` point into that
+    pinned storage and must not outlive the release.
     """
+
+    def __init__(self, raw, stage=None):
+        super().__init__(raw)
+        # None only if a caller constructs a group itself; without an owning
+        # stage there is no slot to release through, so the finalizer stays off.
+        self._stage = stage
+        self._released = False
+
+    @property
+    def released(self) -> bool:
+        """Whether this group's pinned storage has been released."""
+        return self._released
+
+    def _check_live(self) -> None:
+        """Reject access to storage this group has already released.
+
+        The pointers in ``raw`` dangle after ``release_group``, so reading through
+        them would return whatever now occupies that memory rather than failing.
+        """
+        if self._released:
+            raise OvstageError(
+                _b.OVSTAGE_ERROR_INVALID_HANDLE,
+                "ReadGroup has been released; its pinned storage is no longer valid",
+            )
+
+    def _claim_release(self) -> None:
+        if self._released:
+            raise OvstageError(
+                _b.OVSTAGE_ERROR_INVALID_HANDLE,
+                "ReadGroup has already been released; its pinned storage is no longer valid",
+            )
+        self._released = True
+
+    def _rollback_release(self) -> None:
+        self._released = False
+
+    def release(self) -> None:
+        """Release this group's pinned storage (see :meth:`Stage.release_group`)."""
+        if self._stage is None:
+            raise OvstageError(
+                _b.OVSTAGE_ERROR_INVALID_HANDLE,
+                "ReadGroup was constructed without an owning Stage; release it via "
+                "Stage.release_group instead",
+            )
+        self._stage.release_group(self)
+
+    def __enter__(self) -> "ReadGroup":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self._released or self._stage is None:
+            return
+        if exc_type is None:
+            self.release()  # surface release errors on the normal exit path
+        else:
+            # An exception is already propagating; release best-effort so it does
+            # not mask the original error.
+            try:
+                self.release()
+            except Exception:
+                pass
+
+    def __del__(self):
+        # Safety net only. Skip if already released, if there is no owning stage,
+        # or if that stage is gone (e.g. interpreter shutdown), where the pinned
+        # storage died with the instance and dispatch is unsafe.
+        if self._released or self._stage is None or not getattr(self._stage, "_inst", None):
+            return
+        # Release BEFORE warning. warnings.warn raises when the caller escalates
+        # ResourceWarning (-W error::ResourceWarning, some -X dev setups), so
+        # warning first would skip the release for exactly the users who asked to
+        # be strict about resources — and here that leaves writes to these prims
+        # failing for the life of the Stage.
+        try:
+            self.release()
+        except Exception:
+            pass
+        _warn_dropped_resource(
+            "ReadGroup was garbage-collected without release(); issued a best-effort "
+            "release to free its pinned storage. Use a 'with' block or call "
+            "Stage.release_group() explicitly — an unreleased group keeps failing later "
+            "writes to the same prims with an 'overlapping outstanding read' error."
+        )
+
+    def array(self, index: int):
+        """Zero-copy flat read-only numpy view of tensor ``index`` (CPU only).
+
+        Tuple lanes are folded into this one-dimensional base-element view.
+
+        The view **borrows** this group's storage and does not keep the group
+        alive: it is valid only while the group is, and the group is released by
+        :meth:`Stage.release_group`, by ``with`` exit, or by the finalizer once
+        the group becomes unreachable. Keep the group bound for as long as you
+        read through the view, and copy out (``np.array(...)``) anything that must
+        outlive it.
+        """
+        return dltensor_to_numpy(self.tensor(index), readonly=True)
 
     @property
     def attribute(self) -> int:
@@ -637,8 +1175,21 @@ class MapGroup(_GroupBase):
 
 @dataclass
 class QueryResult:
-    """Snapshot of a fetched query result (copied out before release)."""
+    """Snapshot of a fetched query result (copied out before release).
+
+    Owns no C-side resources: :meth:`Stage.fetch_query_result` copies the scalar
+    summary and the attribute tokens out, then releases the payload before
+    returning. Nothing here needs to be freed.
+    """
 
     attributes: List[int]
     total_prim_count: int
     all_handle: int
+    """The query's own handle, echoed back for convenience — *not* a second resource.
+
+    It is the same value as :attr:`Query.handle`, included so a consumer handed only
+    the ``QueryResult`` still has the handle covering all matched prims (e.g. to pass
+    to :meth:`Stage.resolve_query_prim_paths`). Releasing the query
+    (:meth:`Query.release`, or :meth:`Stage.release_query`) reclaims it; releasing
+    ``all_handle`` *as well* would be a double release.
+    """

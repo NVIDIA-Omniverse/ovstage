@@ -9,7 +9,7 @@
 """ovstage — Python bindings for the OVStage data-plane C API.
 
 Asynchronous, ordinal-keyed, zero-copy simulation data access over CPU/GPU
-memory. Bound to ``libovstage`` via ctypes. Set ``OVSTAGE_LIBRARY_PATH_HINT``
+memory. Bound to the ovstage shared loader via ctypes. Set ``OVSTAGE_LIBRARY_PATH_HINT``
 (or add the build output to ``LD_LIBRARY_PATH``) so the loader can find the
 shared library.
 
@@ -38,8 +38,15 @@ Example::
         paths.destroy_path_list(plist)
 """
 
+import sys as _sys
+
 from . import _src
-from ._src import gates, instancing, population
+
+# ``gates`` stays reachable as ``ovstage.gates`` for the concurrency tests, but it is
+# deliberately absent from ``__all__`` and from the submodule registration below: it
+# wraps the ``ovstage.test.hooks`` extension that only test-instrumented libovstage
+# builds export, so it is instrumentation, not public API.
+from ._src import gates, instancing, population  # noqa: F401  (gates: re-export only)
 from ._src.bindings import (
     OVSTAGE_TIMEOUT_INFINITE,
     OVX_API_ERROR,
@@ -59,7 +66,7 @@ from ._src.dlpack import (
     make_dltensor,
     numpy_to_dldatatype,
 )
-from ._src.path_dictionary import OvxError, PathDictionary
+from ._src.path_dictionary import OvxError, PathDictionary, PathList
 from ._src.stage import Hierarchy, Map, OrdinalQuery, Query, Read, Stage
 from ._src.types import (
     AttributeMeta,
@@ -96,7 +103,17 @@ from ._src.types import (
 try:
     from ._version import version as __version__
 except Exception:
-    __version__ = "0.1.1"
+    __version__ = "0.2.0"
+
+# ``from ._src import instancing, population`` above only *binds* the module objects
+# as attributes of this package; it does not register them as submodules, so
+# ``import ovstage.population`` / ``from ovstage.population import open_usd`` would
+# raise ModuleNotFoundError even though the docs (and ``.. automodule::``) publish
+# that dotted path. Register the public aliases so every import spelling resolves.
+# The same module object is reused, so ``ovstage.population is
+# ovstage._src.population`` and patching either path affects both.
+_sys.modules[f"{__name__}.instancing"] = instancing
+_sys.modules[f"{__name__}.population"] = population
 
 __all__ = [
     "Stage",
@@ -107,6 +124,7 @@ __all__ = [
     "OrdinalQuery",
     "Hierarchy",
     "PathDictionary",
+    "PathList",
     "OvxError",
     "OvstageError",
     "ErrorCode",
@@ -140,7 +158,6 @@ __all__ = [
     "numpy_to_dldatatype",
     "instancing",
     "population",
-    "gates",
     "library_version",
     "set_log_callback",
     "flush_log",

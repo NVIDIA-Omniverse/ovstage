@@ -73,6 +73,8 @@ Resolve inputs in this order: existing repository files and referenced snippets,
 7. **Layer in the focused skills** as concerns arise: tensor data (`dlpack-tensor-exchange`),
    submit/observe & concurrency (`cpu-ahead-gpu-async`), error reporting (`error-handling`),
    string/token identity (`string-handling`, `path-dictionary`).
+   Once a committed snapshot must be persisted as USD, route to `exporting-to-usd`;
+   it owns selection, destination lifetime, save ownership, and export-specific waits.
 
 ## Output Format
 

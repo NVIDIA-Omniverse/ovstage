@@ -192,6 +192,11 @@ Logging
    :members:
    :undoc-members:
 
+USD Schemas
+^^^^^^^^^^^
+
+.. autofunction:: ovstage.population.register_usd_schemas
+
 DLPack Tensor Interchange
 ^^^^^^^^^^^^^^^^^^^^^^^^^^
 
@@ -228,9 +233,42 @@ DLPack Tensor Interchange
 ovstage.population
 ------------------
 
-USD population: composes USD content into the runtime stage (see
-:doc:`/scene/population`).
+USD population composes USD content into the runtime stage; population export
+authors selected runtime state back into a USD destination that ovstage opens
+and owns. See :doc:`/scene/population` and :doc:`/scene/exporting_to_usd`.
 
+.. Symbols documented explicitly elsewhere on this page (the classes below, and
+   ``register_usd_schemas`` under "USD Schemas") must be excluded here, or
+   ``population.__all__`` documents them a second time and the strict ``-W``
+   docs build fails with "duplicate object description". Keep this list in sync.
 .. automodule:: ovstage.population
+   :members:
+   :undoc-members:
+   :exclude-members: Desc, Selector, PrimPredicate, PropertyPredicate, PrimPredicateKind, PropertyPredicateKind, register_usd_schemas
+
+Descriptions and Selectors
+^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+.. autoclass:: ovstage.population.Desc
+   :members:
+   :undoc-members:
+
+.. autoclass:: ovstage.population.Selector
+   :members:
+   :undoc-members:
+
+.. autoclass:: ovstage.population.PrimPredicate
+   :members:
+   :undoc-members:
+
+.. autoclass:: ovstage.population.PropertyPredicate
+   :members:
+   :undoc-members:
+
+.. autoclass:: ovstage.population.PrimPredicateKind
+   :members:
+   :undoc-members:
+
+.. autoclass:: ovstage.population.PropertyPredicateKind
    :members:
    :undoc-members:

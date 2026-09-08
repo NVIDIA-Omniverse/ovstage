@@ -43,6 +43,8 @@ over a prim set (and one **batched** op for several columns).
 Do **not** use it to *mirror* an existing USD stage into ovstage automatically — that is
 **population**, not migration (route to `runtime-loop`) — or for the mechanics of a single
 ovstage call (route to the focused skills: `application-flow`, `dlpack-tensor-exchange`, etc.).
+When a migrated runtime snapshot must be written back to USD, route that output
+workflow to `exporting-to-usd`; it is not a direct-USD API migration recipe.
 
 ## Inputs
 

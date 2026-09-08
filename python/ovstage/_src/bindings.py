@@ -9,7 +9,7 @@
 """Raw ctypes layer for the ovstage C ABI.
 
 ovstage's data plane is a *vtable* contract (``ovstage_api/ovstage_api.h``):
-``libovstage.so`` exports the process and instance lifecycle as flat symbols,
+The ovstage shared loader exports the process and instance lifecycle as flat symbols,
 and ``ovstage_create_instance`` hands back an ``ovstage_instance_t`` bundle
 (``{const ovstage_vtable_t* vtable; ovstage_context_t* context;}``). Every
 data-plane operation (query/read/write/map/ordinal/diagnostics) is reached
@@ -211,15 +211,28 @@ def make_string_or_token(value) -> ovx_string_or_token_t:
     When a string is supplied, the backing buffer is kept alive on the returned
     struct (``_string_ref``) so it stays valid for the duration of the call it
     is passed to.
+
+    Only ``int`` and ``str`` are accepted. This used to fall through to
+    ``str(value)`` for anything else, which made both branches silently wrong:
+    a float took the *string* branch, so ``5.75`` -- and ``5.0`` -- named a new
+    attribute the runtime then interned as a live column, and a numpy integer
+    (not an ``int`` subclass) meant "the attribute named ``7``" rather than
+    token 7. The token branch is bounded because ``ovx_token_t`` is
+    ``uint64_t`` and ctypes wraps rather than raising, so ``2**64`` addressed
+    token ``0``.
     """
     out = ovx_string_or_token_t()
-    if isinstance(value, int):
-        out.token = value
-    else:
-        s = ovx_string_t(str(value))
+    if isinstance(value, str):
+        s = ovx_string_t(value)
         out.token = 0
         out.string = s
         out._string_ref = s  # keepalive: s._bytes backs out.string.ptr
+        return out
+    # Imported lazily to avoid a bindings <- types import cycle at module load,
+    # matching set_log_callback's LogSeverity import below.
+    from .types import check_token
+
+    out.token = check_token(value)
     return out
 
 
@@ -354,6 +367,66 @@ class ovstage_population_enqueue_result_t(ctypes.Structure):
     _fields_ = [
         ("status", ovstage_api_status_t),
         ("op_index", ovstage_population_op_id_t),
+    ]
+
+
+class ovstage_population_prim_predicate_t(ctypes.Structure):
+    # Mirrors the C prim predicate: kind, a union selecting how `values` is read, and
+    # value_count. A prim predicate's union names a property predicate, so both unions
+    # are filled in after both classes exist (see below).
+    pass
+
+
+class ovstage_population_property_predicate_t(ctypes.Structure):
+    pass
+
+
+class _prim_predicate_values(ctypes.Union):
+    _fields_ = [
+        ("strings", ctypes.POINTER(ovx_string_t)),
+        ("subpredicates", ctypes.POINTER(ovstage_population_prim_predicate_t)),
+        ("property_predicate", ctypes.POINTER(ovstage_population_property_predicate_t)),
+    ]
+
+
+class _property_predicate_values(ctypes.Union):
+    _fields_ = [
+        ("strings", ctypes.POINTER(ovx_string_t)),
+        ("subpredicates", ctypes.POINTER(ovstage_population_property_predicate_t)),
+    ]
+
+
+ovstage_population_prim_predicate_t._fields_ = [
+    ("kind", ctypes.c_int),
+    ("values", _prim_predicate_values),
+    ("value_count", ctypes.c_size_t),
+]
+
+ovstage_population_property_predicate_t._fields_ = [
+    ("kind", ctypes.c_int),
+    ("values", _property_predicate_values),
+    ("value_count", ctypes.c_size_t),
+]
+
+
+class ovstage_population_selector_t(ctypes.Structure):
+    _fields_ = [
+        ("prim_predicate", ovstage_population_prim_predicate_t),
+        ("property_predicate", ovstage_population_property_predicate_t),
+        ("prim_metadata_paths", ctypes.POINTER(ovx_string_t)),
+        ("prim_metadata_path_count", ctypes.c_size_t),
+        ("property_metadata_paths", ctypes.POINTER(ovx_string_t)),
+        ("property_metadata_path_count", ctypes.c_size_t),
+    ]
+
+
+class ovstage_population_desc_t(ctypes.Structure):
+    _fields_ = [
+        ("domains", ctypes.c_uint32),
+        ("selectors", ctypes.POINTER(ovstage_population_selector_t)),
+        ("selector_count", ctypes.c_size_t),
+        ("stage_metadata_paths", ctypes.POINTER(ovx_string_t)),
+        ("stage_metadata_path_count", ctypes.c_size_t),
     ]
 
 
@@ -737,11 +810,11 @@ def instance_api(lib: ctypes.CDLL, invalid_instance_error=None) -> "_InstanceApi
 OVSTAGE_LIBRARY_PATH_HINT: Optional[str] = None
 
 if sys.platform.startswith("win"):
-    OVSTAGE_LIB_NAME = "ovstage.dll"
+    OVSTAGE_LIB_NAME = "ovstage-dynamic.dll"
 elif sys.platform == "darwin":
-    OVSTAGE_LIB_NAME = "libovstage.dylib"
+    OVSTAGE_LIB_NAME = "libovstage-dynamic.dylib"
 else:
-    OVSTAGE_LIB_NAME = "libovstage.so"
+    OVSTAGE_LIB_NAME = "libovstage-dynamic.so"
 
 
 def _resolve_existing_dirs(paths: Iterable[Path]) -> List[Path]:
@@ -786,7 +859,7 @@ def ovstage_loader_candidate_dirs() -> List[Path]:
 
 
 class _LibraryLoader:
-    """Lazily loads and configures a singleton ``libovstage`` CDLL."""
+    """Lazily loads and configures the singleton ovstage shared loader."""
 
     def __init__(self):
         self._lib: Optional[ctypes.CDLL] = None
@@ -824,7 +897,7 @@ class _LibraryLoader:
             if lib_path.exists() and lib_path.is_file():
                 # On Windows (Python 3.8+) a DLL loaded by full path resolves its
                 # own dependencies from the registered DLL directories, not PATH.
-                # ovstage.dll's runtime dependencies sit alongside it and in a
+                # The ovstage runtime dependencies sit alongside the loader and in a
                 # sibling ``plugins`` dir, so register both before loading.
                 self._add_dll_directories(lib_path.parent)
                 try:
@@ -870,6 +943,15 @@ class _LibraryLoader:
                     self._dll_dir_cookies.append(os.add_dll_directory(str(d)))
             except OSError:
                 continue
+
+
+# The description-taking population entry points. Their prototypes are configured as a
+# unit below, so a library exporting one without the other leaves neither callable --
+# anything probing for description support has to require both.
+POPULATION_DESC_ENTRY_POINTS = (
+    "ovstage_population_open_usd_from_file_with_desc",
+    "ovstage_population_open_usd_from_string_with_desc",
+)
 
 
 def _configure_prototypes(lib: ctypes.CDLL) -> None:
@@ -965,6 +1047,16 @@ def _configure_prototypes(lib: ctypes.CDLL) -> None:
         lib.ovstage_flush_log.argtypes = [ovstage_timeout_ns_t]
         lib.ovstage_flush_log.restype = err
 
+    # USD schema registration (ovstage_population_register_usd_schemas): another process-global
+    # flat export. Guarded the same way, so an older libovstage without it still
+    # loads and the wrapper raises NOT_SUPPORTED.
+    if hasattr(lib, "ovstage_population_register_usd_schemas"):
+        lib.ovstage_population_register_usd_schemas.argtypes = [
+            ctypes.POINTER(ovx_string_t),
+            ctypes.c_size_t,
+        ]
+        lib.ovstage_population_register_usd_schemas.restype = err
+
     # The path dictionary is reached through the ``get_path_dictionary`` vtable
     # slot (see ``ovstage_vtable_t``) rather than flat exports — nothing to
     # configure here.
@@ -995,6 +1087,15 @@ def _configure_prototypes(lib: ctypes.CDLL) -> None:
         lib.ovstage_population_open_usd_from_string.argtypes = [inst, ovx_string_t, ovstage_ordinal_t,
                                                                 ctypes.c_double, ctypes.c_uint32]
         lib.ovstage_population_open_usd_from_string.restype = pop_enq
+    if all(hasattr(lib, name) for name in POPULATION_DESC_ENTRY_POINTS):
+        pop_desc = ctypes.POINTER(ovstage_population_desc_t)
+        lib.ovstage_population_open_usd_from_file_with_desc.argtypes = [inst, ovx_string_t, ovstage_ordinal_t,
+                                                                        ctypes.c_double, pop_desc, ctypes.c_size_t]
+        lib.ovstage_population_open_usd_from_file_with_desc.restype = pop_enq
+        lib.ovstage_population_open_usd_from_string_with_desc.argtypes = [inst, ovx_string_t, ovstage_ordinal_t,
+                                                                          ctypes.c_double, pop_desc, ctypes.c_size_t]
+        lib.ovstage_population_open_usd_from_string_with_desc.restype = pop_enq
+    if hasattr(lib, "ovstage_population_open_usd_from_file"):
         lib.ovstage_population_add_usd_reference_from_file.argtypes = [inst, ovx_string_t, ovx_string_t,
                                                                        ctypes.POINTER(ref_handle)]
         lib.ovstage_population_add_usd_reference_from_file.restype = pop_enq
@@ -1046,7 +1147,7 @@ _loader = _LibraryLoader()
 
 
 def load() -> ctypes.CDLL:
-    """Return the configured singleton ``libovstage`` CDLL (loading on first use)."""
+    """Return the configured singleton ovstage loader (loading on first use)."""
     return _loader.load()
 
 
@@ -1134,7 +1235,7 @@ def set_log_callback(callback, severity=None, channel_filter: Optional[str] = No
         ``OP_FAILED`` if the runtime is not bootstrapped.
     """
     global _active_log_trampoline, _active_log_user_callback
-    from .types import LogSeverity
+    from .types import LogSeverity, check_enum_member
 
     if severity is None:
         severity = LogSeverity.WARNING
@@ -1146,7 +1247,7 @@ def set_log_callback(callback, severity=None, channel_filter: Optional[str] = No
 
     if callback is None:
         _check_process_status(
-            lib.ovstage_set_log_callback(int(severity), filter_ptr, _log_callback_t(), None),
+            lib.ovstage_set_log_callback(check_enum_member(severity, LogSeverity, "severity"), filter_ptr, _log_callback_t(), None),
             "ovstage_set_log_callback",
         )
         # The disable call flushes and tears the dispatcher thread down before
@@ -1169,7 +1270,7 @@ def set_log_callback(callback, severity=None, channel_filter: Optional[str] = No
 
     trampoline = _log_callback_t(_trampoline)
     _check_process_status(
-        lib.ovstage_set_log_callback(int(severity), filter_ptr, trampoline, None),
+        lib.ovstage_set_log_callback(check_enum_member(severity, LogSeverity, "severity"), filter_ptr, trampoline, None),
         "ovstage_set_log_callback",
     )
     # Publish only after the install succeeds. Retire (don't free) the previous

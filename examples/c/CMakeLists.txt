@@ -32,6 +32,7 @@ foreach(_ovstage_example
     queries
     runtime-loop
     time-and-ordinals
+    usd-export
     write-flavors)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_ovstage_example}/CMakeLists.txt")
         add_subdirectory(${_ovstage_example})

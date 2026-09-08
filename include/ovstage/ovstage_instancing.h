@@ -20,10 +20,6 @@ extern "C"
 {
 #endif
 
-    /** @defgroup ovstage_instancing Instancing queries
-     *  @{
-     */
-
     /**
      * Return all instance-root prim paths that reference @p prototype_root.
      *
@@ -65,8 +61,6 @@ extern "C"
     ovstage_api_status_t ovstage_instancing_get_prototype_roots(
         ovstage_instance_t*   instance,
         ovx_primpath_list_t* out_prototype_roots);
-
-    /** @} */ // end of ovstage_instancing
 
 #ifdef __cplusplus
 }

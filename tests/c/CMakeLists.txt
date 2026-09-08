@@ -10,7 +10,8 @@
 #
 # ovstage public C tests. Consumes the *produced* ovstage package exactly like an
 # external project would (find_package(ovstage) + link ovstage::ovstage), same as
-# ../../examples/smoke. Point CMake at an unpacked package via CMAKE_PREFIX_PATH:
+# the examples under ../../examples/c. Point CMake at an unpacked package via
+# CMAKE_PREFIX_PATH:
 #
 #   cmake -S . -B build -DCMAKE_PREFIX_PATH=/path/to/unpacked-ovstage
 #   cmake --build build --config Release
@@ -44,6 +45,7 @@ enable_testing()
 add_executable(ovstage_public_tests
     test_minimal.cpp
     test_population.cpp
+    test_population_export.cpp
     test_clone.cpp
     test_queries.cpp
     test_error_handling.cpp

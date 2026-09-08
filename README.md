@@ -30,6 +30,10 @@ Sources live under [`examples/`](examples/) and are the source of truth for the 
     * Load from file or from USDA text description in memory
     * Add references to other USD files or to USDA text description in memory
     * Apply changes from timesampled data in USD to the entire stage
+* Export selected runtime state to USD:
+    * Select candidates with the same predicate graphs as generic population, then author sparse `OVER` layers or durable `DEF` prims through explicit projection rules
+    * Target one-shot saved files or reusable destinations that ovstage opens and owns, without exposing OpenUSD C++ types in the C ABI
+    * Use synchronous export directly or the optional per-instance asynchronous scheduler
 * Efficient cloning of stage subtrees
 * Stage hierarchy lookups
 * Explicit queries for instanced data (prototype and instance roots)
@@ -43,13 +47,21 @@ These packages include a number of pre-packaged dependencies.
 In addition to these pre-packaged dependencies, on Windows, ovstage depends on [Microsoft's VC runtime redistributable libraries](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist?view=msvc-170), with a minimum version of 14.38 (as included in Visual Studio 2022 17.8). 
 These libraries can be installed by an end user (using the linked Microsoft resources) or can be included by an application. The use of this version of the MSVC runtime libraries makes our binaries compatible with the vcruntime140.dll pre-packaged in Python distributions for Windows as old as Python 3.11. Older Python versions include older vcruntime140.dll, and are therefore not guaranteed to work.
 
+On Linux, the packages are built against the `manylinux_2_35` baseline: they require glibc 2.35 or newer (Ubuntu 22.04+, or an equivalent distribution). A few host libraries are deliberately not bundled and must be resolvable on the system:
+
+- Required to link a C/C++ application against the SDK, and to load it: `libX11.so.6`, `libGL.so.1`, and `libgomp.so.1` (Debian/Ubuntu packages `libx11-6`, `libgl1`, `libgomp1`). These are transitive dependencies of the pre-packaged runtime, so the linker must be able to find them even though your code never references them directly.
+- Additionally used at runtime by optional components: `libXt.so.6`, `libGLX.so.0`, `libOpenGL.so.0` (`libxt6`, `libglx0`, `libopengl0`), and the NVIDIA driver's `libcuda.so.1` for the GPU-resident data paths.
+
+Building must use the distribution's binutils (`as`, `ld`). On x86_64 hosts with Homebrew/Linuxbrew installed, note that Homebrew has linked its own `binutils` into `PATH` by default since June 2026: GCC locates `as` and `ld` through `PATH`, so it silently uses Homebrew's tools even when CMake selects the system compiler. Depending on the Homebrew and host glibc versions, the build then fails at compile time (`as: ... version 'GLIBC_2.xx' not found`) or at link time with unresolved X11/GL symbols or `GLIBC_2.xx` version errors reported against the pre-packaged runtime. If you hit this, either run `brew unlink binutils`, or remove the Homebrew `bin` directory from `PATH` for the build, or add `-B/usr/bin` to your compiler flags. The SDK's CMake package config detects a Homebrew linker and warns at configure time (pass `-DOVSTAGE_SKIP_LINKER_CHECK=ON` to CMake, or set that environment variable, to silence it).
+
 
 ## System requirements
 
 - A CUDA-capable GPU is required to enable the use of GPU-resident data paths. CPU payload paths are also part of the API surface and do not require a GPU.
 - **C/C++**:
-    - The ovstage library has a C11-compatible interface. It can be loaded dynamically or by statically linking to the `ovstage-static` loader library, which requires linking to the C++ stdlib. 
+    - The ovstage library has a C11-compatible interface. It can be loaded dynamically or by statically linking to the `ovstage-static` loader library, which requires linking to the C++ stdlib (on Linux, the system `libstdc++` — the loader's link interface names it by `-lstdc++`, so it is resolved by whichever linker runs the consumer link).
     - The example code requires a C++17 compiler and CMake 3.18+. The examples use cmake to fetch the prebuilt ovstage package from the GitHub.com release page.
+    - On Linux, linking against the SDK additionally requires glibc 2.35+, a small set of system libraries, and the distribution's binutils linker — a Homebrew/Linuxbrew `ld` on `PATH` is not supported; see [Packaging and Dependencies](#packaging-and-dependencies).
 - **Python**:
     - Python 3.10–3.13 versions are supported. On Windows, Python 3.11+ is recommended (Python 3.10 is not guaranteed to work because older distributions bundle an older vcruntime140.dll; see [Packaging and Dependencies](#packaging-and-dependencies)).
     - The examples use [uv](https://docs.astral.sh/uv/) to resolve the `ovstage` wheel.
@@ -135,6 +147,7 @@ This model is appropriate when producers and consumers are tightly coupled and b
 - **Map attributes for direct producer writes** - use map/unmap flows when a producer wants to fill ovstage-owned storage directly.
 - **Reuse prim identity across libraries** - exchange tokens and prim-path lists through the shared path dictionary instead of string lookups at every boundary.
 - **Use built-in USD metadata** - `usd-path`, `usd-schemas`, `usd-prim-type`, `usd-parent`, and `usd-children` are auto-maintained and usable in filter predicates. (`usd-active` appears in the header contract but is not supported — it returns `NOT_SUPPORTED` — and is subject to removal in a future release.)
+- **Export selected runtime state to USD** - select candidates with shared population predicates, project them through explicit authoring rules, then use a one-shot saved file or an explicitly saved reusable destination that ovstage opens and owns.
 
 ### Single Parse, Shared Runtime State
 
@@ -177,13 +190,15 @@ The full documentation site is available at **<https://nvidia-omniverse.github.i
 Reference links in this source tree:
 
 - **Overview:** [`OVERVIEW.md`](OVERVIEW.md)
-- **Public C API:** [`include/ovstage/ovstage.h`](include/ovstage/ovstage.h) (data plane), [`include/ovstage/ovstage_types.h`](include/ovstage/ovstage_types.h) (backend-owned types), [`include/ovstage/ovstage_api/`](include/ovstage/ovstage_api/) (API types and utilities), [`include/ovstage/ovalign.h`](include/ovstage/ovalign.h) (alignment helpers), [`include/ovstage/ovstage_instancing.h`](include/ovstage/ovstage_instancing.h) (high-level instancing queries; included from `ovstage.h`), [`include/ovstage/ovstage_population.h`](include/ovstage/ovstage_population.h) (USD-to-ovstage population; included from `ovstage.h`)
+- **Public C API:** [`include/ovstage/ovstage.h`](include/ovstage/ovstage.h) (data plane), [`include/ovstage/ovstage_types.h`](include/ovstage/ovstage_types.h) (backend-owned types), [`include/ovstage/ovstage_api/`](include/ovstage/ovstage_api/) (API types and utilities), [`include/ovstage/ovalign.h`](include/ovstage/ovalign.h) (alignment helpers), [`include/ovstage/ovstage_instancing.h`](include/ovstage/ovstage_instancing.h) (high-level instancing queries; included from `ovstage.h`), [`include/ovstage/ovstage_population.h`](include/ovstage/ovstage_population.h) (USD-to-ovstage population; included from `ovstage.h`), [`include/ovstage/ovstage_population_export.h`](include/ovstage/ovstage_population_export.h) (selected ovstage-to-USD authoring)
 - **Path dictionary API:** [`include/ovx/path_dictionary/`](include/ovx/path_dictionary/) (shared OVX path-dictionary C API headers), [`include/ovx/types.h`](include/ovx/types.h) and [`include/ovx/string_types.h`](include/ovx/string_types.h) (shared OVX handle and string types)
 - **DLPack header:** [`include/dlpack/dlpack.h`](include/dlpack/dlpack.h)
 - **Examples index:** [`examples/README.md`](examples/README.md)
 - **Minimal C example:** [`examples/c/minimal`](examples/c/minimal)
 - **Minimal Python example:** [`examples/python/minimal`](examples/python/minimal)
 - **Runtime-loop examples (USD populate + live updates):** [`examples/c/runtime-loop`](examples/c/runtime-loop), [`examples/python/runtime-loop`](examples/python/runtime-loop)
+- **USD-export examples:** [`examples/c/usd-export`](examples/c/usd-export), [`examples/python/usd-export`](examples/python/usd-export)
+- **Public contract tests:** [`tests/`](tests/)
 - **AI coding agent skills:** [`skills`](skills)
 - **Source:** [NVIDIA-Omniverse/ovstage](https://github.com/NVIDIA-Omniverse/ovstage)
 

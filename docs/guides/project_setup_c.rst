@@ -12,8 +12,8 @@ Set Up a C/C++ Project
 ======================
 
 ovstage exposes a pure **C API**. A C/C++ consumer includes
-``<ovstage/ovstage.h>`` for the data plane, adds ovstage's ``include/`` directory
-to its include path, and links the ovstage shared library.
+``<ovstage/ovstage.h>`` for the data plane and links ``ovstage::ovstage`` or
+``ovstage::ovstage_static``; either CMake target provides the public include path.
 
 .. note::
 
@@ -53,11 +53,45 @@ The public examples wire up ovstage with a small CMake helper,
    target_link_libraries(myapp PRIVATE ovstage::ovstage)
    ovstage_setup_runtime(myapp)    # rpath (Linux) / package bin/ on PATH (Windows)
 
-Linking ``ovstage::ovstage`` brings in the public ``include/`` tree, so
+``ovstage::ovstage`` is the shared forwarding loader. The operating system
+loads it with the application; it opens the ovstage runtime on the first
+initialize/create call. ``ovstage::ovstage_static`` provides the same forwarding
+behavior as a static library. Linking either target brings in the public
+``include/`` tree, so
 ``#include <ovstage/ovstage.h>`` resolves with no extra include paths. Then follow
 the minimal example's lifecycle: create → get path dictionary → intern / build
 path list → query → write → advance write floor → read → release. Refer to
 :doc:`/concepts/application_flow`.
+
+Linux Toolchain Requirements
+----------------------------
+
+The Linux packages target the ``manylinux_2_35`` baseline (glibc 2.35+, e.g.
+Ubuntu 22.04). Linking an application against the SDK makes the linker walk the
+pre-packaged runtime's dependencies, which resolve a few libraries from the
+host system: ``libX11.so.6``, ``libGL.so.1``, and ``libgomp.so.1``
+(Debian/Ubuntu packages ``libx11-6``, ``libgl1``, ``libgomp1``). Install those
+before building, even if your own code never touches X11 or OpenGL.
+
+The build must run with the distribution's binutils (``as``, ``ld``). GCC
+locates both via ``PATH``, so a Homebrew/Linuxbrew installation that has
+linked its own ``binutils`` (Homebrew's default on Linux since June 2026)
+silently replaces the system tools — even when CMake selected
+``/usr/bin/c++``. Depending on the Homebrew and host glibc versions, the build
+then fails at compile time (``as: ... version 'GLIBC_2.xx' not found``) or at
+link time with unresolved X11/GL symbols or ``GLIBC_2.xx`` version errors
+reported against the pre-packaged runtime libraries. Remedies, in preference
+order:
+
+* ``brew unlink binutils``, or
+* remove the Homebrew ``bin`` directory from ``PATH`` for the build shell, or
+* add ``-B/usr/bin`` to the compiler flags (forces GCC to use the system
+  binutils for this build only).
+
+``find_package(ovstage)`` performs a configure-time check and warns when it
+detects a Homebrew linker; pass ``-DOVSTAGE_SKIP_LINKER_CHECK=ON`` to CMake
+(or set that environment variable) to silence it if you are deliberately
+using a custom toolchain.
 
 Diagnostics Caveat
 ------------------

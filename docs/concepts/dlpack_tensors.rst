@@ -148,10 +148,11 @@ trailing component axis. For example, Warp exports ``vec3f`` as ``(N, 3)`` with
 ``float3 = DLDataType(code=DLDataTypeCode.kDLFloat, bits=32, lanes=3)``, then
 call ``make_dltensor(warp_points, dtype=float3)``. The adapter aliases the same
 allocation while folding only complete compact trailing axes into
-``dtype.lanes``. It validates the unchanged base type, a positive bit width, and
-byte extent, and requires byte-aligned source elements; no automatic shape-based
-inference is performed, so a scalar array with shape ``(N, 3)`` keeps its
-original meaning unless the caller requests the lane fold.
+``dtype.lanes``. It validates the unchanged base type, a positive bit width, a
+lane count within the transportable range ``[1, 255]``, and byte extent, and
+requires byte-aligned source elements; no automatic shape-based inference is
+performed, so a scalar array with shape ``(N, 3)`` keeps its original meaning
+unless the caller requests the lane fold.
 When folding consumes every source axis, such as ``(3,)`` into a three-lane
 dtype, the adapter normalizes the mathematically rank-zero result to
 ``shape=(1,)``, ``ndim=1``: a one-element tensor view compatible with ovstage's

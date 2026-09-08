@@ -69,6 +69,7 @@ C_EXAMPLES = [
     ("authoring-hierarchy", True),
     ("producer-consumer", False),
     ("queries", False),
+    ("usd-export", False),
 ]
 # Python examples; extra_pins names PyPI deps beyond numpy the example needs
 # (pins read from the example's own pyproject.toml so they stay in one place).
@@ -81,6 +82,7 @@ PY_EXAMPLES = [
     ("producer-consumer", False, ()),
     ("queries", False, ()),
     ("usd-to-ovstage", False, ("usd-core",)),
+    ("usd-export", False, ()),
 ]
 # Deps needed only by an example's GPU section (the example self-skips that
 # section when they are absent, so they are deliberately NOT hard deps in its
@@ -98,6 +100,32 @@ PY_EXAMPLES_NO_AARCH64 = {"usd-to-ovstage"}
 
 IS_WINDOWS = sys.platform == "win32"
 IS_AARCH64 = platform.machine().lower() in ("aarch64", "arm64")
+
+# Diagnostic signatures that must never appear in a shipped example's output
+# (generic signatures only — this file ships publicly): build-machine checkout
+# roots, the USD diagnostic default-printer line format, and the console
+# logger's "[<severity>] [<component>]" prefixes (spelled out per severity — a
+# bare "] [" would false-positive on legitimate example output such as
+# write-flavors' bracketed lists). Examples legitimately print their own
+# results, so this is a pattern scan rather than an empty-console assertion;
+# the strict empty-stderr guarantee is asserted by
+# tests/python/test_output_cleanliness.py.
+FORBIDDEN_OUTPUT_PATTERNS = (
+    "/builds/",
+    "\\builds\\",
+    "Status: in ",
+    "Status (secondary thread)",
+    "Warning: in ",
+    "Warning (secondary thread)",
+    "Error: in ",
+    "Error (secondary thread)",
+    "Coding Error",
+    "[Verbose] [",
+    "[Info] [",
+    "[Warning] [",
+    "[Error] [",
+    "[Fatal] [",
+)
 
 
 def _check_example_inventory() -> None:
@@ -150,9 +178,45 @@ def _log(msg: str) -> None:
 
 def _run(cmd, **kw) -> None:
     """Run a command, echoing it; raise on non-zero (do NOT capture output — a
-    piped ovstage child can hang in CI, per examples/smoke/run_smoke_test.py)."""
+    piped ovstage child can hang in CI)."""
     _log("$ " + " ".join(str(c) for c in cmd))
     subprocess.run([str(c) for c in cmd], check=True, **kw)
+
+
+def _run_scanned(cmd, check=True, **kw) -> int:
+    """Run an example, scanning its output for FORBIDDEN_OUTPUT_PATTERNS.
+
+    Output goes to temp FILES, not pipes — a piped ovstage child can hang in CI
+    (see _run) — and is echoed afterwards so CI logs keep the child's output.
+    Returns the child's exit code; raises on non-zero when ``check`` (matching
+    _run) and always raises when a forbidden signature is found.
+    """
+    _log("$ " + " ".join(str(c) for c in cmd))
+    with tempfile.TemporaryDirectory() as td:
+        out_path = Path(td) / "stdout.txt"
+        err_path = Path(td) / "stderr.txt"
+        with open(out_path, "wb") as out_f, open(err_path, "wb") as err_f:
+            proc = subprocess.run([str(c) for c in cmd], stdout=out_f, stderr=err_f, **kw)
+        out_text = out_path.read_text(errors="replace")
+        err_text = err_path.read_text(errors="replace")
+    if out_text:
+        sys.stdout.write(out_text)
+        sys.stdout.flush()
+    if err_text:
+        sys.stderr.write(err_text)
+        sys.stderr.flush()
+    # Scan BEFORE the exit-code check: a child that both fails and leaks must
+    # report the leak (the more actionable finding), not just the failure.
+    leaks = [p for p in FORBIDDEN_OUTPUT_PATTERNS if p in out_text or p in err_text]
+    if leaks:
+        raise SystemExit(
+            f"forbidden diagnostic signature(s) {leaks} in the output of "
+            f"{cmd[0]} (exit code {proc.returncode}) — shipped examples must not "
+            f"print internal build paths or diagnostic-printer lines "
+            f"(see tests/python/test_output_cleanliness.py)")
+    if check and proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, [str(c) for c in cmd])
+    return proc.returncode
 
 
 def _unpack_and_find_root(package: Path, work: Path) -> Path:
@@ -175,14 +239,14 @@ def _runtime_env(root: Path) -> dict:
     env = os.environ.copy()
     bin_dir = root / "bin"
     if IS_WINDOWS:
-        # Windows DLLs carry no embedded search path: expose bin/ (ovstage.dll) and
-        # bin/plugins/ (ovstage.dll's direct import deps usd_ms/tbb). These suites
-        # link the dynamic ovstage::ovstage target, so the loader path is set here
-        # (unlike examples/smoke, which links the static loader and self-locates).
+        # Windows DLLs carry no embedded search path: expose bin/ (the shared loader
+        # and runtime) and bin/plugins/ (the runtime's direct dependencies). These
+        # suites link ovstage::ovstage, so the loader path is set here (unlike a
+        # consumer that links ovstage::ovstage_static and self-locates).
         key, search = "PATH", [bin_dir, bin_dir / "plugins"]
     else:
-        # libovstage.so self-locates via RUNPATH ($ORIGIN:$ORIGIN/plugins), so bin/
-        # alone is enough for the loader to find libovstage.so itself.
+        # The shared loader and runtime are colocated in bin/; the runtime's RUNPATH
+        # resolves its plugin dependencies from there, so bin/ alone is sufficient.
         key, search = "LD_LIBRARY_PATH", [bin_dir]
     prefix = os.pathsep.join(str(p) for p in search)
     env[key] = prefix + (os.pathsep + env[key] if env.get(key) else "")
@@ -295,7 +359,7 @@ def _run_c_examples(root: Path, config: str) -> None:
         exe = (build / name / config / exe_name) if IS_WINDOWS else (build / name / exe_name)
         if not exe.is_file():
             raise SystemExit(f"built example {exe_name} not found at {exe}")
-        _run([exe], env=_runtime_env(root), cwd=exe.parent)
+        _run_scanned([exe], env=_runtime_env(root), cwd=exe.parent)
         if name == "producer-consumer":
             # Also cover the concurrent mode (--threads): producer and consumer
             # on one shared instance with coordinated shutdown. The example
@@ -304,12 +368,12 @@ def _run_c_examples(root: Path, config: str) -> None:
             # a coordinated shutdown in that case, so exit 0 and exit 1 are
             # both healthy; anything else (crash, signal) fails the suite.
             _log(f"=== C example: {name} --threads ===")
-            threads_run = subprocess.run([str(exe), "--threads"], env=_runtime_env(root),
-                                         cwd=exe.parent)
-            if threads_run.returncode not in (0, 1):
+            threads_rc = _run_scanned([exe, "--threads"], check=False,
+                                      env=_runtime_env(root), cwd=exe.parent)
+            if threads_rc not in (0, 1):
                 raise SystemExit(
-                    f"{name} --threads exited abnormally (code {threads_run.returncode})")
-            if threads_run.returncode == 1:
+                    f"{name} --threads exited abnormally (code {threads_rc})")
+            if threads_rc == 1:
                 _log(f"{name} --threads hit its documented expected race (exit 1)")
     _check_absent_examples("C", absent)
 
@@ -381,7 +445,7 @@ def _run_python_suite(wheel: Path) -> None:
         if gpu_deps and _gpu_gate(f"Python {name} GPU-section deps ({', '.join(gpu_deps)})"):
             _install_example_deps(py, example_dir, name, gpu_deps)
         _log(f"=== Python example: {name} ===")
-        _run([py, main_py], cwd=example_dir)
+        _run_scanned([py, main_py], cwd=example_dir)
     _check_absent_examples("Python", absent)
 
 

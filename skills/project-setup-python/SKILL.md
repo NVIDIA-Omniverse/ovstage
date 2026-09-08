@@ -84,7 +84,7 @@ This skill has no scripts.
 
 ovstage ships a Python package, **`ovstage`**, built with hatchling
 (`pyproject.toml`, `requires-python = ">=3.10,<3.14"`). It binds the ovstage C
-data-plane via ctypes, so the **ovstage shared library must be loadable** at
+data-plane via ctypes, so the **ovstage shared loader must be loadable** at
 import time. The released wheel bundles that library at `<package>/bin`, which
 the bindings find automatically — a wheel consumer needs no loader-path setup.
 
@@ -109,7 +109,7 @@ The minimal example wires this up as a ready-to-copy starting point — pin `ovs
 
 For a **local build** (not a published wheel), the loader finds the ovstage shared library on
 the **loader path**: add the build output
-dir (the one holding `ovstage.dll` / `libovstage.so`) to `PATH` (Windows) or
+dir (the one holding `ovstage-dynamic.dll` / `libovstage-dynamic.so`) to `PATH` (Windows) or
 `LD_LIBRARY_PATH` (Linux). The wheel layout (`<package>/bin`) is also searched
 automatically.
 
@@ -157,8 +157,8 @@ for `PathDictionary`, and `string-handling` (Python) for `str` vs. interned-toke
 
 ## Troubleshooting
 
-- **Import fails / shared library not found:** make the build output dir (holding
-  `ovstage.dll` / `libovstage.so`) reachable — set `OVSTAGE_LIBRARY_PATH_HINT` to it, or add
+- **Import fails / shared loader not found:** make the build output dir (holding
+  `ovstage-dynamic.dll` / `libovstage-dynamic.so`) reachable — set `OVSTAGE_LIBRARY_PATH_HINT` to it, or add
   it to `PATH` (Windows) / `LD_LIBRARY_PATH` (Linux). See Library Path.
 - **Unsupported Python version:** the package supports 3.10–3.13 only; recreate the env
   with a supported interpreter rather than editing the constraint.

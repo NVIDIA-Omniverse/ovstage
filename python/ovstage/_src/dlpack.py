@@ -9,7 +9,7 @@
 """DLPack tensor structures for zero-copy data interchange.
 
 ctypes wrappers for the DLPack 1.3 structs declared in
-``ovstage/public/include/dlpack/dlpack.h`` (which forwards to the shared
+``include/dlpack/dlpack.h`` (which forwards to the shared
 ``ovx/dlpack/dlpack.h``). ovstage carries all attribute tensor data as
 ``DLTensor``, so the binding both *consumes* DLTensors (read/map results) and
 *produces* them (the copy-in write path).
@@ -17,8 +17,7 @@ ctypes wrappers for the DLPack 1.3 structs declared in
 Two interchange paths are provided:
 
 * **NumPy convenience** — :func:`make_dltensor` wraps a numpy array (CPU) and
-  :func:`dltensor_to_numpy` returns a zero-copy ``np.ctypeslib`` view over a CPU
-  buffer.
+  :func:`dltensor_to_numpy` returns a zero-copy numpy view over a CPU buffer.
 * **Standard DLPack protocol** — :meth:`DLTensor.from_dlpack` ingests *any*
   producer exposing ``__dlpack__`` (numpy / warp / torch / cupy / jax) on CPU
   **or** CUDA, and :class:`ManagedDLTensor` (via ``__dlpack__`` /
@@ -53,6 +52,14 @@ __all__ = [
 # DLPack version numbers (aligned with C header dlpack.h)
 DLPACK_MAJOR_VERSION = 1
 DLPACK_MINOR_VERSION = 3
+
+# Largest lane (component) count ovstage can transport, mirroring the limit the C
+# write path already enforces. A dtype above this cannot cross into ovstage in
+# either direction, so it is rejected at the Python boundary rather than being
+# turned into a tensor view no backing buffer can satisfy. The DLPack ``lanes``
+# field is a uint16, so an unchecked value also wraps silently (``-1`` -> 65535)
+# and would describe a view ~257x past this limit.
+_MAX_DLPACK_LANES = 255
 
 # DLPack capsule name strings (protocol export/import).
 _c_str_dltensor = b"dltensor"
@@ -129,6 +136,48 @@ class DLDataType(ctypes.Structure):
         return f"DLDataType(code={self.code}, bits={self.bits}, lanes={self.lanes})"
 
 
+def _check_lane_count(dtype: DLDataType, what: str) -> int:
+    """Reject a lane count ovstage cannot transport, returning the valid one.
+
+    ``what`` names the boundary being crossed so the message says which side
+    produced the bad descriptor.
+    """
+    lanes = int(dtype.lanes)
+    if not 1 <= lanes <= _MAX_DLPACK_LANES:
+        raise ValueError(f"{what}: DLDataType lanes must be in [1, {_MAX_DLPACK_LANES}], got {lanes} ({dtype!r})")
+    return lanes
+
+
+def _described_byte_extent(
+    shape: tuple, strides: Optional[tuple], dtype: DLDataType, byte_offset: int
+) -> Optional[int]:
+    """Bytes a descriptor claims, measured from its own data pointer.
+
+    Used to remember how large a producer said its buffer was, so a *later*
+    re-description of the same tensor can be checked against it. Returns ``None``
+    for a descriptor this cannot bound safely (negative dimension or stride), so
+    the caller falls back to the lane check alone rather than enforcing a limit
+    that might be wrong.
+    """
+    if any(dim < 0 for dim in shape):
+        return None
+    item_bytes = (int(dtype.bits) * int(dtype.lanes) + 7) // 8
+    if strides is None:
+        span = 1
+        for dim in shape:
+            span *= dim
+    elif any(stride < 0 for stride in strides):
+        return None
+    elif any(dim == 0 for dim in shape):
+        span = 0
+    else:
+        # Strided: the payload reaches the last addressable element, not just
+        # prod(shape) contiguous ones. Bound by the real span so a legitimately
+        # strided producer is not rejected.
+        span = 1 + sum((dim - 1) * stride for dim, stride in zip(shape, strides))
+    return int(byte_offset) + span * item_bytes
+
+
 class DLTensor(ctypes.Structure):
     """Plain C tensor object; does not manage memory."""
 
@@ -180,6 +229,11 @@ class DLTensor(ctypes.Structure):
         managed = ctypes.cast(ptr, ctypes.POINTER(DLManagedTensor)).contents
         src = managed.dl_tensor
 
+        # Validate before consuming: raising here leaves the capsule un-renamed so
+        # the producer's own destructor reclaims it, which is the protocol-correct
+        # outcome for a rejected import. Do not move this below PyCapsule_SetName.
+        _check_lane_count(src.dtype, f"DLPack producer of type {type(obj).__name__}")
+
         result = cls()
         result.data = src.data
         result.device = src.device
@@ -198,6 +252,18 @@ class DLTensor(ctypes.Structure):
             result.strides = ctypes.cast(result._strides_storage, ctypes.POINTER(ctypes.c_int64))
         else:
             result.strides = None
+
+        # Remember what the producer claimed its buffer holds. Unlike a numpy
+        # array (whose real size stays reachable through ``_array``), a foreign
+        # producer offers no size at decode time, so record it while we still
+        # have the untouched descriptor. Re-describing the tensor afterwards
+        # cannot inflate this bound.
+        result._backing_nbytes = _described_byte_extent(
+            result.shape_tuple,
+            tuple(result.strides[i] for i in range(result.ndim)) if result.strides else None,
+            src.dtype,
+            src.byte_offset,
+        )
 
         # Consume the capsule per the DLPack protocol: rename it so the capsule
         # destructor no-ops, then keep the producer's managed-tensor descriptor
@@ -273,14 +339,6 @@ class _ConsumedDLManagedTensor:
 
 # ── DLPack protocol export (capsule creation) ───────────────────────────────
 # Python C-API bindings used to build/consume DLPack PyCapsules.
-# AUTOREMOVE: BEGIN
-# Derived from the sibling ovrtx implementation (ovrtx/_src/dlpack.py), but
-# deliberately *diverged* as of OMPE-102796: ovrtx still allocates with PyMem_Malloc
-# and installs a Python ctypes callback as the DLPack deleter, which reproduces the
-# bug fixed here (writing into a read-only np.from_dlpack view raises "SystemError:
-# error return without exception set" and strands the capsule context). Do not
-# resync this file to ovrtx until the same fix lands there.
-# AUTOREMOVE: END
 # The DLManagedTensor block is allocated and freed in the *raw* allocator domain.
 # PyMem_Malloc/PyMem_Free would require the GIL, and the DLPack deleter below is a
 # bare C function pointer that cannot acquire it the way a ctypes callback does, so
@@ -528,9 +586,17 @@ class ManagedDLTensor:
         managed = ManagedDLTensor(tensor, manager_ctx=owner)
         view = np.from_dlpack(managed)  # `managed` must outlive `view`
 
-    This does not invalidate ``np.from_dlpack(group.dlpack(0))`` for ovstage
-    read/map groups: their ``manager_ctx`` does not own the backing allocation,
-    and the view remains valid while the owning read/map operation is alive.
+    For ovstage read/map groups the ``manager_ctx`` does not own the backing
+    allocation, so the view stays valid while the owning group is alive — but a
+    consumer view does **not** keep that group alive. Bind the group for as long
+    as you use the view::
+
+        group = read.fetch_next()
+        arr = np.from_dlpack(group.dlpack(0))  # `group` must outlive `arr`
+
+    ``np.from_dlpack(read.fetch_next().dlpack(0))`` drops the group on the same
+    line: its finalizer releases the pinned storage and ``arr`` is left reading
+    memory that has been handed back.
     """
 
     def __init__(
@@ -593,9 +659,13 @@ class ManagedDLTensor:
         if copy is True:
             raise BufferError("copy=True is not supported")
         if dl_device is not None:
+            # operator.index, not int(): the array-API contract is that a
+            # malformed request is rejected, and int() truncated a fractional
+            # device onto the tensor's own device, which then compared equal.
+            # KeyError is in the tuple because dl_device[0] on a dict raises it.
             try:
-                requested_device = (int(dl_device[0]), int(dl_device[1]))
-            except (TypeError, IndexError, ValueError) as exc:
+                requested_device = (operator.index(dl_device[0]), operator.index(dl_device[1]))
+            except (TypeError, IndexError, KeyError, ValueError) as exc:
                 raise TypeError("dl_device must be a (device_type, device_id) tuple") from exc
             current_device = self.__dlpack_device__()
             if requested_device != current_device:
@@ -675,14 +745,15 @@ _NUMPY_TO_DL = {
 def numpy_to_dldatatype(np_dtype, lanes: int = 1) -> DLDataType:
     """Build a :class:`DLDataType` from a numpy dtype (with optional vector lanes).
 
-    ``lanes`` must be an integer in ``[1, 65535]``: the value lands in the DLPack
-    ``uint16`` lane field, so anything outside that range raises
-    :class:`ValueError` (:class:`TypeError` for non-integers) instead of silently
-    wrapping to a bogus lane count (e.g. ``-1`` becoming ``65535``).
+    ``lanes`` must be an integer in ``[1, 255]``, the range ovstage can transport:
+    anything outside it raises :class:`ValueError` (:class:`TypeError` for
+    non-integers) rather than building a dtype no ovstage read or write accepts.
+    The value lands in the DLPack ``uint16`` lane field, which would otherwise
+    also wrap a negative count silently (``-1`` becoming ``65535``).
     """
     lanes = operator.index(lanes)
-    if not 1 <= lanes <= 0xFFFF:
-        raise ValueError(f"DLDataType lanes must be in [1, 65535], got {lanes}")
+    if not 1 <= lanes <= _MAX_DLPACK_LANES:
+        raise ValueError(f"DLDataType lanes must be in [1, {_MAX_DLPACK_LANES}], got {lanes}")
     name = str(np_dtype)
     if name not in _NUMPY_TO_DL and np_dtype is not None:
         # A numpy scalar *type* (np.float32) stringifies as "<class 'numpy.float32'>",
@@ -749,7 +820,8 @@ def _fold_dlpack_producer_layout(
             f"(source=({source_dtype.code}, {source_dtype.bits}), "
             f"requested=({dtype.code}, {dtype.bits}))"
         )
-    if source_dtype.lanes == 0 or dtype.lanes == 0 or dtype.lanes < source_dtype.lanes:
+    _check_lane_count(dtype, "DLPack producer dtype override")
+    if source_dtype.lanes == 0 or dtype.lanes < source_dtype.lanes:
         raise ValueError("DLPack producer dtype override must preserve or increase a positive lane count")
     if dtype.lanes % source_dtype.lanes != 0:
         raise ValueError("requested lanes must be an integer multiple of the source lanes")
@@ -925,10 +997,14 @@ def make_dltensor(
         tensor.strides = None
     tensor.byte_offset = 0
     tensor.dtype = dtype if dtype is not None else numpy_to_dldatatype(array.dtype)
+    # An explicit dtype bypasses numpy_to_dldatatype's own check, so validate the
+    # resolved one here: a bad lane count is worth reporting where the descriptor
+    # is built rather than later, at whichever read first tries to decode it.
+    _check_lane_count(tensor.dtype, "cannot describe numpy array as DLTensor")
     return tensor
 
 
-def dltensor_to_numpy(tensor: DLTensor):
+def dltensor_to_numpy(tensor: DLTensor, *, readonly: bool = False):
     """Return a zero-copy numpy view of a CPU :class:`DLTensor`.
 
     The view is flat: its length is ``prod(shape) * dtype.lanes`` base elements,
@@ -936,11 +1012,22 @@ def dltensor_to_numpy(tensor: DLTensor):
     folded into the element count rather than the dtype. The data is owned by
     ovstage and only valid until the owning group/result is released.
 
-    An invalid dtype (``lanes == 0``) is rejected with :class:`ValueError`. A
-    tensor wrapping a numpy array (built by :func:`make_dltensor`) is also
-    checked against the array's real size, so the returned view can never extend
-    past that backing buffer; tensors from other producers carry no buffer size
-    to check against and are trusted to describe themselves.
+    When ``readonly`` is true, the view is backed by a read-only buffer so its
+    ``WRITEABLE`` flag cannot be re-enabled. The default remains writable for
+    caller-owned tensors and map buffers.
+
+    Every tensor's lane count is checked against the transportable range
+    ``[1, 255]`` and a dtype outside it is rejected with :class:`ValueError`,
+    whatever produced the descriptor. That bound needs no buffer size, so it
+    also covers a raw ``DLTensor`` decoded straight out of the C read/map
+    result, where the ``lanes`` field is a ``uint16`` that a wrapped value
+    (``-1`` -> 65535) would otherwise turn into a view far past the payload.
+
+    Where a real buffer size is known — a numpy array wrapped by
+    :func:`make_dltensor`, or the extent a DLPack producer described at
+    :meth:`DLTensor.from_dlpack` time — the decoded view is additionally checked
+    against it and can never extend past it. A raw descriptor carries no buffer
+    length at all, so for those the lane bound is the guarantee.
     """
     import numpy as np
 
@@ -954,9 +1041,7 @@ def dltensor_to_numpy(tensor: DLTensor):
     if ctype is None:
         raise ValueError(f"Unsupported DLDataType for numpy conversion: {tensor.dtype!r}")
 
-    lanes = int(tensor.dtype.lanes)
-    if lanes < 1:
-        raise ValueError(f"Invalid DLDataType lanes for numpy conversion: {tensor.dtype!r}")
+    lanes = _check_lane_count(tensor.dtype, "cannot decode DLTensor to numpy")
 
     count = 1
     for i in range(tensor.ndim):
@@ -965,20 +1050,27 @@ def dltensor_to_numpy(tensor: DLTensor):
 
     np_dtype = np.dtype(ctype)
     if count == 0 or not tensor.data:
+        if readonly:
+            return np.frombuffer(b"", dtype=np_dtype)
         return np.empty(0, dtype=np_dtype)
 
-    # When the backing buffer is known (a numpy array wrapped by make_dltensor),
-    # refuse to build a view extending past it: a mis-described dtype/shape would
-    # otherwise become an out-of-bounds read at first element access.
+    # When a real buffer size is known, refuse to build a view extending past it:
+    # a mis-described dtype/shape would otherwise become an out-of-bounds read at
+    # first element access. Two sources, in order of trust: a wrapped numpy array
+    # still reports its own size, and a DLPack producer's extent was recorded at
+    # ingest. A raw descriptor has neither and relies on the lane bound above.
     backing = getattr(tensor, "_array", None)
-    if backing is not None:
+    backing_nbytes = backing.nbytes if backing is not None else getattr(tensor, "_backing_nbytes", None)
+    if backing_nbytes is not None:
         described_bytes = int(tensor.byte_offset) + count * ctypes.sizeof(ctype)
-        if described_bytes > backing.nbytes:
+        if described_bytes > backing_nbytes:
             raise ValueError(
                 f"DLTensor describes {described_bytes} bytes (shape {tensor.shape_tuple}, "
-                f"dtype {tensor.dtype!r}) but its backing buffer holds {backing.nbytes} bytes"
+                f"dtype {tensor.dtype!r}) but its backing buffer holds {backing_nbytes} bytes"
             )
 
     base_addr = int(tensor.data) + int(tensor.byte_offset)
     buffer = (ctype * count).from_address(base_addr)
+    if readonly:
+        return np.frombuffer(memoryview(buffer).toreadonly(), dtype=np_dtype)
     return np.ctypeslib.as_array(buffer)

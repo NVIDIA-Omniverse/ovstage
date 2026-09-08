@@ -16,7 +16,6 @@ Tensor data flows as numpy arrays (CPU) via DLPack.
 """
 
 import ctypes
-import warnings
 from typing import List, Optional, Sequence, Union
 
 from . import bindings as _b
@@ -39,8 +38,17 @@ from .types import (
     StageConfig,
     TIMEOUT_INFINITE,
     WriteDesc,
+    _warn_dropped_resource,
+    check_element_sizes,
+    check_enum,
+    check_enum_member,
+    check_handle,
+    check_index_map,
+    check_mask,
     check_ordinal,
     check_timeout,
+    check_token_sequence,
+    check_write_count,
 )
 
 __all__ = ["Stage", "Query", "Read", "Map", "OrdinalQuery", "Hierarchy"]
@@ -52,7 +60,7 @@ def _handle(value) -> int:
     """Accept a handle wrapper (``.handle``) or a raw int handle."""
     if hasattr(value, "_ensure_active"):
         value._ensure_active()
-    return int(getattr(value, "handle", value))
+    return check_handle(getattr(value, "handle", value), "handle")
 
 
 class Stage:
@@ -95,6 +103,14 @@ class Stage:
                 self._lib.ovstage_shutdown()
                 self._holds_process_ref = False
             raise OvstageError(code, message)
+        # Ownership of caller-created path lists, keyed by handle (see PathList).
+        # It lives here rather than on PathDictionary because the C path
+        # dictionary is per-Stage while wrappers are not: PathDictionary(stage) is
+        # the documented shared form and ovstage.instancing builds one per call, so
+        # several wrappers over one Stage are routine and must agree on who owns
+        # what — otherwise a release through one desyncs the other into a double
+        # release.
+        self._path_list_refs = {}
 
     # ── lifecycle ──────────────────────────────────────────────────────────
     @staticmethod
@@ -102,13 +118,11 @@ class Stage:
         entries = []
         model = config.runtime_default_hierarchy_computation_model
         if model is not None:
-            try:
-                model = HierarchyComputationModel(model)
-            except (TypeError, ValueError):
-                raise ValueError(
-                    "runtime_default_hierarchy_computation_model must be a "
-                    f"HierarchyComputationModel, got {model!r}"
-                ) from None
+            model = check_enum_member(
+                model,
+                HierarchyComputationModel,
+                "runtime_default_hierarchy_computation_model",
+            )
             if model == HierarchyComputationModel.INVALID:
                 raise ValueError(
                     "runtime_default_hierarchy_computation_model must be CPU_INCREMENTAL, "
@@ -117,7 +131,7 @@ class Stage:
             entries.append(
                 _b.ovstage_config_entry_uint64(
                     _b.OVSTAGE_CONFIG_RUNTIME_DEFAULT_HIERARCHY_COMPUTATION_MODEL,
-                    int(model),
+                    model,
                 )
             )
         return _b.ovstage_config_t(entries)
@@ -215,7 +229,11 @@ class Stage:
     def wait_op_raw(self, op_id: int, timeout: int = TIMEOUT_INFINITE) -> int:
         """Wait without raising or releasing; returns the raw ``ovstage_api_status_t``."""
         wait = _b.ovstage_op_wait_result_t()
-        return int(self._api.ovstage_wait_op(self._inst, op_id, check_timeout(timeout), ctypes.byref(wait)))
+        return int(
+            self._api.ovstage_wait_op(
+                self._inst, check_handle(op_id, "op_id"), check_timeout(timeout), ctypes.byref(wait)
+            )
+        )
 
     def wait_op(self, op_id: int, timeout: int = TIMEOUT_INFINITE):
         """Low-level wait: returns ``(code, error_op_ids, lowest_pending_op_id)``.
@@ -225,7 +243,11 @@ class Stage:
         ``error_op_ids``).
         """
         wait = _b.ovstage_op_wait_result_t()
-        code = int(self._api.ovstage_wait_op(self._inst, op_id, check_timeout(timeout), ctypes.byref(wait)))
+        code = int(
+            self._api.ovstage_wait_op(
+                self._inst, check_handle(op_id, "op_id"), check_timeout(timeout), ctypes.byref(wait)
+            )
+        )
         error_op_ids = (
             [int(wait.error_op_ids[i]) for i in range(int(wait.error_op_id_count))]
             if wait.error_op_ids
@@ -235,7 +257,7 @@ class Stage:
 
     def release_op(self, op_id: int) -> int:
         """Release op tracking state; returns the raw ``ovstage_api_status_t``."""
-        return int(self._api.ovstage_release_op(self._inst, op_id))
+        return int(self._api.ovstage_release_op(self._inst, check_handle(op_id, "op_id")))
 
     # ── query ───────────────────────────────────────────────────────────────
     def query(
@@ -254,19 +276,44 @@ class Stage:
         attr_ptr = None
         attr_count = 0
         if attrs:
-            arr = (_b.ovx_token_t * len(attrs))(*[int(a) for a in attrs])
+            tokens = check_token_sequence(attrs, "attrs entries")
+            arr = (_b.ovx_token_t * len(tokens))(*tokens)
             keep.append(arr)
             attr_ptr = ctypes.cast(arr, ctypes.POINTER(_b.ovx_token_t))
-            attr_count = len(attrs)
+            attr_count = len(tokens)
         handle = _b.ovstage_query_handle_t()
         res = self._api.ovstage_query(self._inst, filt_ref, attr_ptr, attr_count, ctypes.byref(handle))
         return Query(self, int(handle.value), Operation(self, res.status, res.op_index, keepalive=keep))
 
     def query_from_path_list(self, path_list: int) -> "Query":
-        """Create a query handle from an interned prim path list (synchronous)."""
+        """Create a query handle from an interned prim path list (synchronous).
+
+        The handle wraps a **caller-owned** list (see ``query_from_path_list`` in
+        ``ovstage_api.h``), so keep your list alive for as long as the query and
+        release it when you are done::
+
+            with paths.create_path_list_from_strings(paths_) as plist:
+                with stage.query_from_path_list(plist) as query:
+                    ...
+
+        When given a :class:`PathList`, the returned :class:`Query` holds a
+        reference to it, so the list cannot be finalized while the query is live.
+        That is a safety net, not a transfer of ownership: releasing the query does
+        not release your list. Passing a freshly created list inline —
+        ``stage.query_from_path_list(paths.create_path_list_from_strings(...))`` —
+        leaves no handle to release, so the list is eventually reclaimed by
+        :meth:`PathList.__del__` with a :class:`ResourceWarning`. Bind it.
+        """
         handle = _b.ovstage_query_handle_t()
-        self._check(self._api.ovstage_query_from_path_list(self._inst, int(path_list), ctypes.byref(handle)))
-        return Query(self, int(handle.value), None)
+        self._check(
+            self._api.ovstage_query_from_path_list(
+                self._inst, check_handle(path_list, "path_list"), ctypes.byref(handle)
+            )
+        )
+        query = Query(self, int(handle.value), None)
+        # Keepalive only — the reference stays the caller's to release.
+        query._path_list = path_list
+        return query
 
     def fetch_query_result(self, query, timeout: int = TIMEOUT_INFINITE) -> QueryResult:
         """Fetch (and release) a query result, copying out its scalar summary."""
@@ -294,11 +341,20 @@ class Stage:
             raise
         if res.status != _b.OVSTAGE_OK and claimed:
             query._rollback_release()
-        return Operation(self, res.status, res.op_index)
+        # The release is enqueue-only and the query wraps a caller-owned list, so
+        # carry the keepalive on the op: a caller who holds the returned Operation
+        # (the documented `q.release().wait()` form) cannot let the list be
+        # finalized while the release is still pending. A caller who discards the
+        # op -- including the __del__ safety net -- gets no such protection; the
+        # shipped implementation does not read the list after this point, but the
+        # header does not promise that, so keep the list alive yourself if you
+        # release without waiting.
+        keepalive = getattr(query, "_path_list", None)
+        return Operation(self, res.status, res.op_index, keepalive=[keepalive] if keepalive is not None else None)
 
     # ── read ─────────────────────────────────────────────────────────────────
     def read_attributes(self, query, attrs: Sequence[int], ordinal_range: OrdinalRange) -> "Read":
-        attr_list = [int(a) for a in attrs]
+        attr_list = check_token_sequence(attrs, "attrs entries")
         arr = (_b.ovx_token_t * len(attr_list))(*attr_list)
         handle = _b.ovstage_read_handle_t()
         res = self._api.ovstage_read_attributes(
@@ -315,10 +371,31 @@ class Stage:
             return None
         if code != _b.OVSTAGE_OK:
             raise OvstageError(code, self._last_error())
-        return ReadGroup(grp)
+        return ReadGroup(grp, self)
 
     def release_group(self, group: ReadGroup) -> None:
-        self._check(self._api.ovstage_release_group(self._inst, ctypes.byref(group.raw)))
+        """Release a read group's pinned storage.
+
+        A group released twice would free storage the instance has already
+        reclaimed, so a :class:`ReadGroup` raises instead — this is what keeps an
+        explicit release plus a later finalizer from double-releasing.
+
+        Release state is tracked on every :class:`ReadGroup`, including one a
+        caller constructed themselves (no owning stage). Such a group has no
+        finalizer, but it still needs the flag: without it a second
+        ``release_group`` would reach the C API, and :meth:`ReadGroup.tensor` /
+        :meth:`ReadGroup.prim_index` would keep reading storage that has been
+        handed back.
+        """
+        claimed = isinstance(group, ReadGroup)
+        if claimed:
+            group._claim_release()
+        try:
+            self._check(self._api.ovstage_release_group(self._inst, ctypes.byref(group.raw)))
+        except Exception:
+            if claimed:
+                group._rollback_release()  # nothing was reclaimed; stay releasable
+            raise
 
     def release_read(self, read) -> Operation:
         claimed = isinstance(read, _HandleObject)
@@ -341,11 +418,13 @@ class Stage:
             raise TypeError("is_array must be a bool")
         if index_map is not None and mask is not None:
             raise ValueError("index_map and mask are mutually exclusive; pass at most one")
-        # wd.count is a uint32, so a negative wraps to a value near 2^32 and is
-        # reported back as a count that exceeds the query -- naming neither the
-        # sign nor the argument that carried it.
-        if count is not None and count < 0:
-            raise ValueError(f"count must not be negative; got {count}")
+        # Normalize count before anything derives a bound from it. wd.count is a
+        # uint32 and ctypes wraps instead of raising, so a negative came back as
+        # a count near 2^32 that "exceeds the query" -- naming neither the sign
+        # nor the argument that carried it -- and 2**32 became a silent
+        # whole-query write. Guard here so the checks below see the real value.
+        if count is not None:
+            count = check_write_count(count)
         keep: list = []
         items = tensors if isinstance(tensors, (list, tuple)) else [tensors]
         if not items:
@@ -362,11 +441,15 @@ class Stage:
         wd.tensor_count = len(dl_tensors)
         wd.is_array = is_array
         if index_map is not None:
+            # Entries are uint32 source rows and ctypes would wrap an
+            # out-of-range one into a valid-looking row, so check and materialize
+            # them once here; the bounds below and the C array share the result.
+            indices = check_index_map(index_map)
             # The runtime reads exactly `count` entries from index_map -- one
             # source row per logical element -- so a count wider than the map
             # would read past the buffer this binding owns. Only Python knows
             # the map's length, so the bound has to be enforced here.
-            resolved_count = len(index_map) if count is None else count
+            resolved_count = len(indices) if count is None else count
             if resolved_count == 0:
                 # 0 is the C contract's "every prim the query covers", which
                 # cannot be what a map means: the runtime would leave it unread
@@ -376,17 +459,20 @@ class Stage:
                     "index_map requires a non-zero count; an empty index_map (or count=0) addresses "
                     "no logical elements. Omit index_map to write every prim the query covers"
                 )
-            if resolved_count > len(index_map):
+            if resolved_count > len(indices):
                 raise ValueError(
                     f"index_map must hold one entry per logical element: count={resolved_count} "
-                    f"exceeds len(index_map)={len(index_map)}. To address more of the query, "
+                    f"exceeds len(index_map)={len(indices)}. To address more of the query, "
                     "lengthen index_map (or use mask to select target prims)"
                 )
-            im = (ctypes.c_uint32 * len(index_map))(*[int(x) for x in index_map])
+            im = (ctypes.c_uint32 * len(indices))(*indices)
             keep.append(im)
             wd.index_map = ctypes.cast(im, ctypes.POINTER(ctypes.c_uint32))
             wd.count = resolved_count
         elif mask is not None:
+            # Words are uint64; ctypes would wrap a negative one into an
+            # all-bits-set word that selects every element.
+            words = check_mask(mask)
             # The C contract requires a non-zero count whenever mask is set, and
             # the mask words cannot imply one: they are a bitset whose length is
             # a word count, not an element count. Defaulting to 0 here would
@@ -403,12 +489,12 @@ class Stage:
                 )
             # The runtime tests one bit per logical element, reading
             # ceil(count / 64) words, so a short mask reads past the buffer.
-            if count > len(mask) * 64:
+            if count > len(words) * 64:
                 raise ValueError(
                     f"mask must hold at least {(count + 63) // 64} 64-bit word(s) to index "
-                    f"{count} logical element(s); got {len(mask)}"
+                    f"{count} logical element(s); got {len(words)}"
                 )
-            mk = (ctypes.c_uint64 * len(mask))(*[int(x) for x in mask])
+            mk = (ctypes.c_uint64 * len(words))(*words)
             keep.append(mk)
             wd.mask = ctypes.cast(mk, ctypes.POINTER(ctypes.c_uint64))
             wd.count = count
@@ -428,7 +514,11 @@ class Stage:
             wd.cuda_sync.stream = cuda_stream
         if cuda_event is not None:
             wd.cuda_sync.wait_event = cuda_event
-        wd.semantic = int(semantic)
+        # Range-only on purpose: semantic is documented to accept a raw
+        # ovstage_attribute_semantic_t, so a value newer than the compiled-in
+        # enum must still reach the library. Changes only together with the
+        # map_attribute site below.
+        wd.semantic = check_enum(semantic, "semantic")
         return wd, keep
 
     def write_attribute(
@@ -505,10 +595,16 @@ class Stage:
         To write a subset of a query's prims, use ``mask``; ``index_map`` selects
         source data, not targets.
 
+        All three carry the width of the C fields behind them: ``count`` and
+        every ``index_map`` entry must fit in ``uint32`` and each ``mask`` word
+        in ``uint64``. An out-of-range value raises :class:`ValueError` rather
+        than wrapping into the field — ``count=2**32`` is rejected, not silently
+        turned into the whole-query ``0``.
+
         ``semantic`` is the :class:`AttributeSemantic` (or raw
         ``ovstage_attribute_semantic_t`` value) carried on the write. Geometric
-        semantics (POINT/VECTOR/NORMAL/COLOR/QUATERNION/MATRIX/TEXTURE_COORDINATE)
-        record a geometric role on the column; ID semantics select the
+        semantics (POINT/VECTOR/NORMAL/COLOR/QUATERNION/MATRIX/FRAME/TEXTURE_COORDINATE)
+        and TIME_CODE record a role on the column; ID semantics select the
         corresponding ID storage type and require pre-interned id payloads
         (``TOKEN_ID`` / ``RELATIONSHIP_PATH_ID`` use ``dtype = (kDLUInt, 64, 1)``,
         ``CONNECTION_PATH_ID`` uses ``dtype = (kDLUInt, 64, 2)``). ``0`` (NONE)
@@ -522,7 +618,7 @@ class Stage:
         sot = _b.make_string_or_token(attribute)
         keep.append(sot)
         res = self._api.ovstage_write_attribute(
-            self._inst, _handle(query), sot, check_ordinal(ordinal), wd, int(prim_mode)
+            self._inst, _handle(query), sot, check_ordinal(ordinal), wd, check_enum_member(prim_mode, PrimMode, "prim_mode")
         )
         return Operation(self, res.status, res.op_index, keepalive=keep)
 
@@ -565,7 +661,8 @@ class Stage:
             else None
         )
         res = self._api.ovstage_write_attributes(
-            self._inst, _handle(query), writes_ptr, len(items), check_ordinal(ordinal), int(prim_mode)
+            self._inst, _handle(query), writes_ptr, len(items), check_ordinal(ordinal),
+            check_enum_member(prim_mode, PrimMode, "prim_mode"),
         )
         return Operation(self, res.status, res.op_index, keepalive=keep)
 
@@ -646,7 +743,13 @@ class Stage:
     ) -> Operation:
         """Enqueue hierarchy-derived data computation for ``input_ordinal``."""
         fn = self._flat_symbol("ovstage_compute_hierarchy")
-        res = fn(self._require_inst(), int(model), check_ordinal(input_ordinal), check_ordinal(output_ordinal))
+        res = fn(
+            # Range-only on purpose: model ids are discovered at runtime via
+            # get_hierarchy_computation_models, so they must not be checked
+            # against the enum this wheel happens to ship.
+            self._require_inst(), check_enum(model, "model"),
+            check_ordinal(input_ordinal), check_ordinal(output_ordinal),
+        )
         return Operation(self, res.status, res.op_index)
 
     def get_hierarchy(self, path_list: int, ordinal: int, relation: int) -> HierarchyResult:
@@ -670,7 +773,14 @@ class Stage:
         """Enqueue a parent/children/siblings lookup for an ordered path list."""
         fn = self._flat_symbol("ovstage_get_hierarchy")
         handle = _b.ovstage_hierarchy_handle_t()
-        res = fn(self._require_inst(), int(path_list), check_ordinal(ordinal), int(relation), ctypes.byref(handle))
+        res = fn(
+            self._require_inst(), check_handle(path_list, "path_list"), check_ordinal(ordinal),
+            # Range-only on purpose: test_get_hierarchy_validates_relation_and_release
+            # pins that the *runtime* rejects an unknown relation, returning
+            # INVALID_ARGUMENT with a zero handle. Pre-rejecting here would make
+            # that native path unreachable from Python. Same treatment as `model`.
+            check_enum(relation, "relation"), ctypes.byref(handle),
+        )
         return Hierarchy(self, int(handle.value), Operation(self, res.status, res.op_index))
 
     @staticmethod
@@ -745,9 +855,9 @@ class Stage:
         reconstruct a convenience write shape such as ``(N, 4, 4)``.
         ``semantic`` is the :class:`AttributeSemantic` (or raw
         ``ovstage_attribute_semantic_t`` value) carried on the map. Geometric
-        semantics record a geometric role on the column when the map creates it;
-        ID semantics select the corresponding ID storage type and require
-        pre-interned ids in the map buffer (``TOKEN_ID`` /
+        semantics and TIME_CODE record a role on the column when the map
+        creates it; ID semantics select the corresponding ID storage type and
+        require pre-interned ids in the map buffer (``TOKEN_ID`` /
         ``RELATIONSHIP_PATH_ID`` use ``dtype = (kDLUInt, 64, 1)``,
         ``CONNECTION_PATH_ID`` uses ``dtype = (kDLUInt, 64, 2)``).
         ``element_sizes`` gives per-prim element counts for ragged columns.
@@ -756,18 +866,22 @@ class Stage:
         sizes_ptr = None
         sizes_count = 0
         if element_sizes is not None:
-            sizes = (ctypes.c_size_t * len(element_sizes))(*[int(s) for s in element_sizes])
+            entries = check_element_sizes(element_sizes)
+            sizes = (ctypes.c_size_t * len(entries))(*entries)
             keep.append(sizes)
             sizes_ptr = ctypes.cast(sizes, ctypes.POINTER(ctypes.c_size_t))
-            sizes_count = len(element_sizes)
+            # Length of the materialized list: it is the array the runtime reads,
+            # so the count it is paired with should be derived from the same thing.
+            sizes_count = len(entries)
         sot = _b.make_string_or_token(attribute)
         keep.append(sot)  # keeps sot._string_ref (the attribute string buffer) alive
         desc = _b.ovstage_map_desc_t()
         desc.attribute = sot
         if dtype is not None:
             desc.dtype = dtype
-        desc.semantic = int(semantic)
-        desc.prim_mode = int(prim_mode)
+        # Range-only on purpose -- see the write_attribute site.
+        desc.semantic = check_enum(semantic, "semantic")
+        desc.prim_mode = check_enum_member(prim_mode, PrimMode, "prim_mode")
         keep.append(desc)
         handle = _b.ovstage_map_handle_t()
         res = self._api.ovstage_map_attribute(
@@ -822,13 +936,16 @@ class Stage:
         """
         desc = _b.ovstage_write_floor_desc_t()
         desc.ordinal = check_ordinal(ordinal)
-        desc.scope = int(scope)
+        desc.scope = check_enum_member(scope, Scope, "scope")
         keep: list = []
         if attributes:
-            arr = (_b.ovx_token_t * len(attributes))(*[int(a) for a in attributes])
+            tokens = check_token_sequence(attributes, "attributes entries")
+            arr = (_b.ovx_token_t * len(tokens))(*tokens)
             keep.append(arr)
             desc.attributes = ctypes.cast(arr, ctypes.POINTER(_b.ovx_token_t))
-            desc.attribute_count = len(attributes)
+            # Length of the materialized list, for the same reason as the array
+            # above it: this count describes `arr`, so it is derived from `arr`.
+            desc.attribute_count = len(tokens)
         res = self._api.ovstage_advance_write_floor(self._inst, ctypes.byref(desc))
         return Operation(self, res.status, res.op_index, keepalive=keep)
 
@@ -869,8 +986,10 @@ class Stage:
         """Return the instance's shared path-dictionary bundle (``{vtable, context}``).
 
         The dictionary is owned by ovstage and stays valid while at least one
-        instance is alive; callers must not tear it down. Used by
-        :class:`ovstage.PathDictionary`.
+        instance is alive; callers must not tear it down. This is the raw bundle
+        the binding dispatches through, **not** a :class:`ovstage.PathDictionary`
+        — to work with tokens, paths, and path lists from Python, construct
+        ``PathDictionary(stage)``, which calls this for you.
         """
         pd = self._api.ovstage_get_path_dictionary(self._inst)
         if not pd:
@@ -899,7 +1018,7 @@ class _HandleObject:
 
     def __init__(self, stage: Stage, handle: int, op: Optional[Operation]):
         self._stage = stage
-        self.handle = int(handle)
+        self.handle = check_handle(handle, "handle")
         self.op = op
         self._released = False
 
@@ -955,17 +1074,18 @@ class _HandleObject:
         # instance is gone (e.g. interpreter shutdown), where dispatch is unsafe.
         if self._released or not self.handle or not getattr(self._stage, "_inst", None):
             return
-        warnings.warn(
-            f"{type(self).__name__} (handle={self.handle}) was garbage-collected without "
-            "release(); issuing a best-effort release to free the pinned handle. Use a "
-            "'with' block or call release() explicitly.",
-            ResourceWarning,
-            stacklevel=1,
-        )
+        # Release BEFORE warning: warnings.warn raises when the caller escalates
+        # ResourceWarning (-W error::ResourceWarning), so warning first would skip
+        # the release for exactly the users who asked to be strict about resources.
         try:
             self.release()  # enqueue-only; the handle is reclaimed when the op runs
         except Exception:
             pass
+        _warn_dropped_resource(
+            f"{type(self).__name__} (handle={self.handle}) was garbage-collected without "
+            "release(); issued a best-effort release to free the pinned handle. Use a "
+            "'with' block or call release() explicitly."
+        )
 
 
 class Query(_HandleObject):
@@ -1105,17 +1225,18 @@ class Map(_HandleObject):
         # instance is gone (e.g. interpreter shutdown), where dispatch is unsafe.
         if self._unmapped or not self.handle or not getattr(self._stage, "_inst", None):
             return
-        warnings.warn(
-            f"Map (handle={self.handle}) was garbage-collected without unmap(); "
-            "issuing a best-effort unmap to release the pinned session. Use a "
-            "'with' block or call unmap() explicitly.",
-            ResourceWarning,
-            stacklevel=1,
-        )
+        # Unmap BEFORE warning, for the same reason as _HandleObject.__del__:
+        # warnings.warn raises under -W error::ResourceWarning, and warning first
+        # would strand the pinned session for the users who asked to be strict.
         try:
             self.unmap()  # enqueue-only; the session releases when the op runs
         except Exception:
             pass
+        _warn_dropped_resource(
+            f"Map (handle={self.handle}) was garbage-collected without unmap(); "
+            "issued a best-effort unmap to release the pinned session. Use a "
+            "'with' block or call unmap() explicitly."
+        )
 
 
 class OrdinalQuery(_HandleObject):

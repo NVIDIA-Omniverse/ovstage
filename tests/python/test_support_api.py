@@ -6,6 +6,7 @@
 # tensor data in and out. CPU-only; no Stage required. The ovstage_mod fixture
 # skips cleanly if the native library is not loadable.
 
+import ctypes
 import gc
 import sys
 
@@ -15,6 +16,9 @@ import pytest
 from ovstage import (
     DLDataType,
     DLDataTypeCode,
+    DLDevice,
+    DLDeviceType,
+    DLTensor,
     ManagedDLTensor,
     dltensor_to_numpy,
     library_version,
@@ -34,6 +38,28 @@ class _DLPackProducer:
 
     def __dlpack_device__(self):
         return self.array.__dlpack_device__()
+
+
+def _raw_dltensor(backing, *, lanes, shape=None):
+    """Describe ``backing`` the way a read or map result does: a bare DLTensor.
+
+    Deliberately not built through ``make_dltensor``. A raw descriptor carries no
+    Python-side reference to its buffer, so nothing can recover the real size at
+    decode time — which is precisely the case a validation guard is most likely to
+    leave uncovered, and the case ``AttributeGroup.array()`` actually decodes.
+    The caller keeps ``backing`` alive for as long as the tensor is used.
+    """
+    shape = (backing.shape[0],) if shape is None else tuple(shape)
+    tensor = DLTensor()
+    tensor.data = backing.ctypes.data
+    tensor.device = DLDevice(DLDeviceType.kDLCPU, 0)
+    tensor.ndim = len(shape)
+    tensor._shape_storage = (ctypes.c_int64 * len(shape))(*shape)
+    tensor.shape = ctypes.cast(tensor._shape_storage, ctypes.POINTER(ctypes.c_int64))
+    tensor.strides = None
+    tensor.byte_offset = 0
+    tensor.dtype = DLDataType(code=DLDataTypeCode.kDLFloat, bits=32, lanes=lanes)
+    return tensor
 
 
 def test_library_version(ovstage_mod):
@@ -67,11 +93,21 @@ def test_dlpack_lane_folding(ovstage_mod):
     assert bool(np.allclose(view, source))
 
 
+def test_dltensor_to_numpy_readonly_empty_view_cannot_be_made_writable(ovstage_mod):
+    tensor = make_dltensor(np.empty(0, np.float32))
+    view = dltensor_to_numpy(tensor, readonly=True)
+
+    assert view.shape == (0,)
+    assert not view.flags.writeable
+    with pytest.raises(ValueError):
+        view.setflags(write=True)
+
+
 def test_numpy_to_dldatatype_accepts_valid_lanes(ovstage_mod):
     dtype = numpy_to_dldatatype(np.dtype("float32"), lanes=3)
     assert (dtype.code, dtype.bits, dtype.lanes) == (DLDataTypeCode.kDLFloat, 32, 3)
     assert numpy_to_dldatatype(np.dtype("float32")).lanes == 1
-    assert numpy_to_dldatatype(np.dtype("float32"), lanes=65535).lanes == 65535
+    assert numpy_to_dldatatype(np.dtype("float32"), lanes=255).lanes == 255
 
 
 @pytest.mark.parametrize(
@@ -113,7 +149,8 @@ def test_numpy_to_dldatatype_rejects_out_of_range_lanes(ovstage_mod):
     # A bad lane count must fail loudly: the DLPack lanes field is uint16, and a
     # silently wrapped value (e.g. -1 -> 65535) describes a tensor far larger than
     # its backing buffer, turning the later decode into an out-of-bounds read.
-    for bad_lanes in (-1, 0, 65536):
+    # 256 is rejected too: the field can hold it, but no ovstage transport can.
+    for bad_lanes in (-1, 0, 256, 65536):
         with pytest.raises(ValueError):
             numpy_to_dldatatype(np.dtype("float32"), lanes=bad_lanes)
 
@@ -122,6 +159,26 @@ def test_numpy_to_dldatatype_rejects_non_integer_lanes(ovstage_mod):
     for bad_lanes in (1.5, "3", None):
         with pytest.raises(TypeError):
             numpy_to_dldatatype(np.dtype("float32"), lanes=bad_lanes)
+
+
+def test_ordinal_range_rejects_non_integer_ordinals(ovstage_mod):
+    """`OrdinalRange` validates on every path into it, not just the classmethods.
+
+    It is a plain dataclass, so a caller can build one directly or assign to
+    the field afterwards; validation therefore has to happen where the C struct
+    is built as well as where the classmethods run.
+    """
+    from ovstage import OrdinalRange
+
+    for bad in (12.9, 12.0, "12", None):
+        with pytest.raises(TypeError):
+            OrdinalRange.latest(bad)
+        with pytest.raises(TypeError):
+            OrdinalRange.between(1, bad)
+        with pytest.raises(TypeError):
+            OrdinalRange(end_ordinal=bad).to_c()
+
+    assert OrdinalRange.latest(12).to_c().end_ordinal == 12
 
 
 def test_dlpack_cleanup_survives_failing_deleter_callback(ovstage_mod):
@@ -215,22 +272,47 @@ def test_dlpack_capsule_cleanup_survives_pending_exception(ovstage_mod):
     assert sys.getrefcount(owner) == baseline
 
 
-def test_dltensor_to_numpy_rejects_zero_lanes(ovstage_mod):
-    # lanes == 0 is not a valid DLPack dtype; reject it instead of silently
-    # coercing it to a 1-lane read.
-    zero_lanes = DLDataType(code=DLDataTypeCode.kDLFloat, bits=32, lanes=0)
-    tensor = make_dltensor(np.zeros(4, np.float32), dtype=zero_lanes)
-    with pytest.raises(ValueError):
-        dltensor_to_numpy(tensor)
-
-
-def test_dltensor_to_numpy_rejects_view_beyond_backing_buffer(ovstage_mod):
+@pytest.mark.parametrize("bad_lanes", [0, 256, 65535], ids=["zero", "above-limit", "uint16-wrap"])
+def test_make_dltensor_rejects_out_of_range_lanes(ovstage_mod, bad_lanes):
     # ctypes wraps out-of-range assignments on direct DLDataType construction, so
-    # an oversized lane count can still reach the decode path; it must be refused
-    # there rather than returned as a view ~262 KB past the 4-byte buffer.
-    oversized = DLDataType(code=DLDataTypeCode.kDLFloat, bits=32, lanes=65535)
-    tensor = make_dltensor(np.zeros(1, np.float32), dtype=oversized)
+    # an explicit dtype can carry a lane count no ovstage transport accepts. Refuse
+    # it where the descriptor is built rather than at whichever read decodes it.
+    bad = DLDataType(code=DLDataTypeCode.kDLFloat, bits=32, lanes=bad_lanes)
     with pytest.raises(ValueError):
+        make_dltensor(np.zeros(4, np.float32), dtype=bad)
+
+
+@pytest.mark.parametrize("bad_lanes", [0, 256, 65535], ids=["zero", "above-limit", "uint16-wrap"])
+def test_dltensor_to_numpy_rejects_out_of_range_lanes_on_raw_descriptor(ovstage_mod, bad_lanes):
+    # The decode guard must hold for a RAW descriptor — one with no Python-side
+    # backing reference. That is what read and map results hand to
+    # AttributeGroup.array(), and a guard keyed on a wrapped numpy array would
+    # miss it entirely while still passing every make_dltensor-based test.
+    # lanes=65535 over a 1-element float32 buffer is a 262140-byte view.
+    backing = np.zeros(1, np.float32)
+    with pytest.raises(ValueError):
+        dltensor_to_numpy(_raw_dltensor(backing, lanes=bad_lanes))
+
+
+def test_dltensor_to_numpy_lane_bound_matches_transport_limit(ovstage_mod):
+    # Pin the bound to the limit the C write path enforces rather than to the
+    # width of the uint16 field, so both directions agree on what is transportable.
+    backing = np.zeros(255, np.float32)
+    view = np.asarray(dltensor_to_numpy(_raw_dltensor(backing, lanes=255, shape=(1,))))
+    assert view.shape[0] == 255
+    with pytest.raises(ValueError):
+        dltensor_to_numpy(_raw_dltensor(backing, lanes=256, shape=(1,)))
+
+
+def test_dltensor_to_numpy_rejects_view_beyond_producer_extent(ovstage_mod):
+    # A DLPack producer offers no size at decode time, so its extent is recorded
+    # at ingest. Re-describing the tensor afterwards must not be able to inflate
+    # the view past what the producer actually said it holds — including with a
+    # lane count that is itself within the transportable range.
+    source = np.zeros(1, np.float32)
+    tensor = DLTensor.from_dlpack(_DLPackProducer(source))
+    tensor.dtype.lanes = 255
+    with pytest.raises(ValueError, match="backing buffer holds"):
         dltensor_to_numpy(tensor)
 
 

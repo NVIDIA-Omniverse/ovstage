@@ -139,6 +139,14 @@ Ownership and Lifetime
 * **Path lists are explicitly refcounted.** ``create_path_list_from_*`` returns
   a list owned by the caller; pair each create with exactly one release. A path
   list handed back inside a read result is a *borrow* — do not release it.
+* **In Python, the created list releases itself.** ``create_path_list`` /
+  ``create_path_list_from_strings`` return an :class:`ovstage.PathList` — an
+  ``int`` subclass that *is* the handle, so it passes into every slot that takes
+  a path list unchanged — which owns the create reference and releases it on
+  ``with``-exit, on ``release()``, or (as a safety net, with a
+  ``ResourceWarning``) when garbage-collected. Borrowed lists from read results
+  stay plain ``int``, so the finalizer never releases a reference you do not own.
+  Prefer creating one list outside a per-frame loop and reusing it.
 
 Errors
 ------
@@ -146,7 +154,18 @@ Errors
 Every C path-dictionary call returns ``ovx_api_result_t { status, error }``; on
 ``OVX_API_ERROR`` the error string must be released with
 ``path_dictionary_release_error``. In Python, path-dictionary failures raise
-``ovstage.OvxError``. Refer to :doc:`/concepts/error_handling`.
+``ovstage.OvxError``. Resolving ``OVX_INVALID_PRIMPATH`` or an unknown or
+expired prim-path handle through the dictionary ovstage hands out — whether via
+``path_dictionary_get_tokens_from_paths`` in C or
+``PathDictionary.path_to_string`` in Python — reports an actionable
+``OVX_API_ERROR`` (``OvxError``) rather than a successfully processed
+zero-token path or an empty string. The absolute root is a valid handle and
+still succeeds. ``path_dictionary_get_tokens_from_paths`` decomposes a path into
+component tokens rather than returning a path string, so in C the root reports
+one processed path with zero tokens; joining those tokens is the caller's step.
+``PathDictionary.path_to_string`` performs that join and spells the root ``/``
+(matching ``SdfPath``), so in Python an empty string is never a successful
+result. Refer to :doc:`/concepts/error_handling`.
 
 Where to Go Next
 ----------------

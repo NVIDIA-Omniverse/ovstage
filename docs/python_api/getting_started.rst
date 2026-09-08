@@ -26,7 +26,7 @@ The minimal example is a ``uv`` project that pins the ``ovstage`` wheel in its
    cd examples/python/minimal
    uv run main.py
 
-The bindings load the ovstage shared library through ctypes the first time you create a
+The bindings load the ovstage shared loader through ctypes the first time you create a
 :py:class:`~ovstage.Stage` or :py:class:`~ovstage.PathDictionary`. If you are running
 against a locally built shared library instead of the wheel, put its directory on the
 loader path (``LD_LIBRARY_PATH`` on Linux, ``PATH`` on Windows) or point the loader at it

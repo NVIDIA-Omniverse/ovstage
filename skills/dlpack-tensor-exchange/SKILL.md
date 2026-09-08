@@ -83,7 +83,12 @@ Resolve inputs in this order: existing repository files and referenced snippets,
 5. **Read (copy-out):** after `fetch_read_next`, if `group.data.cuda_sync.wait_event` is
    non-zero, wait on it (e.g. `cuStreamWaitEvent`) before touching `tensors[i].data`. Treat the
    data as valid only for the current snapshot — copy/retain it to use beyond the immediate
-   read. Release the group with `release_group`.
+   read. Release the group with `release_group`. Releasing the *read* does not reclaim a
+   group: an unreleased group stays pinned for the life of the stage and keeps failing later
+   writes to the same prims with an "overlapping outstanding read" error. In Python, prefer
+   the context manager so an exception in the processing body cannot strand it:
+
+   > **Source:** `tests/python/test_read_groups.py` snippet `read-group-context-manager`
 6. **Mapped staging write:** `fetch_map_next` hands back a writable `ovstage_map_group_t`;
    write your values into `group.data.tensors[i].data` (CPU or via a GPU kernel), then commit
    with `unmap_group` (per group) or `unmap_attribute` (commit remaining + release the
@@ -366,8 +371,12 @@ surface and `error-handling` (Python) for the exception types.
   — the returned `Operation` holds it for you until `.wait()`. For fixed-size attributes, a
   NumPy `(N, 3)` point array or `(N, 4, 4)` matrix array is a convenience write layout; the
   raw result is normalized to `(N,)` with 3 or 16 lanes.
-- **Read / map:** `ReadGroup.array(i)` / `MapGroup.array(i)` return a zero-copy NumPy **view**
-  (CPU), valid only until the group/result is released.
+- **Read:** `ReadGroup.array(i)` returns a zero-copy **read-only** NumPy view (CPU). Its
+  `WRITEABLE` flag is `False` and cannot be re-enabled, so direct writes through the returned
+  array are rejected. Copy it if you need a mutable array.
+- **Map:** `MapGroup.array(i)` returns a zero-copy **writable** NumPy view (CPU) — fill it in
+  place, then commit via `unmap_group` / `unmap_attribute`. Both views are valid only until the
+  group/result is released.
 
 **DLPack protocol (numpy / warp / torch / cupy / jax; CPU or CUDA):**
 

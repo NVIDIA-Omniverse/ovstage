@@ -136,7 +136,7 @@
  * table above for contract stability only and is subject to removal in a
  * future release.
  *
- * @version 0.1.1
+ * @version 0.2.0
  * @date 2026-05-27
  */
 

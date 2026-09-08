@@ -39,6 +39,8 @@ USD edits per tick, or confirming what landed by querying populated prims.
 
 For the direct write → seal → read data-plane lifecycle (no USD), use
 `application-flow` and `path-dictionary` instead.
+For the reverse path — exporting this populated runtime state back to a USD
+file or a reusable destination — use `exporting-to-usd`.
 
 ## Inputs
 
@@ -46,7 +48,7 @@ Resolve inputs in this order: existing repository files and referenced snippets,
 
 - USD source: a file/URL path, or an inline USDA string.
 - Data domains to populate: RENDERING, PHYSICS, or ALL (bitmask). `0`
-  (`DOMAIN_NONE`) authors stage units only.
+  (`DOMAIN_NONE`) authors nothing.
 - The caller-owned `ordinal` for the tick (population never opens/commits its own).
 - Whether this is a one-shot open or a running loop with live edits
   (`apply_usd_changes`) / time playback (`apply_usd_time`).
@@ -96,9 +98,7 @@ ovstage itself has **no USD dependency**; the population API is the bridge that 
 USD (files or inline USDA) and mirrors it into an ovstage instance so consumers like
 ovrtx can render it. The initial `open_usd_*` is one-shot (it replaces prior USD
 content); subsequent live edits are picked up by `apply_usd_changes` (structural) and
-`apply_usd_time` (time-sampled). Regardless of `domains`, stage units
-(metersPerUnit, kilogramsPerUnit, upAxis) are authored onto the reserved
-`/__ovstage_population_stage_info__` prim.
+`apply_usd_time` (time-sampled).
 
 ### Domains
 
@@ -106,7 +106,77 @@ content); subsequent live edits are picked up by `apply_usd_changes` (structural
 
 - `RENDERING` — meshes, lights, materials, and cameras.
 - `PHYSICS` — colliders, rigid bodies, joints, articulations, physics schema attrs.
-- `ALL` — both. `NONE` (0) authors stage units only.
+- `ALL` — both. `NONE` (0) authors nothing.
+
+Stage metadata is populated onto the root prim, under the `usd-metadata:<path>` column
+prefix, when something asks for it: a selected domain may bring its own, and a
+description names whatever it wants through `stage_metadata_paths`.
+
+### Selectors
+
+A domain is a prebuilt policy; `ovstage_population_selector_t` is how a caller writes their
+own. Each selector pairs a prim predicate (which prims) with a property predicate (which of
+their properties), and selectors compose: a prim is in scope if any selector matches it, and
+its properties are the union over the selectors that did. Selectors go in a desc alongside
+`domains`, so a caller's own selection unions with a built-in domain in one traversal.
+
+Predicate kinds accepted today — prim: `NONE`, `ALL`, `AND`, `OR`, `NOT`, `HAS_SCHEMA`,
+`HAS_TYPE`, `IS_A_TYPE`, `HAS_APPLIED_SCHEMA`, `HAS_APPLIED_SCHEMA_IN_NAMESPACE`, `HAS_PATH`,
+`IS_UNDER_PATH`, `HAS_KIND`, `HAS_PURPOSE`, `HAS_METADATA`, `HAS_PARENT`, `HAS_ANCESTOR`,
+`HAS_PROPERTY`;
+property: `NONE`, `ALL`, `AND`, `OR`, `NOT`, `DECLARED_BY_SCHEMA`, `HAS_NAME`, `IN_NAMESPACE`,
+`HAS_METADATA`, `IS_ATTRIBUTE`, `IS_RELATIONSHIP`, `IS_CUSTOM`, `IS_AUTHORED` — the whole declared
+vocabulary. A `kind` outside either enum is rejected at enqueue with `NOT_SUPPORTED`, as is a
+malformed graph, so a description cannot silently populate nothing through a kind the build
+cannot honour. Values are not checked against any registry: a schema or type name nothing
+registers is accepted and matches nothing, so spell those from the stage you are populating.
+
+`HAS_PROPERTY` nests a property predicate inside a prim one, so a prim can be gated on what it
+carries. It sees every property the prim has — those it authors, including custom ones no schema
+declares, and those its schemas declare that resolve to a fallback. So an unauthored schema
+property still counts; pair it with `IS_AUTHORED` for "carries an authored value".
+
+The common shape is "populate these schemas": `HAS_SCHEMA` over the schema names, paired
+with `DECLARED_BY_SCHEMA` over the same names to publish just what those schemas declare.
+The same list serves both halves — `HAS_SCHEMA` matches a name whether it is the prim's type
+or one of its applied API schemas, so a schema list needs no partitioning. Narrow it to a
+branch by AND-ing `IS_UNDER_PATH`.
+
+> **Source:** `tests/python/test_population.py` snippets `populate-by-schema`,
+> `populate-narrowed`, `populate-stage-metadata`, `populate-several-descs`;
+> `tests/c/test_population.cpp` snippets `populate-by-schema-c`, `populate-narrowed-c`
+
+In C a nested predicate and its values are *referenced*, not copied, so every node and
+string array must outlive the call — hence the named locals in the C snippets. The Python
+builder owns them instead, so a tree can be built inline.
+
+### Registering your own USD schemas
+
+ovstage ships only what its USD build registers — the core `Usd*` schemas. If your
+stages use anything else (a physics extension such as `PhysxSchema`, a sensor
+family, your studio's own schemas), register it first:
+
+> **Source:** `tests/c/test_population.cpp` snippet `register-usd-schemas-c`
+
+Each path is a `plugInfo.json` or a directory containing one; a descriptor's
+`Includes` are followed, so one entry can pull in a whole tree of families.
+No schema code is loaded: USD loads a schema's C++ library only when something
+asks for that schema's C++ type, and population never does. A code-full drop is
+consumed for its definitions alone, library untouched.
+
+Without this, prims carrying those schemas are still populated, but only their
+**authored** attributes are visible: unauthored attributes do not resolve their
+schema fallbacks and do not appear in the prim's property set.
+
+> **Order matters.** USD assembles its schema definitions once, the first time
+> anything reads them, and never revisits that set. Register before the first ovstage
+> call that reads them — populating a stage and exporting one both do — as a family
+> registered afterwards registers cleanly and still contributes nothing. ovstage reports
+> a registration that arrives after its own first such call; one that arrives after some
+> other USD consumer in the process got there first cannot be detected.
+>
+> Registering does not change which prims a domain claims. It makes a family's
+> definitions resolvable.
 
 ## Python
 
@@ -149,6 +219,7 @@ edits (`ovstage_population_add_usd_reference_from_*`, `_remove_usd_reference`,
 |---------|---|--------|
 | Open inline USDA | `ovstage_population_open_usd_from_string` | `population.open_usd_from_string` |
 | Open file/URL | `ovstage_population_open_usd_from_file` | `population.open_usd` / `open_usd_from_file` |
+| Open with a description | `ovstage_population_open_usd_from_{file,string}_with_desc` | `population.open_usd_with_desc` / `open_usd_from_string_with_desc` |
 | Await op | `ovstage_population_wait_op` | `Operation.wait()` (blocking wrappers auto-wait) |
 | Add reference | `ovstage_population_add_usd_reference_from_{file,string}` | `population.add_usd_reference[_from_string]` |
 | Remove reference | `ovstage_population_remove_usd_reference` | `population.remove_usd` |

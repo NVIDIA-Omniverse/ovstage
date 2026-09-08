@@ -11,8 +11,8 @@
 Set Up a Python Project
 =======================
 
-The ``ovstage`` Python package binds the ovstage C data plane through ctypes, so the
-ovstage shared library must be loadable at import time. Programs use ``Stage`` and
+The ``ovstage`` Python package binds the ovstage C data plane through ctypes. Its
+shared loader must be discoverable when the first native operation runs. Programs use ``Stage`` and
 ``PathDictionary`` (both context managers) plus ``numpy`` for tensor attribute
 I/O.
 
@@ -44,9 +44,11 @@ directly.
 Loading the Shared Library
 --------------------------
 
-The bindings load the ovstage shared library (``ovstage.dll`` on Windows) the
-first time you construct a ``Stage`` or ``PathDictionary``. The wheel bundles the
-library and its ``<package>/bin`` layout is searched automatically, so no extra
+The bindings open the ovstage shared loader (``ovstage-dynamic.dll`` on Windows,
+``libovstage-dynamic.so`` on Linux) the first time you construct a ``Stage`` or
+``PathDictionary``. The loader opens the ovstage runtime on the first
+initialize/create call. The wheel bundles both and its ``<package>/bin`` layout
+is searched automatically, so no extra
 setup is needed. If you are instead running against a locally built shared
 library, make it discoverable:
 

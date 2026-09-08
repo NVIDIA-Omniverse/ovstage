@@ -45,14 +45,14 @@ macro(ovstage_fetch)
         # an empty hash skips verification rather than failing the fetch.
         if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
             set(OVSTAGE_PACKAGE_SYSTEM "windows-x86_64")
-            set(OVSTAGE_HASH "21ec62c2eb94ff346678e3fd2a41c4068a08a35d240341f95ec4e2ce1f23cf08")
+            set(OVSTAGE_HASH "2ca9a39310f6a0622166c4bca2affbe11695c592ec6b22e74a7a1b5dacd0cdff")
         elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
             if (CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
                 set(OVSTAGE_PACKAGE_SYSTEM "manylinux_2_35_aarch64")
-                set(OVSTAGE_HASH "7892d2e8139b6aaae14b993f9a9b0c08b36cf53b7c00767a46ed0e5036222051")
+                set(OVSTAGE_HASH "1ff3b64ccc17c4cf7f99636d1f8648c98f7de73e0e6308aa5daf5aec3a030994")
             elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64")
                 set(OVSTAGE_PACKAGE_SYSTEM "manylinux_2_35_x86_64")
-                set(OVSTAGE_HASH "34703875ac9ec81d8f12ea8695d90fe16ebe9921c610f66202c8b6ee2729c49f")
+                set(OVSTAGE_HASH "e5dc1738d632f35407259d68bf3edb9d012d00900f0fa50e44f730e76a93e4a5")
             else()
                 message(FATAL_ERROR "Unsupported system: ${CMAKE_SYSTEM_NAME} ${CMAKE_SYSTEM_PROCESSOR}")
             endif()
@@ -72,7 +72,7 @@ macro(ovstage_fetch)
         FetchContent_Declare(
             ovstage
             DOWNLOAD_EXTRACT_TIMESTAMP TRUE
-            URL "https://github.com/NVIDIA-Omniverse/ovstage/releases/download/v0.1.1/ovstage@0.1.1.355824.553acd42.${OVSTAGE_PACKAGE_SYSTEM}.zip"
+            URL "https://github.com/NVIDIA-Omniverse/ovstage/releases/download/v0.2.0/ovstage@0.2.0.377349.70d78229.${OVSTAGE_PACKAGE_SYSTEM}.zip"
             ${_OVSTAGE_URL_HASH}
         )
 
@@ -89,11 +89,9 @@ endmacro()
 
 # Setup runtime dependencies for a target (rpath / loader-path guidance)
 function(ovstage_setup_runtime TARGET_NAME)
-    # IMPORTANT: never copy the ovstage shared library next to the executable.
-    # libovstage discovers its bundled runtime (bin/plugins/**, bin/ovstage_usd_schemas/)
-    # relative to the directory it is loaded from, so it must stay in the package
-    # bin/ beside that tree; a copied library has no sibling plugins/ and
-    # ovstage_create_instance() fails to load its runtime support.
+    # Keep the shared loader and runtime in the package bin/ beside plugins/**.
+    # Copying only the loader would separate it from the runtime closure opened
+    # by the first initialize/create call.
     if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
         # Windows has no rpath: put the package bin/ on PATH when running, e.g.
         #   $env:PATH = "<ovstage-package>\bin;$env:PATH"

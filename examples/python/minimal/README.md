@@ -48,7 +48,7 @@ uv run main.py
 The `ovstage` wheel bundles the native library under `<package>/bin`, which
 the bindings search automatically — so a published install needs **no**
 loader-path setup. To run against a locally built `libovstage` instead, put
-the build output dir (the one holding `ovstage.dll` / `libovstage.so`) on the
+the build output dir (the one holding `ovstage-dynamic.dll` / `libovstage-dynamic.so`) on the
 **loader path** — `PATH` on Windows, `LD_LIBRARY_PATH` on Linux — and run with
 a plain interpreter:
 

@@ -25,6 +25,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <string>
 
 namespace
 {
@@ -109,6 +110,35 @@ protected:
     ovx_primpath_list_t pathList_ = OVX_INVALID_PRIMPATH_LIST;
     ovstage_query_handle_t query_ = OVSTAGE_INVALID_QUERY_HANDLE;
 };
+
+TEST_F(MinimalTest, PathDictionaryRejectsInvalidPrimPathHandles)
+{
+    ovx_token_t tokenBuffer[8]{};
+    ovx_token_t* tokensPerPath[1]{};
+    size_t numTokensPerPath[1]{};
+
+    for (const ovx_primpath_t invalidPath : { OVX_INVALID_PRIMPATH, ovx_primpath_t{ 0xdeadbeef } })
+    {
+        size_t numPathsProcessed = 99;
+        const ovx_api_result_t result = path_dictionary_get_tokens_from_paths(
+            dict_,
+            &invalidPath,
+            1,
+            tokenBuffer,
+            8,
+            tokensPerPath,
+            numTokensPerPath,
+            &numPathsProcessed);
+
+        EXPECT_EQ(result.status, OVX_API_ERROR);
+        EXPECT_EQ(numPathsProcessed, 0);
+        ASSERT_NE(result.error.ptr, nullptr);
+        EXPECT_EQ(
+            std::string(result.error.ptr, result.error.length),
+            "Prim path handle was not found in this dictionary");
+        dict_->vtable->release_error(dict_->context, result.error);
+    }
+}
 
 // Write one float per prim, seal ordinal 1, read the column back, and assert the
 // values survive the round-trip. This is the tested source of truth for the
