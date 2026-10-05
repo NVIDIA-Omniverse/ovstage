@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-10-05
+
+Patch release improving Windows library compatibility, cloned-scene transforms, and CPU/CUDA attribute updates. No public C API/ABI or Python API changes from 0.2.0; existing applications do not need API migration.
+
+### Fixed
+
+- **Load ovstage alongside other MaterialX versions on Windows.** Versioned MaterialX DLL names prevent name conflicts that could stop ovstage from loading in applications using another MaterialX version.
+- **Keep cloned objects in the correct position.** Cloned prims inside USD scene-graph instances now follow the cloned hierarchy's transforms instead of retaining the source's world transforms, so moving a cloned hierarchy also moves its affected child prims. If the destination parent does not exist, the clone root attaches to the nearest existing ancestor; if none exists, it remains unparented.
+- **Update selected prims without corrupting other values.** CPU and CUDA attribute writes to a subset of prims now preserve attribute values on prims outside that selection, allowing applications to update selected objects without disturbing the rest of the scene.
+- **Use GPU hierarchy computation when ovstage initializes first.** Fixed an initialization-order issue that could prevent ovrtx from using GPU transform-hierarchy computation when ovstage initialized first.
+
+### Changed
+
+- Updated the bundled Omniverse Client Library from 2.74.0 to 2.75.1, bringing security updates to the networking dependencies used for remote asset access.
+
 ## [0.2.0] - 2026-09-08
 
 Feature release. Population can now be *described* by the caller rather than

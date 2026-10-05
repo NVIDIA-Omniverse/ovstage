@@ -35,7 +35,7 @@
  * The execution-model documentation lives at the top of `ovstage_api.h`
  * alongside the vtable definition.
  *
- * @version 0.2.0
+ * @version 0.2.1
  * @date 2026-05-28
  */
 
@@ -58,7 +58,7 @@
  * always agree. */
 #define OVSTAGE_VERSION_MAJOR 0
 #define OVSTAGE_VERSION_MINOR 2
-#define OVSTAGE_VERSION_PATCH 0
+#define OVSTAGE_VERSION_PATCH 1
 
 /* Marks a deprecated public entry point: OVSTAGE_DEPRECATED("Use <new> instead")
  * on the old declaration. Emits a compiler warning at the call site where

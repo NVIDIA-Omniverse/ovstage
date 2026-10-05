@@ -103,7 +103,7 @@ from ._src.types import (
 try:
     from ._version import version as __version__
 except Exception:
-    __version__ = "0.2.0"
+    __version__ = "0.2.1"
 
 # ``from ._src import instancing, population`` above only *binds* the module objects
 # as attributes of this package; it does not register them as submodules, so

@@ -15,7 +15,7 @@
  * This header contains the type surface that is specific to the ovstage backend.
  * The generic vtable runtime types remain in `ovstage_api/ovstage_api_types.h`.
  *
- * @version 0.2.0
+ * @version 0.2.1
  * @date 2026-06-17
  */
 
