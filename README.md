@@ -229,7 +229,9 @@ NVIDIA Corporation
 
 ## License and security
 
-The software and materials are governed by the [NVIDIA Software License Agreement](https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-software-license-agreement/) and the [Product Specific Terms for NVIDIA AI Products](https://www.nvidia.com/en-us/agreements/enterprise-software/product-specific-terms-for-ai-products/).
+The agent skills in [`skills/`](skills/) are licensed under the [Apache License, Version 2.0](skills/LICENSE). Each skill declares `Apache-2.0` in its license metadata and SPDX header.
+
+Except for those skills, the software and materials are governed by the [NVIDIA Software License Agreement](https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-software-license-agreement/) and the [Product Specific Terms for NVIDIA AI Products](https://www.nvidia.com/en-us/agreements/enterprise-software/product-specific-terms-for-ai-products/).
 
 This project will download and install additional third-party open source software projects. Review the license terms of these open source projects before use.
 
