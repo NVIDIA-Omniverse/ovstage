@@ -31,7 +31,7 @@ Headers
    * - Include
      - Provides
    * - ``<ovstage/ovstage.h>``
-     - The data-plane API, ``ovstage_get_path_dictionary``, and the path-dictionary / DLPack **types**.
+     - The data-plane API, :c:func:`ovstage_get_path_dictionary <ovstage_get_path_dictionary>`, and the path-dictionary / DLPack **types**.
    * - ``<ovx/path_dictionary/path_dictionary.h>`` + ``path_dictionary_utils.h``
      - The path-dictionary **functions** (interning tokens, building path lists). Include these directly to *call* them.
    * - ``<dlpack/dlpack.h>``
@@ -96,17 +96,17 @@ using a custom toolchain.
 Diagnostics Caveat
 ------------------
 
-``ovstage_get_error_string`` and ``ovstage_get_last_op_error`` are
+:c:func:`ovstage_get_error_string <ovstage_get_error_string>` and :c:func:`ovstage_get_last_op_error <ovstage_get_last_op_error>` are
 vtable-dispatched and need a live ``ovstage_instance_t*``. Before
-``ovstage_create_instance`` returns, you can only print the numeric status code
-or use the free function ``ovstage_get_last_error()`` (refer to
+:c:func:`ovstage_create_instance <ovstage_create_instance>` returns, you can only print the numeric status code
+or use the free function :c:func:`ovstage_get_last_error() <ovstage_get_last_error>` (refer to
 :doc:`/concepts/error_handling`).
 
 Static Loader Package Root
 --------------------------
 
 When linking ``ovstage::ovstage_static``, pass the package ``bin/`` directory via
-:c:func:`ovstage_config_entry_binary_package_root_path` to ``ovstage_initialize()``
+:c:func:`ovstage_config_entry_binary_package_root_path` to :c:func:`ovstage_initialize() <ovstage_initialize>`
 before any other ``ovstage_*`` call. The path may include
 :c:macro:`OVX_CONFIG_EXECUTABLE_DIR_TOKEN` (``"${executable_dir}"``), which the
 loader substitutes with the absolute directory of the running executable — for
@@ -137,6 +137,39 @@ updates for newly created instances and can be selected explicitly:
 Configure a concrete CPU or GPU model on the first process reference. Passing
 ``RUNTIME_DEFAULT`` as the configured value leaves the runtime default
 unmodified; that config entry is ignored.
+
+After creating an instance, :c:func:`ovstage_get_config` returns a borrowed view
+of the explicit entries that established the active process state. The view does
+not materialize omitted defaults and remains valid until the instance is
+destroyed.
+
+.. _configuring-ordinal-admission-c:
+
+Configuring Ordinal Admission
+-----------------------------
+
+Pass an entry from
+:c:func:`ovstage_config_entry_runtime_default_ordinal_admission_policy` to
+``ovstage_initialize()`` before creating the first instance. The
+:c:type:`ovstage_ordinal_admission_policy_t` choices are described in
+:ref:`ordinal-admission-policies`. The default is
+``OVSTAGE_ORDINAL_ADMISSION_NONDECREASING``.
+
+.. filtered-literalinclude:: ../../tests/c/test_support_api.cpp
+   :language: cpp
+   :start-after: // [snippet:configure-ordinal-admission-c]
+   :end-before: // [/snippet:configure-ordinal-admission-c]
+   :exclude-pattern: ^\s*//\s*\[/?snippet:
+   :dedent:
+
+The policy is process-scoped. Omission or ``OVSTAGE_ORDINAL_ADMISSION_DEFAULT``
+inherits active settings; on the first process reference it selects the nondecreasing
+default. A later concrete value must match. Conflicts in either hierarchy or
+admission configuration reject the whole initialization without changing state
+or acquiring a reference. Balance every successful initialization with
+``ovstage_shutdown()`` and release all instances, including retained handles and
+attachments, before choosing a different policy. The original explicit entries
+remain available through ``ovstage_get_config()``; omitted defaults are not added.
 
 Minimal Program
 ---------------

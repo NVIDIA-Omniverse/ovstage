@@ -187,4 +187,56 @@ TEST_F(CloneTest, CloneSubtreeCopiesValues)
     }
 }
 
+TEST_F(CloneTest, CloneReportCountsCreatedPrims)
+{
+    float value = 42.0f;
+    int64_t shape[] = { 1 };
+    int64_t strides[] = { 1 };
+    DLTensor tensor{};
+    tensor.data = &value;
+    tensor.device = { kDLCPU, 0 };
+    tensor.ndim = 1;
+    tensor.dtype = { kDLFloat, 32, 1 };
+    tensor.shape = shape;
+    tensor.strides = strides;
+
+    ovstage_write_data_t write{};
+    write.tensors = &tensor;
+    write.tensor_count = 1;
+    write.is_array = false;
+
+    ASSERT_TRUE(waitOp(stage_,
+        ovstage_write_attribute(stage_, query_, { attr_, {} }, 1, write, OVSTAGE_PRIM_MODE_UPSERT),
+        "write_attribute"));
+
+    ovstage_write_floor_desc_t floor{};
+    floor.ordinal = 1;
+    floor.scope = OVSTAGE_SCOPE_ALL;
+    ASSERT_TRUE(waitOp(stage_, ovstage_advance_write_floor(stage_, &floor), "advance_write_floor"));
+
+    // [snippet:clone-result-c]
+    const ovx_string_t targets[] = { str("/World/A_env0"), str("/World/A_env1") };
+    const ovstage_enqueue_result_t enq = ovstage_clone(stage_, str("/World/A"), targets, 2, 2);
+    ASSERT_EQ(enq.status, OVSTAGE_OK);
+
+    ovstage_op_wait_result_t wait{};
+    ASSERT_EQ(ovstage_wait_op(stage_, enq.op_index, OVSTAGE_TIMEOUT_INFINITE, &wait), OVSTAGE_OK);
+    ASSERT_EQ(wait.error_op_id_count, 0u);
+
+    // The completion report is per-op state: fetch it after the wait and before release_op.
+    ovstage_clone_result_t report{};
+    ASSERT_EQ(ovstage_fetch_clone_result(stage_, enq.op_index, OVSTAGE_TIMEOUT_INFINITE, &report), OVSTAGE_OK);
+    EXPECT_EQ(report.prims_cloned, 2u); // one source prim, two targets
+    EXPECT_EQ(report.target_count, 2u);
+    EXPECT_EQ(report.source_prim_count, 1u);
+    EXPECT_EQ(report.ordinal, 2u);
+    ovstage_release_op(stage_, enq.op_index);
+    // [/snippet:clone-result-c]
+
+    // Only a live clone op has a report.
+    ovstage_clone_result_t none{};
+    EXPECT_EQ(ovstage_fetch_clone_result(stage_, OVSTAGE_INVALID_OP_ID, 0, &none), OVSTAGE_ERROR_INVALID_HANDLE);
+    EXPECT_EQ(none.prims_cloned, 0u);
+}
+
 } // namespace

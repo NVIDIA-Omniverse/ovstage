@@ -85,6 +85,23 @@ API Types and Utilities
 .. doxygenfile:: ovstage_api_utils.h
    :project: ovstage
 
+.. doxygenfile:: ovstage_tensor_utils.h
+   :project: ovstage
+
+Experimental Device Placement
+-----------------------------
+
+The ``ovstage.placement`` extension selects CPU or CUDA copies for reads,
+writes, and maps. Include
+``<ovstage/ovstage_api/experimental/ovstage_placement_extension.h>`` explicitly;
+``ovstage.h`` does not include it. Its API, ABI, and semantics may change between
+releases. Lookup requires the exact extension version and a sufficiently large
+table; unavailable or incompatible implementations return ``OVSTAGE_ERROR_NOT_FOUND``.
+See :ref:`ovstage-device-placement` for device selection and synchronization.
+
+.. doxygenfile:: ovstage_placement_extension.h
+   :project: ovstage
+
 Configuration
 -------------
 
@@ -92,12 +109,6 @@ Helpers for building the ``ovstage_config_t`` entries passed to
 ``ovstage_initialize()``.
 
 .. doxygenfile:: ovstage_config.h
-   :project: ovstage
-
-Alignment Helpers
------------------
-
-.. doxygenfile:: ovalign.h
    :project: ovstage
 
 Path Dictionary (OVX)

@@ -38,8 +38,8 @@ ovstage is a building block — the application is always in control of what dat
 
 Core capabilities:
 
-- **Ordinal-keyed writes** — every write carries an ordinal used purely for ordering and change membership; payload reads always return the latest committed snapshot (no historical or per-version payload access)
-- **CPU/GPU tensor interchange** — DLTensor carries CPU or CUDA buffers without requiring a custom tensor format. The current implementation accepts zero-copy CUDA source tensors for writes, while payload reads and map/unmap buffers are CPU-resident; GPU array reads and CUDA array maps are not yet supported.
+- **Ordinal-keyed writes** — every write carries an ordinal for admission, ordering and change membership; reads check requested ordinal bounds against recorded changes, while this build stores only current payloads (no historical or per-version payload access)
+- **CPU/GPU tensor interchange** — DLTensor carries CPU or CUDA buffers without requiring a custom tensor format. CUDA source tensors can be written without a host round-trip. Reads and maps use CPU buffers by default; the experimental [placement extension](docs/concepts/dlpack_tensors.rst#experimental-device-placement) also selects CUDA read payloads and fixed-size CUDA map buffers. Array-valued CUDA maps are not supported.
 - **Built-in change detection** — change-membership queries ("what changed since ordinal N?") are a first-class operation (expressed as an ordinal-range read; see `ovstage_ordinal_range_t` in the C API reference) that report exact changed prims within the runtime-reported retention frontier; callers do not assume a fixed retention depth, and older markers may be coalesced per attribute and prim
 - **Uniform addressing** — shared prim path dictionary means handles pass between libraries with zero conversion
 - **Asynchronous submission** — state-mutating and data-producing work is enqueued, while fetch, status, lifecycle, and path-dictionary calls remain synchronous. The current implementation executes queued work serially; the API preserves ordinal ordering semantics for future concurrent backends.
@@ -55,11 +55,11 @@ These principles guided the API design and are relevant for understanding trade-
 
 2. **No leaked implementation details.** The API does not expose internal storage layout. Read results are grouped by memory locality (for performance), not by schema bucketing (an implementation choice). Consumers never need to understand internal partitioning.
 
-3. **Zero-copy-capable tensor transport.** Read results return pointers into internal storage. DLTensor carries device type, pointer, and shape for CPU and GPU interchange without a custom tensor format. In the current implementation, reads and map/unmap buffers are CPU-resident; CUDA source tensors can be ingested without a host round-trip, while GPU array reads and CUDA array maps remain future work.
+3. **Zero-copy-capable tensor transport.** Read results return pointers into internal storage. DLTensor carries device type, pointer, and shape for CPU and GPU interchange without a custom tensor format. Reads and maps default to CPU buffers; experimental placement can select CUDA read payloads and fixed-size CUDA map staging. A read of an already-current copy on the requested device avoids migration. Follow the placement event and buffer-lifetime rules before consuming device data.
 
 4. **Optional complexity — implementations can subset.** An implementation supporting only latest-value reads uses the same API signatures. Value-based query filters are optional. Historical/per-version payload access is optional. The API contract is the same; the capability level is declared.
 
-5. **Round-trip symmetry.** Canonical read results are directly usable as write inputs — same addressing and data structures. Fixed-size values use one transported data-row dimension plus `dtype.lanes`; compact convenience write shapes are normalized to that canonical form. Logical prim-to-row association remains separate in `data.index_map`.
+5. **Shared read/map layout.** Reads and writable maps expose scalar lanes and type-aware component axes. Writes retain their canonical input layout; use the explicit typed-tensor write adapter when forwarding a known read/map descriptor. Preserve semantic, array kind and logical prim-to-row association through `data.index_map`. Copy pinned read payload before releasing it to write back to the same storage.
 
 ---
 
@@ -144,8 +144,8 @@ graph LR
 - **Parse once:** The ovstage population API traverses USD once. Participating libraries consume the same populated data.
 - **Built-in change detection:** A consumer can ask "what changed since my last read?" and use change membership instead of performing a full-scene diff.
 - **Different rates with explicit coordination:** Producers and consumers can run at different cadences while the application owns ordinals, write-floor advancement, retention checks, and consumer scheduling.
-- **CPU/GPU interchange:** DLPack permits CPU or CUDA producers without a custom tensor format. Currently, CUDA source tensors can be written without a host round-trip, but reads and map/unmap buffers remain CPU-resident.
-- **Shared addressing:** Participating libraries use the shared path dictionary so tokens and prim-path lists can cross integration boundaries without repeated string lookups.
+- **CPU/GPU interchange:** DLPack permits CPU or CUDA producers without a custom tensor format. CUDA source tensors can be written without a host round-trip. Reads and maps default to CPU buffers, with CUDA placement available through the experimental extension described above.
+- **Shared addressing:** Participating libraries use the owning Stage’s path dictionary so tokens and prim-path lists can cross integration boundaries without repeated string lookups.
 
 ---
 
@@ -154,7 +154,7 @@ graph LR
 ovstage stores data and exposes changes — but it does **not** automatically push updates to consumers. Each library owns when and how it reads from ovstage:
 
 - **Pull-based:** Libraries call read operations when they're ready for new data (typically once per their simulation tick)
-- **Delta-aware:** Reads can ask "what changed since ordinal N?" — ovstage reports only the changed prims and returns their latest data, not the full scene. Only the latest payload is retained, so a *fixed* range whose selected `(attribute, path)` changed again after the range end cannot be represented and returns `OVSTAGE_ERROR_OUT_OF_RANGE` rather than membership and data
+- **Delta-aware:** Reads can ask "what changed since ordinal N?" — ovstage reports only the changed prims and returns their latest data, not the full scene. Only the latest payload is retained, so a fixed range whose selected `(attribute, path)` has a recorded change after the range end returns `OVSTAGE_ERROR_OUT_OF_RANGE`. A snapshot applies the same check to every queried path. Use end `UINT64_MAX` for current values; a selected unsealed change still returns `OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION`.
 - **Independent rates within retention:** A consumer can request a larger change range on its next read without imposing a global update cadence. Exact change membership is guaranteed only at or above the runtime-reported retention frontier; consumers must query that frontier and recover appropriately if they fall behind it. API waits and CPU/GPU synchronization still apply where documented.
 - **No global sync:** A write by ovphysx does not trigger an immediate update in ovrtx. The renderer reads when it's ready for the next frame.
 
@@ -165,10 +165,10 @@ ovstage stores data and exposes changes — but it does **not** automatically pu
 ### In scope (current)
 
 - Vectorized, CPU/GPU-capable data store for post-composition USD attributes
-- Ordinal-keyed writes; payload reads return the latest committed snapshot
+- Ordinal-keyed writes; snapshot and change-range reads of current payloads check requested bounds against recorded changes
 - Delta reads (change-membership stream: which prims changed since a given ordinal)
 - Query filters
-- Zero-copy CPU map/unmap into storage-owned buffers; zero-copy CUDA source-tensor ingest for writes
+- CPU map/unmap with writable staging buffers; zero-copy CUDA source-tensor ingest for writes; experimental CUDA reads and fixed-size maps through device placement
 - Asynchronous submission with ordinal-keyed ordering; current backend execution is serialized
 - Path dictionary for cross-library handle sharing
 - USD population (mirroring composed stage into ovstage)
@@ -193,7 +193,7 @@ ovstage stores **post-composition** USD data in a runtime-optimized format. It d
 
 - **USD** = persistent scene description (files, composition, layering)
 - **ovstage population API** = the optional bridge that traverses composed USD and writes attributes into ovstage
-- **ovstage population export API** = shared-predicate selection plus explicit, sparse projection into a one-shot saved file or a reusable destination, both opened and owned by ovstage
+- **ovstage population export API** = shared-predicate selection plus explicit, sparse projection into a one-shot saved file, a reusable destination, or a host-owned in-memory USD layer/stage target
 - **ovstage** = runtime mirror (vectorized, CPU/GPU-capable, change-tracked, queryable)
 
 Libraries read from ovstage at runtime; they don't need to interact with USD directly.
@@ -206,7 +206,7 @@ Every write carries an ordinal used for ordering and change membership. Readers 
 
 All tensor data uses **DLTensor** (from the DLPack standard). This provides zero-copy interop with the Python/ML ecosystem (NumPy, PyTorch, JAX, Warp) and carries device type, pointer, shape, and lane-width metadata. No custom tensor types.
 
-Fixed-size attributes use a lane-canonical raw layout: reads and maps return `ndim = 1`, `shape = (N,)`, with the complete per-row tuple width in `dtype.lanes`, where `N` is the transported data-row count. Without `data.index_map`, logical prims select rows one-to-one and `N` must equal the logical prim count; with it, `data.index_map[i]` selects the row for logical prim `i`, so `N` may differ from the logical prim count: it can be smaller when rows are shared, or larger when a query touches only part of a transported bucket. Copy-in writes may use compact convenience shapes such as `(N, 3)` with one lane for a point or `(N, 4, 4)` with one lane for a matrix, but those trailing dimensions are folded and are not preserved. A flat `(N * L,)` tensor with one lane is not a convenience encoding of `N` rows of width `L`. The corresponding raw results are `(N,)` with 3 or 16 lanes. Python DLPack export expands the lane width as exactly one trailing axis, so the matrix becomes `(N, 16)`, not `(N, 4, 4)`. Array/ragged attributes are outside this fixed-size rule.
+Fixed-size reads and maps expose scalar lanes: scalars `(N,)`, tuples `(N,C)`, and semantic square matrices `(N,S,S)` for S=2,3,4. Here `N` is the transported data-row count. Without `data.index_map`, logical prims select rows one-to-one; with it, `data.index_map[i]` selects the row for logical prim `i`, so `N` may differ from the logical prim count. The original write shape is not stored; dimensions follow component width and semantic. Generic tuples, including 12-component values, retain one component axis rather than an inferred non-square matrix shape. Array maps and reads apply the same trailing dimensions to each value tensor. Returned strides count scalar elements. Map creation dtypes and canonical writes retain complete logical elements in `dtype.lanes`; `ovstage_tensor_to_write()` / Python `typed_tensor_to_write()` explicitly fold a known typed result back into that layout without copying payload.
 
 ### Can ovstage be used without the full Omniverse stack?
 

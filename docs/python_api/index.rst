@@ -25,6 +25,11 @@ Version and Constants
 
 .. autodata:: ovstage.__version__
 
+.. autofunction:: ovstage.get_build_info
+
+.. autoclass:: ovstage.BuildInfo
+   :members:
+
 .. autofunction:: ovstage.library_version
 
 .. autodata:: ovstage.TIMEOUT_INFINITE
@@ -50,32 +55,45 @@ Stage and Path Dictionary
    :members:
    :undoc-members:
 
+.. autoclass:: ovstage.PathList
+   :members:
+   :undoc-members:
+
 Queries, Reads, and Maps
 ^^^^^^^^^^^^^^^^^^^^^^^^^
 
 .. autoclass:: ovstage.Query
    :members:
    :undoc-members:
+   :inherited-members:
 
 .. autoclass:: ovstage.OrdinalQuery
    :members:
    :undoc-members:
+   :inherited-members:
 
 .. autoclass:: ovstage.Read
    :members:
    :undoc-members:
+   :inherited-members:
 
 .. autoclass:: ovstage.Map
    :members:
    :undoc-members:
+   :inherited-members:
 
 .. autoclass:: ovstage.Operation
+   :members:
+   :undoc-members:
+
+.. autoclass:: ovstage.CloneOperation
    :members:
    :undoc-members:
 
 .. autoclass:: ovstage.Hierarchy
    :members:
    :undoc-members:
+   :inherited-members:
 
 Instancing Queries
 ^^^^^^^^^^^^^^^^^^
@@ -110,16 +128,22 @@ Data and Result Types
 .. autoclass:: ovstage.ReadGroup
    :members:
    :undoc-members:
+   :inherited-members:
 
 .. autoclass:: ovstage.MapGroup
    :members:
    :undoc-members:
+   :inherited-members:
 
 .. autoclass:: ovstage.AttributeMeta
    :members:
    :undoc-members:
 
 .. autoclass:: ovstage.QueryResult
+   :members:
+   :undoc-members:
+
+.. autoclass:: ovstage.CloneResult
    :members:
    :undoc-members:
 
@@ -150,6 +174,10 @@ Enums
    :members:
    :undoc-members:
 
+.. autoclass:: ovstage.AttributeMode
+   :members:
+   :undoc-members:
+
 .. autoclass:: ovstage.AttributeSemantic
    :members:
    :undoc-members:
@@ -163,6 +191,10 @@ Enums
    :undoc-members:
 
 .. autoclass:: ovstage.HierarchyRelation
+   :members:
+   :undoc-members:
+
+.. autoclass:: ovstage.OrdinalAdmissionPolicy
    :members:
    :undoc-members:
 
@@ -224,11 +256,23 @@ DLPack Tensor Interchange
    :members:
    :undoc-members:
 
+.. autofunction:: ovstage.typed_tensor_to_write
+
 .. autofunction:: ovstage.make_dltensor
 
 .. autofunction:: ovstage.dltensor_to_numpy
 
 .. autofunction:: ovstage.numpy_to_dldatatype
+
+Experimental Device Placement
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Pass ``placement=`` to stage read, write, or map methods. Availability depends
+on the runtime's experimental extension; see :ref:`ovstage-device-placement`.
+
+.. autoclass:: ovstage.Placement
+   :members:
+   :undoc-members:
 
 ovstage.population
 ------------------

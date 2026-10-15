@@ -88,7 +88,7 @@ def _last_error() -> str:
 
 def _require_export(stage):
     lib = _b.load()
-    if not hasattr(lib, "ovstage_population_export_to_usd_file"):
+    if not hasattr(lib, "ovstage_population_export_to_usd_layer_identifier"):
         raise OvstageError(
             _b.OVSTAGE_ERROR_NOT_SUPPORTED,
             "libovstage was built without the ovstage population export-to-USD bridge",
@@ -699,6 +699,27 @@ def _build_export_desc(
     return desc, refs
 
 
+def _layer_identifier(usd_layer) -> str:
+    if isinstance(usd_layer, str):
+        return usd_layer
+    identifier = getattr(usd_layer, "identifier", None)
+    if identifier:
+        return str(identifier)
+    get_identifier = getattr(usd_layer, "GetIdentifier", None)
+    if get_identifier:
+        return str(get_identifier())
+    raise TypeError("USD layer target must be a layer identifier string or a pxr.Sdf.Layer-like object")
+
+
+def _stage_identifier(usd_stage) -> str:
+    if isinstance(usd_stage, str):
+        return usd_stage
+    get_root_layer = getattr(usd_stage, "GetRootLayer", None)
+    if get_root_layer:
+        return _layer_identifier(get_root_layer())
+    raise TypeError("USD stage target must be a root-layer identifier string or a pxr.Usd.Stage-like object")
+
+
 def _export_to_usd_identifier(
     stage,
     identifier: str,
@@ -782,6 +803,205 @@ def _enqueue_to_usd_identifier(
         lib,
         result,
         name=public_function_name,
+    )
+
+
+def export_to_usd_layer(
+    stage,
+    usd_layer,
+    ordinal: int,
+    *,
+    since_ordinal: int = 0,
+    selection: int = OVSTAGE_POPULATION_EXPORT_SELECTION_EXPLICIT_PREDICATE,
+    layer_mode: int = OVSTAGE_POPULATION_EXPORT_LAYER_MODE_OVER,
+    transform_policy: int = OVSTAGE_POPULATION_EXPORT_TRANSFORM_USD_XFORM_OP,
+    unknown_metadata_policy: int = OVSTAGE_POPULATION_EXPORT_UNKNOWN_METADATA_DROP,
+    source_api_schema_policy: int = OVSTAGE_POPULATION_EXPORT_SOURCE_API_SCHEMAS_EXPLICIT_ONLY,
+    projection: int = OVSTAGE_POPULATION_EXPORT_PROJECTION_EXPLICIT_RULES,
+    prim_predicate: Optional[PrimPredicate] = None,
+    property_predicate: Optional[PropertyPredicate] = None,
+    prim_rules: Optional[list[dict]] = None,
+    api_schema_rules: Optional[list[dict]] = None,
+    attribute_rules: Optional[list] = None,
+    property_rules: Optional[list[dict]] = None,
+    metadata_rules: Optional[list[dict]] = None,
+) -> dict:
+    """Export selected ovstage runtime state into a USD layer.
+
+    The target layer is resolved by identifier. This works for file-backed
+    layers and for already-open layers visible to USD's layer registry.
+    """
+    return _export_to_usd_identifier(
+        stage,
+        _layer_identifier(usd_layer),
+        "ovstage_population_export_to_usd_layer_identifier",
+        "export_to_usd_layer",
+        ordinal,
+        since_ordinal=since_ordinal,
+        selection=selection,
+        layer_mode=layer_mode,
+        transform_policy=transform_policy,
+        unknown_metadata_policy=unknown_metadata_policy,
+        source_api_schema_policy=source_api_schema_policy,
+        projection=projection,
+        prim_predicate=prim_predicate,
+        property_predicate=property_predicate,
+        prim_rules=prim_rules,
+        api_schema_rules=api_schema_rules,
+        attribute_rules=attribute_rules,
+        property_rules=property_rules,
+        metadata_rules=metadata_rules,
+    )
+
+
+def export_to_usd_stage(
+    stage,
+    usd_stage,
+    ordinal: int,
+    *,
+    since_ordinal: int = 0,
+    selection: int = OVSTAGE_POPULATION_EXPORT_SELECTION_EXPLICIT_PREDICATE,
+    layer_mode: int = OVSTAGE_POPULATION_EXPORT_LAYER_MODE_OVER,
+    transform_policy: int = OVSTAGE_POPULATION_EXPORT_TRANSFORM_USD_XFORM_OP,
+    unknown_metadata_policy: int = OVSTAGE_POPULATION_EXPORT_UNKNOWN_METADATA_DROP,
+    source_api_schema_policy: int = OVSTAGE_POPULATION_EXPORT_SOURCE_API_SCHEMAS_EXPLICIT_ONLY,
+    projection: int = OVSTAGE_POPULATION_EXPORT_PROJECTION_EXPLICIT_RULES,
+    prim_predicate: Optional[PrimPredicate] = None,
+    property_predicate: Optional[PropertyPredicate] = None,
+    prim_rules: Optional[list[dict]] = None,
+    api_schema_rules: Optional[list[dict]] = None,
+    attribute_rules: Optional[list] = None,
+    property_rules: Optional[list[dict]] = None,
+    metadata_rules: Optional[list[dict]] = None,
+) -> dict:
+    """Export through a stage root-layer identifier and its default edit target.
+
+    A pxr.Usd.Stage-like object is reduced to its root-layer identifier. Its
+    current edit target is not preserved.
+    """
+    return _export_to_usd_identifier(
+        stage,
+        _stage_identifier(usd_stage),
+        "ovstage_population_export_to_usd_stage_identifier",
+        "export_to_usd_stage",
+        ordinal,
+        since_ordinal=since_ordinal,
+        selection=selection,
+        layer_mode=layer_mode,
+        transform_policy=transform_policy,
+        unknown_metadata_policy=unknown_metadata_policy,
+        source_api_schema_policy=source_api_schema_policy,
+        projection=projection,
+        prim_predicate=prim_predicate,
+        property_predicate=property_predicate,
+        prim_rules=prim_rules,
+        api_schema_rules=api_schema_rules,
+        attribute_rules=attribute_rules,
+        property_rules=property_rules,
+        metadata_rules=metadata_rules,
+    )
+
+
+def export_to_usd_layer_async(
+    stage,
+    usd_layer,
+    ordinal: int,
+    *,
+    since_ordinal: int = 0,
+    selection: int = OVSTAGE_POPULATION_EXPORT_SELECTION_EXPLICIT_PREDICATE,
+    layer_mode: int = OVSTAGE_POPULATION_EXPORT_LAYER_MODE_OVER,
+    transform_policy: int = OVSTAGE_POPULATION_EXPORT_TRANSFORM_USD_XFORM_OP,
+    unknown_metadata_policy: int = OVSTAGE_POPULATION_EXPORT_UNKNOWN_METADATA_DROP,
+    source_api_schema_policy: int = OVSTAGE_POPULATION_EXPORT_SOURCE_API_SCHEMAS_EXPLICIT_ONLY,
+    projection: int = OVSTAGE_POPULATION_EXPORT_PROJECTION_EXPLICIT_RULES,
+    prim_predicate: Optional[PrimPredicate] = None,
+    property_predicate: Optional[PropertyPredicate] = None,
+    prim_rules: Optional[list[dict]] = None,
+    api_schema_rules: Optional[list[dict]] = None,
+    attribute_rules: Optional[list] = None,
+    property_rules: Optional[list[dict]] = None,
+    metadata_rules: Optional[list[dict]] = None,
+) -> ExportOperation:
+    """Enqueue export into a USD layer and return an operation handle.
+
+    The native enqueue copies the complete descriptor before returning. The
+    caller must still avoid concurrent USD reads or writes to the destination
+    until the returned operation completes.
+    """
+    return _enqueue_to_usd_identifier(
+        stage,
+        _layer_identifier(usd_layer),
+        "ovstage_population_export_enqueue_to_usd_layer_identifier",
+        "export_to_usd_layer_async",
+        ordinal,
+        since_ordinal=since_ordinal,
+        selection=selection,
+        layer_mode=layer_mode,
+        transform_policy=transform_policy,
+        unknown_metadata_policy=unknown_metadata_policy,
+        source_api_schema_policy=source_api_schema_policy,
+        projection=projection,
+        prim_predicate=prim_predicate,
+        property_predicate=property_predicate,
+        prim_rules=prim_rules,
+        api_schema_rules=api_schema_rules,
+        attribute_rules=attribute_rules,
+        property_rules=property_rules,
+        metadata_rules=metadata_rules,
+    )
+
+
+def export_to_usd_stage_async(
+    stage,
+    usd_stage,
+    ordinal: int,
+    *,
+    since_ordinal: int = 0,
+    selection: int = OVSTAGE_POPULATION_EXPORT_SELECTION_EXPLICIT_PREDICATE,
+    layer_mode: int = OVSTAGE_POPULATION_EXPORT_LAYER_MODE_OVER,
+    transform_policy: int = OVSTAGE_POPULATION_EXPORT_TRANSFORM_USD_XFORM_OP,
+    unknown_metadata_policy: int = OVSTAGE_POPULATION_EXPORT_UNKNOWN_METADATA_DROP,
+    source_api_schema_policy: int = OVSTAGE_POPULATION_EXPORT_SOURCE_API_SCHEMAS_EXPLICIT_ONLY,
+    projection: int = OVSTAGE_POPULATION_EXPORT_PROJECTION_EXPLICIT_RULES,
+    prim_predicate: Optional[PrimPredicate] = None,
+    property_predicate: Optional[PropertyPredicate] = None,
+    prim_rules: Optional[list[dict]] = None,
+    api_schema_rules: Optional[list[dict]] = None,
+    attribute_rules: Optional[list] = None,
+    property_rules: Optional[list[dict]] = None,
+    metadata_rules: Optional[list[dict]] = None,
+) -> ExportOperation:
+    """Enqueue export through a stage root-layer identifier.
+
+    The caller must avoid concurrent USD reads or writes to the destination stage
+    and its layers until the returned operation completes. A pxr.Usd.Stage-like
+    object is reduced to its root-layer identifier; its current edit target is
+    not preserved.
+    """
+    options = dict(
+        since_ordinal=since_ordinal,
+        selection=selection,
+        layer_mode=layer_mode,
+        transform_policy=transform_policy,
+        unknown_metadata_policy=unknown_metadata_policy,
+        source_api_schema_policy=source_api_schema_policy,
+        projection=projection,
+        prim_predicate=prim_predicate,
+        property_predicate=property_predicate,
+        prim_rules=prim_rules,
+        api_schema_rules=api_schema_rules,
+        attribute_rules=attribute_rules,
+        property_rules=property_rules,
+        metadata_rules=metadata_rules,
+    )
+
+    return _enqueue_to_usd_identifier(
+        stage,
+        _stage_identifier(usd_stage),
+        "ovstage_population_export_enqueue_to_usd_stage_identifier",
+        "export_to_usd_stage_async",
+        ordinal,
+        **options,
     )
 
 
@@ -870,6 +1090,66 @@ def _export_typed_hierarchy(
         prim_predicate=selected_prims,
         property_predicate=selected_properties,
         attribute_rules=custom_rules,
+    )
+
+
+def export_typed_hierarchy_to_usd_layer(
+    stage,
+    usd_layer,
+    root_path: str,
+    ordinal: int,
+    *,
+    prim_predicate: Optional[PrimPredicate] = None,
+    property_predicate: Optional[PropertyPredicate] = None,
+    include_custom_namespaces=None,
+    transform_policy: int = OVSTAGE_POPULATION_EXPORT_TRANSFORM_USD_XFORM_OP,
+    unknown_metadata_policy: int = OVSTAGE_POPULATION_EXPORT_UNKNOWN_METADATA_DROP,
+) -> dict:
+    """Export a typed runtime hierarchy using recorded USD representation facts.
+
+    Supported concrete prim types and recognized effective applied API schemas are
+    preserved. Unrecognized representation metadata follows ``unknown_metadata_policy``.
+    Supported schema-declared attributes are projected with their source names and USD
+    types. Custom attributes are excluded unless their namespace is explicitly included.
+    """
+    return _export_typed_hierarchy(
+        export_to_usd_layer,
+        stage,
+        usd_layer,
+        root_path,
+        ordinal,
+        prim_predicate=prim_predicate,
+        property_predicate=property_predicate,
+        include_custom_namespaces=include_custom_namespaces,
+        transform_policy=transform_policy,
+        unknown_metadata_policy=unknown_metadata_policy,
+    )
+
+
+def export_typed_hierarchy_to_usd_layer_async(
+    stage,
+    usd_layer,
+    root_path: str,
+    ordinal: int,
+    *,
+    prim_predicate: Optional[PrimPredicate] = None,
+    property_predicate: Optional[PropertyPredicate] = None,
+    include_custom_namespaces=None,
+    transform_policy: int = OVSTAGE_POPULATION_EXPORT_TRANSFORM_USD_XFORM_OP,
+    unknown_metadata_policy: int = OVSTAGE_POPULATION_EXPORT_UNKNOWN_METADATA_DROP,
+) -> ExportOperation:
+    """Enqueue typed-hierarchy export and return its normal export operation."""
+    return _export_typed_hierarchy(
+        export_to_usd_layer_async,
+        stage,
+        usd_layer,
+        root_path,
+        ordinal,
+        prim_predicate=prim_predicate,
+        property_predicate=property_predicate,
+        include_custom_namespaces=include_custom_namespaces,
+        transform_policy=transform_policy,
+        unknown_metadata_policy=unknown_metadata_policy,
     )
 
 

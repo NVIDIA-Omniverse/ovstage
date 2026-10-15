@@ -13,7 +13,7 @@ Set Up a Python Project
 
 The ``ovstage`` Python package binds the ovstage C data plane through ctypes. Its
 shared loader must be discoverable when the first native operation runs. Programs use ``Stage`` and
-``PathDictionary`` (both context managers) plus ``numpy`` for tensor attribute
+:class:`PathDictionary <ovstage.PathDictionary>` (both context managers) plus ``numpy`` for tensor attribute
 I/O.
 
 .. note::
@@ -27,7 +27,7 @@ Requirements
 
 - **Python 3.10–3.13** (``requires-python = ">=3.10,<3.14"``). Recreate the
   environment with a supported interpreter rather than editing the constraint.
-- **NumPy**, for tensor I/O (``write_attribute(tensors=...)``, ``group.array(...)``):
+- **NumPy**, for tensor I/O (:meth:`write_attribute(tensors=...) <ovstage.Stage.write_attribute>`, :meth:`group.array(...) <ovstage.ReadGroup.array>`):
 
   .. code-block:: bash
 
@@ -46,7 +46,7 @@ Loading the Shared Library
 
 The bindings open the ovstage shared loader (``ovstage-dynamic.dll`` on Windows,
 ``libovstage-dynamic.so`` on Linux) the first time you construct a ``Stage`` or
-``PathDictionary``. The loader opens the ovstage runtime on the first
+:class:`PathDictionary <ovstage.PathDictionary>`. The loader opens the ovstage runtime on the first
 initialize/create call. The wheel bundles both and its ``<package>/bin`` layout
 is searched automatically, so no extra
 setup is needed. If you are instead running against a locally built shared
@@ -80,6 +80,37 @@ another stage remains live raises :py:class:`~ovstage.OvstageError`.
 ``RUNTIME_DEFAULT`` is meaningful as a manual selector. As a configured value,
 it does not override the active process default; a fresh process defaults to
 CPU incremental.
+
+``stage.config`` returns a detached copy of the process configuration captured
+by that stage. It contains the explicit entries from the initialization that
+established the active process state; it does not materialize omitted defaults.
+
+Configuring Ordinal Admission
+-----------------------------
+
+Use :py:class:`~ovstage.OrdinalAdmissionPolicy` to choose how mutations are
+checked against retained value and prim-lifecycle changes:
+
+.. filtered-literalinclude:: ../../tests/python/test_config.py
+   :language: python
+   :start-after: # [snippet:configure-ordinal-admission]
+   :end-before: # [/snippet:configure-ordinal-admission]
+   :exclude-pattern: ^\s*#\s*\[/?snippet:
+   :dedent:
+
+The default is ``NONDECREASING``, which permits repeated writes
+at the same unsealed ordinal, while ``FLOOR_ONLY`` skips retained-history
+conflicts. See :ref:`ordinal-admission-policies` for the comparison rules.
+
+This setting shares the process lifetime of the hierarchy configuration.
+Omission, ``None`` and ``DEFAULT`` inherit the active policy; they select the
+nondecreasing policy only when starting a fresh lifetime. Matching concrete
+configurations may coexist. A conflicting policy raises
+:py:class:`~ovstage.OvstageError` without acquiring an initialization reference
+or changing either setting. Close all stages and release any other initialization
+references and retained instance owners before selecting another policy.
+``stage.config`` reports the original explicit entries, so an omitted policy
+remains ``None`` and an explicit ``DEFAULT`` remains ``DEFAULT``.
 
 Minimal Program
 ---------------

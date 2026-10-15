@@ -2,9 +2,10 @@
 
 A standalone Python program that shows pure client-side authoring and the
 hierarchy APIs: it builds a multi-environment world with **zero USD** — prims
-come into existence via attribute writes to nested paths — then shows that
-derived world transforms are **pull-computed**: nothing fills them in until a
-hierarchy computation model runs. It is the Python sibling of
+come into existence via attribute writes to nested paths. It then shows that
+derived world transforms are **pull-computed**: the rows start absent, the
+client seeds them, and a hierarchy computation model fills or refreshes them.
+It is the Python sibling of
 `../../c/authoring-hierarchy/main.cpp` (same sections, byte-identical output).
 
 ## At a glance
@@ -12,7 +13,7 @@ hierarchy computation model runs. It is the Python sibling of
 1. Create prims by writing attributes to nested paths — no USD anywhere; the hierarchy comes from the paths.
 2. Stamp prim types (`usd-prim-type`) and applied schemas (`usd-schemas`) client-side.
 3. Write each prim's local transform (`omni:xform`) and clone the prototype into three environments.
-4. Show the staleness rule: derived world matrices don't exist until you compute them; run the GPU compute and read correct world translations.
+4. Seed the derived world-matrix rows, run the GPU compute, seal the ordinal, and read correct world translations.
 5. Move one environment and recompute to fold the edit into the derived rows.
 6. Look up parent, children, and siblings of a prim.
 
@@ -35,7 +36,6 @@ applied schemas on /World/Proto/Body: PhysicsMassAPI PhysicsRigidBodyAPI
 cloned /World/Proto -> /World/Env_0 /World/Env_1 /World/Env_2
 hierarchy computation models: cpu-incremental gpu-incremental gpu-global runtime-default
 world matrix rows before compute_hierarchy: absent (derived rows are pull-computed)
-stale placeholder world translation /World/Env_0/Body/Tip: 0.0 0.0 0.0
 world translation /World/Proto/Body/Tip: 10.0 100.0 7.0
 world translation /World/Env_0/Body/Tip: 100.0 100.0 7.0
 world translation /World/Env_1/Body/Tip: 200.0 100.0 7.0
@@ -50,9 +50,10 @@ siblings of /World/Proto/Body: /World/Proto/Arm
 - The first two lines prove the prims exist with zero USD: attribute writes to
   nested paths created them, and the reserved `usd-prim-type` / `usd-schemas`
   columns read back exactly what was stamped.
-- The `absent` and `stale placeholder` lines are the heart of the example: the
-  derived `omni:fabric:worldMatrix` column does not exist until the client
-  seeds it, and the seeded zeros stay stale until `compute_hierarchy` runs.
+- The `absent` line shows that the derived `omni:fabric:worldMatrix` column
+  does not exist until the client seeds it and `compute_hierarchy` runs. The
+  `world translation` lines are the computed compositions, read after the
+  compute and the seal of ordinal 3.
 - The `moved` / `recomputed` pair shows that a later edit needs another
   compute: the ordinal-4 write lands in the derived rows only after the second
   `compute_hierarchy` — the tip's z becomes 47.0.
@@ -86,7 +87,7 @@ ovstage skills under `../../../skills/`; keep them intact when editing.
 - `author-local-transforms` — `omni:xform` as ONE 16-lane float64 element per prim
 - `clone-prototype-envs` — clone one prototype to N environments in one call
 - `hierarchy-computation-models` — enumerate the runtime's computation models
-- `world-matrix-staleness` — absent → seeded placeholder (stale) → compute → correct
+- `world-matrix-staleness` — absent → seed output rows → compute → seal → correct
 - `recompute-after-edit` — a later local edit needs another compute to land
 - `hierarchy-lookups` — parent/children/siblings via `get_hierarchy`
 
@@ -98,8 +99,9 @@ ovstage skills under `../../../skills/`; keep them intact when editing.
   clear error and exits 1.
 - Reading the derived column between an edit and the recompute is not a
   reliable staleness probe: the read itself can pull an incremental refresh.
-  Only an explicit compute guarantees rows consistent with the new input
-  ordinal, so the program reads only after it.
+  Only an explicit compute guarantees rows consistent with the latest
+  committed inputs, so the program reads only after it. The current
+  implementation ignores `input_ordinal`.
 - `usd-schemas` rows are whole-set assignments: a write replaces the prim's
   full schema set, and an empty row clears it. Elements read back unordered, so
   the program prints them sorted; `get_hierarchy` results are unordered too.

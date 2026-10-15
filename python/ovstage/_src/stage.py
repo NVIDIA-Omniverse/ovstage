@@ -9,19 +9,21 @@
 """Pythonic ``Stage`` wrapper over the ovstage data-plane C API.
 
 A :class:`Stage` owns an ``ovstage_instance_t``. Asynchronous calls return an
-:class:`Operation` (with ``.wait()``); handle-reserving calls return lightweight
+:class:`Operation` (whose ``.wait()`` returns it); handle-reserving calls return lightweight
 :class:`Query` / :class:`Read` / :class:`Map` / :class:`OrdinalQuery` objects
 that also carry their reserving op. Errors surface as :class:`OvstageError`.
 Tensor data flows as numpy arrays (CPU) via DLPack.
 """
 
 import ctypes
-from typing import List, Optional, Sequence, Union
+from typing import List, Optional, Sequence, TypeVar, Union
 
 from . import bindings as _b
 from .dlpack import DLDataType, DLTensor, make_dltensor
 from .types import (
     AttributeSemantic,
+    CloneOperation,
+    CloneResult,
     Filter,
     HierarchyComputationModel,
     HierarchyComputationModelDesc,
@@ -29,9 +31,12 @@ from .types import (
     HierarchyResult,
     MapGroup,
     Operation,
+    OrdinalAdmissionPolicy,
     OrdinalRange,
     OvstageError,
+    Placement,
     PrimMode,
+    AttributeMode,
     QueryResult,
     ReadGroup,
     Scope,
@@ -55,6 +60,11 @@ __all__ = ["Stage", "Query", "Read", "Map", "OrdinalQuery", "Hierarchy"]
 
 _TensorLike = Union[DLTensor, "object"]  # DLTensor or numpy array
 
+# Stands in for ``typing.Self`` (Python 3.11+; the package floor is 3.10 with no
+# typing_extensions dependency): ``Read.wait()`` is typed as returning ``Read``,
+# ``Map.wait()`` as ``Map``, and so on. String bound — the class is defined below.
+_HandleT = TypeVar("_HandleT", bound="_HandleObject")
+
 
 def _handle(value) -> int:
     """Accept a handle wrapper (``.handle``) or a raw int handle."""
@@ -63,14 +73,29 @@ def _handle(value) -> int:
     return check_handle(getattr(value, "handle", value), "handle")
 
 
+def _require_placement(placement: Placement) -> Placement:
+    """Reject a non-Placement before it reaches ctypes.
+
+    A bare ``(device_type, device_id)`` tuple is the easy mistake here, and it
+    would otherwise fail deep in ctypes with an opaque message instead of at the
+    call the caller wrote.
+    """
+    if not isinstance(placement, Placement):
+        raise TypeError(
+            f"placement must be an ovstage.Placement, got {type(placement).__name__}; "
+            "use Placement(...) or Placement.from_dlpack_device(...)"
+        )
+    return placement
+
+
 class Stage:
     """An ovstage instance: the unit of stage-data read/write/query.
 
     Args:
         name: Optional instance name used for diagnostics.
         config: Optional process configuration. Its runtime-default hierarchy
-            model is captured by this instance and controls automatic transform
-            updates.
+            model controls automatic transform updates; its ordinal admission
+            policy controls mutation ordering. Both are captured by this instance.
     """
 
     def __init__(self, name: Optional[str] = None, config: Optional[StageConfig] = None):
@@ -104,12 +129,9 @@ class Stage:
                 self._holds_process_ref = False
             raise OvstageError(code, message)
         # Ownership of caller-created path lists, keyed by handle (see PathList).
-        # It lives here rather than on PathDictionary because the C path
-        # dictionary is per-Stage while wrappers are not: PathDictionary(stage) is
-        # the documented shared form and ovstage.instancing builds one per call, so
-        # several wrappers over one Stage are routine and must agree on who owns
-        # what — otherwise a release through one desyncs the other into a double
-        # release.
+        # All PathDictionary wrappers over this Stage use the same dictionary
+        # and registry, so releasing through one wrapper updates ownership for
+        # every wrapper and prevents double release.
         self._path_list_refs = {}
 
     # ── lifecycle ──────────────────────────────────────────────────────────
@@ -134,7 +156,54 @@ class Stage:
                     model,
                 )
             )
+        policy = config.runtime_default_ordinal_admission_policy
+        if policy is not None:
+            policy = check_enum_member(
+                policy,
+                OrdinalAdmissionPolicy,
+                "runtime_default_ordinal_admission_policy",
+            )
+            entries.append(
+                _b.ovstage_config_entry_uint64(
+                    _b.OVSTAGE_CONFIG_RUNTIME_DEFAULT_ORDINAL_ADMISSION_POLICY,
+                    policy,
+                )
+            )
         return _b.ovstage_config_t(entries)
+
+    @staticmethod
+    def _from_c_config(config: _b.ovstage_config_t) -> StageConfig:
+        model = None
+        policy = None
+        for i in range(config.entry_count):
+            entry = config.entries[i]
+            if (
+                entry.key_type == _b.OVSTAGE_CONFIG_KEY_TYPE_UINT64
+                and entry.key.uint64_key == _b.OVSTAGE_CONFIG_RUNTIME_DEFAULT_HIERARCHY_COMPUTATION_MODEL
+            ):
+                model = HierarchyComputationModel(entry.value.uint_value)
+            elif (
+                entry.key_type == _b.OVSTAGE_CONFIG_KEY_TYPE_UINT64
+                and entry.key.uint64_key == _b.OVSTAGE_CONFIG_RUNTIME_DEFAULT_ORDINAL_ADMISSION_POLICY
+            ):
+                policy = OrdinalAdmissionPolicy(entry.value.uint_value)
+        return StageConfig(
+            runtime_default_hierarchy_computation_model=model,
+            runtime_default_ordinal_admission_policy=policy,
+        )
+
+    @property
+    def config(self) -> StageConfig:
+        """Get a detached copy of the original process configuration entries.
+
+        Omitted settings remain ``None`` and selectors remain selectors; this
+        snapshot does not expand them into the resolved runtime defaults.
+        """
+        native_config = _b.ovstage_config_t([])
+        code = self._lib.ovstage_get_config(self._require_inst(), ctypes.byref(native_config))
+        if code != _b.OVSTAGE_OK:
+            raise OvstageError(code, self._last_error())
+        return self._from_c_config(native_config)
 
     @staticmethod
     def get_version() -> tuple:
@@ -206,9 +275,19 @@ class Stage:
             raise self._invalid_instance_error("flat ovstage API")
         return self._inst
 
-    def _wait_and_release(self, op_id: int, timeout: int) -> None:
+    def _wait_and_release(self, op_id: int, timeout: int, on_complete=None) -> None:
+        """Wait for ``op_id``, run ``on_complete`` while the completed op is still live, release it."""
         wait = _b.ovstage_op_wait_result_t()
         code = self._api.ovstage_wait_op(self._inst, op_id, timeout, ctypes.byref(wait))
+        if code == _b.OVSTAGE_ERROR_TIMEOUT:
+            # Not ready is not a terminal result: the op is still pending, and the
+            # C contract allows release_op only once it has completed (releasing a
+            # pending op is rejected and would orphan its tracking state). Leave
+            # it tracked so a later wait can observe it.
+            raise OvstageError(
+                code,
+                f"operation {op_id} is still pending (lowest pending op id {int(wait.lowest_pending_op_id)})",
+            )
         # Ops that ran and failed -- the waited op or a failed producer in its
         # dependency chain -- are reported through wait.error_op_ids, and the
         # wait itself may still return OVSTAGE_OK (see wait_op in
@@ -222,6 +301,12 @@ class Stage:
             msg = self._last_op_error(failed_id)
             self._api.ovstage_release_op(self._inst, op_id)  # best effort
             raise OvstageError(code if code != _b.OVSTAGE_OK else _b.OVSTAGE_ERROR_OP_FAILED, msg)
+        if on_complete is not None:
+            try:
+                on_complete()
+            except Exception:
+                self._api.ovstage_release_op(self._inst, op_id)  # best effort
+                raise
         rc = self._api.ovstage_release_op(self._inst, op_id)
         if rc != _b.OVSTAGE_OK:
             raise OvstageError(rc, self._last_op_error(op_id))
@@ -353,15 +438,68 @@ class Stage:
         return Operation(self, res.status, res.op_index, keepalive=[keepalive] if keepalive is not None else None)
 
     # ── read ─────────────────────────────────────────────────────────────────
-    def read_attributes(self, query, attrs: Sequence[int], ordinal_range: OrdinalRange) -> "Read":
+    def read_attributes(
+        self,
+        query,
+        attrs: Sequence[int],
+        ordinal_range: OrdinalRange,
+        *,
+        placement: Optional[Placement] = None,
+    ) -> "Read":
+        """Enqueue a multi-attribute read; iterate groups with :meth:`Read.groups`.
+
+        ``placement`` selects which of an attribute's copies the returned groups
+        point at, so the payload ``DLTensor``\\ s report that device and a CUDA
+        read yields pointers a kernel can consume without a host round-trip.
+        ``None`` is the host, and is byte-for-byte the unplaced call.
+
+        Unlike a placed write or map, a placed read is *permissive*: a column
+        that is not current on ``placement.device_type``/``device_id`` is made
+        available there rather than the read failing. Zero-copy survives where it
+        is available -- a column already current on that device is pointed at
+        directly and nothing is transferred. A column materialized onto the
+        device lives in storage the group owns and is freed with
+        :meth:`Stage.release_group`.
+
+        ``placement.availability_event`` is what makes a transferring read
+        asynchronous, and it changes when the payload may be touched. Without one
+        the transfer is drained before the operation completes, so the data is
+        ready as soon as :meth:`Read.fetch_next` hands the group over -- the
+        behaviour an unplaced read already has. **With one, the pointers in the
+        returned groups are not safe to dereference until the caller has waited
+        on that event** (or has enqueued their own work on ``placement.stream``
+        behind it). Wait once :meth:`Read.fetch_next` has returned a group: the
+        event is recorded before any group is handed back, and a wait issued
+        earlier may observe an old or unrecorded event. The read operation
+        completes *before* the event fires, by design:
+        the event marks when the column is available to dereference, not when
+        this op finished, and what it waits out can include device work the
+        caller never issued -- a write still in flight ahead of the read. A read
+        served without a transfer records the event too, so a caller never has
+        to know which case they got, and a wait on it never hangs.
+        """
         attr_list = check_token_sequence(attrs, "attrs entries")
         arr = (_b.ovx_token_t * len(attr_list))(*attr_list)
+        keep: list = [arr]
         handle = _b.ovstage_read_handle_t()
-        res = self._api.ovstage_read_attributes(
-            self._inst, _handle(query), ctypes.cast(arr, ctypes.POINTER(_b.ovx_token_t)),
-            len(attr_list), ordinal_range.to_c(), ctypes.byref(handle),
-        )
-        return Read(self, int(handle.value), Operation(self, res.status, res.op_index, keepalive=[arr]))
+        attrs_ptr = ctypes.cast(arr, ctypes.POINTER(_b.ovx_token_t))
+        if placement is None:
+            res = self._api.ovstage_read_attributes(
+                self._inst, _handle(query), attrs_ptr,
+                len(attr_list), ordinal_range.to_c(), ctypes.byref(handle),
+            )
+        else:
+            # Like the placed map slot, this one takes the placement *before* the
+            # out-handle. Keep the struct alive on the op: the native side copies
+            # it during enqueue, but the keepalive costs nothing and removes any
+            # question about when that read happens.
+            c_placement = _require_placement(placement)._to_c()
+            keep.append(c_placement)
+            res = self._api.ovstage_read_attributes_on_device(
+                self._inst, _handle(query), attrs_ptr,
+                len(attr_list), ordinal_range.to_c(), ctypes.byref(c_placement), ctypes.byref(handle),
+            )
+        return Read(self, int(handle.value), Operation(self, res.status, res.op_index, keepalive=keep))
 
     def fetch_read_next(self, read, timeout: int = TIMEOUT_INFINITE) -> Optional[ReadGroup]:
         """Fetch the next read group, or ``None`` at end of iteration."""
@@ -412,7 +550,8 @@ class Stage:
 
     # ── write / delete ────────────────────────────────────────────────────────
     def _build_write_data(
-        self, tensors, is_array, index_map, mask, count, cuda_event, cuda_stream, semantic=AttributeSemantic.NONE
+        self, tensors, is_array, index_map, mask, count, cuda_event, cuda_stream, semantic=AttributeSemantic.NONE,
+        attribute_mode=AttributeMode.REJECT,
     ) -> "tuple[_b.ovstage_write_data_t, list]":
         if not isinstance(is_array, bool):
             raise TypeError("is_array must be a bool")
@@ -519,6 +658,7 @@ class Stage:
         # enum must still reach the library. Changes only together with the
         # map_attribute site below.
         wd.semantic = check_enum(semantic, "semantic")
+        wd.attribute_mode = check_enum_member(attribute_mode, AttributeMode, "attribute_mode")
         return wd, keep
 
     def write_attribute(
@@ -531,11 +671,13 @@ class Stage:
         is_array: bool,
         prim_mode: PrimMode = PrimMode.UPSERT,
         semantic: int = 0,
+        attribute_mode: AttributeMode = AttributeMode.REJECT,
         index_map: Optional[Sequence[int]] = None,
         mask: Optional[Sequence[int]] = None,
         count: Optional[int] = None,
         cuda_event: Optional[int] = None,
         cuda_stream: Optional[int] = None,
+        placement: Optional[Placement] = None,
     ) -> Operation:
         """Enqueue a copy-in write.
 
@@ -544,16 +686,47 @@ class Stage:
         semantic, or existing storage. ``tensors`` is a numpy array /
         :class:`DLTensor`, or a list thereof (one per source row for array
         attributes). Caller-owned tensors are kept alive on the returned
-        :class:`Operation` until ``wait()``.
+        :class:`Operation` until ``wait()`` -- which is long enough only while
+        ``wait()`` implies the device work drained. A ``placement`` carrying an
+        ``availability_event`` can leave that work running past it; see
+        :class:`Placement` for what the caller must then hold a reference to.
 
-        Fixed-size writes (``is_array=False``) are normalized to the raw API's
-        lane-canonical layout: reads and maps return ``ndim=1``, a leading
-        dimension equal to the transported data-row count, and the complete
-        per-row tuple width in ``dtype.lanes``. Logical prims select those rows
-        directly or through the group's data index map. Compact convenience
-        inputs such as a point array shaped ``(N, 3)`` or a matrix array shaped
-        ``(N, 4, 4)`` are accepted, but their trailing shape is folded and not
-        preserved. Without an index map, the leading dimension must equal the
+        Writing a different schema to an existing prim/name fails unless
+        ``attribute_mode`` is :attr:`AttributeMode.FORCE`. Then a target prim whose
+        existing schema differs has it replaced. A ``NONE`` semantic keeps the existing
+        role on a prim whose storage is unchanged; on a prim whose storage is replaced
+        the written schema has no role. The replacement is admitted once at ``ordinal`` and recorded there as the
+        end of the previous schema on the replaced prims together with the written
+        value; it is rejected while a replaced prim has an outstanding read or the
+        attribute an overlapping map, leaving the previous schema in place. A write that
+        fails after the previous schema has ended on a prim leaves that end recorded at
+        ``ordinal`` and the prim without a value; a corrected retry for that prim needs a
+        later ordinal. Other prims keep their schema, and reserved
+        metadata attributes accept only :attr:`AttributeMode.REJECT`. A change-range
+        read that includes ``ordinal`` returns, for each replaced prim, a tombstone group
+        for the previous schema and a value group in the written schema, in unspecified
+        order; a latest read returns only the written schema.
+
+        Aliases of one stored column share ordinal admission, change tracking, and
+        overlap checks on intersecting prim paths.
+        The ordinal must exceed applicable write floors. With the
+        ``OrdinalAdmissionPolicy.STRICTLY_INCREASING``, it must also be newer
+        than retained committed changes to each affected cell and applicable
+        prim lifecycle. ``NONDECREASING`` allows equal unsealed ordinals but
+        rejects older intersecting history; ``FLOOR_ONLY`` skips retained-history
+        and separate prim-lifecycle admission. Disjoint cells may share an ordinal.
+        These policy choices also apply to map commits, clone and delete, each
+        with its own applicable floors and lifecycle targets.
+        Execution checks ordinal admission before changing stage data. Call
+        ``wait()`` on the returned operation to observe admission and completion
+        errors; enqueue acceptance or dropping the operation does not establish success.
+
+        Fixed-size writes (``is_array=False``) are normalized internally.
+        Raw reads return scalar-lane tensors with type-aware component axes
+        (for example, ``(N, 3)`` for points and ``(N, 4, 4)`` for matrices);
+        maps expose the same typed shapes. Logical prims select rows directly or
+        through the group's data index map. The exact input shape is not
+        retained. Without an index map, the leading dimension must equal the
         logical element count; a flat ``(N * L,)`` array is not inferred as
         ``N`` rows of width ``L``. This normalization does not describe
         array/ragged attributes.
@@ -566,8 +739,8 @@ class Stage:
         zero-copy without ambiguously reinterpreting scalar arrays.
 
         Reserved metadata uses the same contract: ``usd-prim-type`` requires
-        ``is_array=False`` and ``usd-schemas`` requires ``is_array=True``.
-        Neither attribute is implicitly broadcast; use ``index_map`` when
+        ``is_array=False``; ``usd-schemas`` and ``usd-ancestor-types`` require ``is_array=True``.
+        None is implicitly broadcast; use ``index_map`` when
         target rows intentionally share source data.
 
         ``count`` is the number of logical elements the write addresses — the
@@ -609,17 +782,46 @@ class Stage:
         (``TOKEN_ID`` / ``RELATIONSHIP_PATH_ID`` use ``dtype = (kDLUInt, 64, 1)``,
         ``CONNECTION_PATH_ID`` uses ``dtype = (kDLUInt, 64, 2)``). ``0`` (NONE)
         writes the payload without stamping a role / base type on the column.
+
+        Like :meth:`write_attributes`, this operation is not transactional. A
+        successfully applied entry commits its values, any new prims or
+        attributes, and their change records at the submitted ordinal. A failed
+        entry is not recorded as a completed write, although changes made before
+        the failure can remain visible to a ``HAS`` query. Because this operation
+        has only one entry, a failed application leaves the submitted ordinal
+        available; a corrected same-ordinal retry remains admissible subject to
+        current stage state. The exception is a :attr:`AttributeMode.FORCE` write
+        that ended a prim's previous schema before failing: that end stays recorded,
+        so a retry for that prim needs a later ordinal. INSERT treats a prim left by a failed write as an
+        existing target and can reject it with
+        ``ErrorCode.PRIM_NOT_FOUND``; UPSERT can repair it. Recoverable allocation
+        and size failures follow the normal :class:`OvstageError` path. Only
+        failure to record an already-applied entry's prim, attribute and ordinal
+        changes terminates the process; Python cannot catch that as an exception.
         """
         # Keep the singular Python entry point aligned with the native API; the
         # native slot relays to the common plural implementation.
         wd, keep = self._build_write_data(
-            tensors, is_array, index_map, mask, count, cuda_event, cuda_stream, semantic
+            tensors, is_array, index_map, mask, count, cuda_event, cuda_stream, semantic, attribute_mode
         )
         sot = _b.make_string_or_token(attribute)
         keep.append(sot)
-        res = self._api.ovstage_write_attribute(
-            self._inst, _handle(query), sot, check_ordinal(ordinal), wd, check_enum_member(prim_mode, PrimMode, "prim_mode")
-        )
+        checked_ordinal = check_ordinal(ordinal)
+        checked_prim_mode = check_enum_member(prim_mode, PrimMode, "prim_mode")
+        if placement is None:
+            res = self._api.ovstage_write_attribute(
+                self._inst, _handle(query), sot, checked_ordinal, wd, checked_prim_mode
+            )
+        else:
+            # Keep the placement struct alive until the op completes: the native
+            # side reads it during enqueue, but the keepalive costs nothing and
+            # removes any question about when that read happens.
+            c_placement = _require_placement(placement)._to_c()
+            keep.append(c_placement)
+            res = self._api.ovstage_write_attribute_on_device(
+                self._inst, _handle(query), sot, checked_ordinal, wd, checked_prim_mode,
+                ctypes.byref(c_placement),
+            )
         return Operation(self, res.status, res.op_index, keepalive=keep)
 
     def write_attributes(
@@ -629,13 +831,55 @@ class Stage:
         ordinal: int,
         *,
         prim_mode: PrimMode = PrimMode.UPSERT,
+        placement: Optional[Placement] = None,
     ) -> Operation:
         """Enqueue one copy-in operation for multiple attribute columns.
 
-        Every write is validated before the operation is queued. The
-        returned operation owns all ctypes/tensor keepalives until ``wait()``.
-        Each fixed-size entry follows the same lane-canonical normalization as
+        Every write undergoes common preflight before the operation is queued.
+        Native preflight failures, including known write-floor violations, are
+        recorded in the returned operation's ``status`` and raised by ``wait()``.
+        Python argument validation raises immediately. Successful enqueue can
+        still be followed by ordinal-admission failure, also reported by ``wait()``.
+        Admission follows the policy described by :meth:`write_attribute` and
+        is checked for the complete batch before any entry changes stage data.
+        The returned operation owns all ctypes/tensor keepalives until ``wait()``.
+        Each fixed-size entry follows the same read/map normalization as
         :meth:`write_attribute`.
+
+        Compatible aliases of one stored column may appear together only when
+        their selected prim coverage is disjoint.
+
+        The operation is not transactional. If a later entry fails, ``wait()``
+        reports failure for the operation, while entries whose application
+        completed successfully remain committed, including any new prims or
+        attributes and their change records at the submitted ordinal. The failed
+        entry is not recorded as a completed write, although changes made before
+        the failure can remain visible to a ``HAS`` query. Preparing storage alone
+        does not count as a completed write or record changes at the submitted
+        ordinal. Reserved metadata may complete before ordinary attribute values;
+        it remains committed if a later entry fails.
+
+        The API exposes no per-entry completion mask, so repair a whole batch that
+        may have completed an entry with a newer ordinal: the
+        ``STRICTLY_INCREASING`` policy rejects rewriting completed entries at
+        their recorded ordinal. If no entry completed,
+        including when the sole entry of a one-entry call did not complete, the
+        ordinal remains available and a corrected same-ordinal retry remains
+        admissible subject to current stage state, except for a prim whose previous
+        schema an :attr:`AttributeMode.FORCE` entry ended before the failure: that end
+        stays recorded, so its retry needs a later ordinal. Recoverable allocation or size
+        failures follow the normal :class:`OvstageError` path while the stage and
+        its ordinal change records can remain consistent with completed entries.
+
+        A failed write can leave a prim visible to queries without recording its
+        creation at the submitted ordinal. INSERT treats that prim as an existing
+        target and rejects it with ``ErrorCode.PRIM_NOT_FOUND``. A later successful
+        UPSERT commits its attribute changes and their ordinal records but does
+        not record a prim-creation event for that already-present prim.
+
+        Only failure to record an already-applied entry's prim, attribute and
+        ordinal changes terminates the process; Python cannot catch that as an
+        exception.
         """
         items = list(writes)
         keep: list = []
@@ -647,7 +891,7 @@ class Stage:
                 raise TypeError("writes must contain WriteDesc instances")
             wd, data_keep = self._build_write_data(
                 item.tensors, item.is_array, item.index_map, item.mask, item.count,
-                item.cuda_event, item.cuda_stream, item.semantic
+                item.cuda_event, item.cuda_stream, item.semantic, item.attribute_mode
             )
             sot = _b.make_string_or_token(item.attribute)
             write_array[index].attribute = sot
@@ -660,14 +904,30 @@ class Stage:
             if items
             else None
         )
-        res = self._api.ovstage_write_attributes(
-            self._inst, _handle(query), writes_ptr, len(items), check_ordinal(ordinal),
-            check_enum_member(prim_mode, PrimMode, "prim_mode"),
-        )
+        checked_ordinal = check_ordinal(ordinal)
+        checked_prim_mode = check_enum_member(prim_mode, PrimMode, "prim_mode")
+        if placement is None:
+            res = self._api.ovstage_write_attributes(
+                self._inst, _handle(query), writes_ptr, len(items), checked_ordinal, checked_prim_mode,
+            )
+        else:
+            c_placement = _require_placement(placement)._to_c()
+            keep.append(c_placement)
+            res = self._api.ovstage_write_attributes_on_device(
+                self._inst, _handle(query), writes_ptr, len(items), checked_ordinal, checked_prim_mode,
+                ctypes.byref(c_placement),
+            )
         return Operation(self, res.status, res.op_index, keepalive=keep)
 
     def delete_attributes(self, query, attributes: Sequence[Union[int, str]], ordinal: int) -> Operation:
-        """Enqueue a delete. Empty ``attributes`` deletes entire prims."""
+        """Enqueue a delete. Empty ``attributes`` deletes entire prims.
+
+        The ordinal must exceed applicable floors. The admission policy described
+        by :meth:`write_attribute` also checks retained changes to deleted cells
+        and, for whole-prim deletion, the affected prim lifecycles. ``FLOOR_ONLY``
+        skips those history and separate lifecycle checks. Call ``wait()`` on the
+        returned operation to observe failures discovered after enqueue.
+        """
         attrs = list(attributes)
         keep: list = []
         attr_ptr = None
@@ -683,18 +943,46 @@ class Stage:
         return Operation(self, res.status, res.op_index, keepalive=keep)
 
     # ── clone (subtree clone) ───────────────────────────────────────────────
-    def clone(self, source_path: str, target_paths: Sequence[str], ordinal: int) -> None:
+    def clone(self, source_path: str, target_paths: Sequence[str], ordinal: int) -> CloneResult:
         """Clone the subtree under ``source_path`` to each path in ``target_paths`` (blocking).
 
         Data-plane peer of ovrtx's ``clone_usd`` (the ``_usd`` postfix is dropped).
-        Like :meth:`write_attribute`, clone is ordinal-keyed: ``ordinal`` must be
-        greater than the write floor or the op fails with a write-floor violation.
-        The source must exist; each target must not already exist.
-        """
-        self.clone_async(source_path, target_paths, ordinal).wait()
+        The ordinal must exceed the global write floor and the effective floors
+        of the source subtree's attributes. For nonempty targets, it must also
+        exceed the effective floors of every reproduced destination attribute,
+        including copied prim type, applied schema and ancestor type metadata.
+        These floor checks run at execution time under every admission policy.
 
-    def clone_async(self, source_path: str, target_paths: Sequence[str], ordinal: int) -> Operation:
-        """Enqueue a subtree clone of ``source_path`` to ``target_paths`` at ``ordinal`` (asynchronous)."""
+        Independently of the source floor checks, the configured history policy
+        checks retained destination-cell changes and every derived target prim's
+        lifecycle, including the effective ``usd-path`` floor. The
+        ``STRICTLY_INCREASING`` policy requires a newer ordinal than intersecting
+        retained changes; ``NONDECREASING`` allows equality but rejects older
+        ordinals. ``FLOOR_ONLY`` skips retained-history and separate lifecycle
+        admission. With no targets, only the source/global floor checks apply.
+        Copied cells record changes at ``ordinal``, so later customization needs
+        a newer ordinal under the strict policy; ``NONDECREASING`` permits the
+        same ordinal while it remains above applicable floors. Disjoint target
+        cells may share an ordinal.
+
+        The source must exist; each target must not already exist, and a target
+        path may appear only once, independently of the admission policy. Returns
+        the clone's :class:`CloneResult`. Execution failure raises
+        :class:`OvstageError`; use :meth:`fetch_clone_result` with the low-level
+        async path to inspect the clone's underlying error code.
+        """
+        return self.clone_async(source_path, target_paths, ordinal).wait().result()
+
+    def clone_async(self, source_path: str, target_paths: Sequence[str], ordinal: int) -> CloneOperation:
+        """Enqueue a subtree clone of ``source_path`` to ``target_paths`` at ``ordinal`` (asynchronous).
+
+        Returns a :class:`CloneOperation` — an :class:`Operation` whose
+        :meth:`~CloneOperation.result` yields the :class:`CloneResult` once the
+        clone has completed (``op.wait().result()``).
+        The source, target and ordinal requirements are those of :meth:`clone`.
+        Enqueue success does not guarantee execution success: call ``wait()``
+        to observe completion errors.
+        """
         targets = list(target_paths)
         src = _b.ovx_string_t(source_path)
         keep: list = [src]
@@ -708,11 +996,43 @@ class Stage:
             keep.append(arr)
             tgt_ptr = ctypes.cast(arr, ctypes.POINTER(_b.ovx_string_t))
         res = self._lib.ovstage_clone(self._require_inst(), src, tgt_ptr, len(targets), check_ordinal(ordinal))
-        return Operation(self, res.status, res.op_index, keepalive=keep)
+        return CloneOperation(self, res.status, res.op_index, keepalive=keep)
+
+    def fetch_clone_result(self, op_or_id, timeout: int = TIMEOUT_INFINITE) -> CloneResult:
+        """Fetch a clone's completion report by op id (low-level ``ovstage_fetch_clone_result``).
+
+        The report is per-op state that lives until the op is released, so this is
+        the C-shaped path — ``Stage.wait_op`` / ``fetch_clone_result`` /
+        ``Stage.release_op`` — and the way to observe a failed clone's own error
+        code (``wait()`` reports every failure as ``OP_FAILED``). After
+        :meth:`CloneOperation.wait`, which releases the op, it raises
+        ``INVALID_HANDLE``; use :meth:`CloneOperation.result` there instead.
+
+        :param op_or_id: the :class:`CloneOperation` or its integer op id.
+        :param timeout: max nanoseconds to wait for completion; ``0`` polls.
+        :raises OvstageError: ``TIMEOUT`` while the clone is pending (it stays
+            waitable), ``INVALID_HANDLE`` for an id that is not a live clone op, or
+            the clone's own failure code with its message.
+        """
+        op_id = check_handle(getattr(op_or_id, "op_id", op_or_id), "op_id")
+        fn = self._flat_symbol("ovstage_fetch_clone_result")
+        raw = _b.ovstage_clone_result_t()
+        code = fn(self._require_inst(), op_id, check_timeout(timeout), ctypes.byref(raw))
+        if code != _b.OVSTAGE_OK:
+            # Synchronous rejections record their detail in the thread-local slot;
+            # a clone that ran and failed left its message on the op.
+            synchronous = (_b.OVSTAGE_ERROR_INVALID_ARGUMENT, _b.OVSTAGE_ERROR_INVALID_HANDLE, _b.OVSTAGE_ERROR_TIMEOUT)
+            raise OvstageError(code, self._last_error() if code in synchronous else self._last_op_error(op_id))
+        return CloneResult(
+            prims_cloned=int(raw.prims_cloned),
+            target_count=int(raw.target_count),
+            source_prim_count=int(raw.source_prim_count),
+            ordinal=int(raw.ordinal),
+        )
 
     # -- hierarchy ---------------------------------------------------------
     def get_hierarchy_computation_models(self) -> List[HierarchyComputationModelDesc]:
-        """Return the hierarchy computation models supported by this backend."""
+        """Return the hierarchy computation models supported by this runtime."""
         fn = self._flat_symbol("ovstage_get_hierarchy_computation_models")
         models = ctypes.POINTER(_b.ovstage_hierarchy_computation_model_desc_t)()
         count = ctypes.c_size_t()
@@ -732,7 +1052,17 @@ class Stage:
         output_ordinal: int,
         model: int = HierarchyComputationModel.DEFAULT_CPU,
     ) -> None:
-        """Compute hierarchy-derived data for ``input_ordinal`` (blocking)."""
+        """Compute hierarchy-derived world transforms (blocking).
+
+        Computation uses the currently connected hierarchy. Children may compute
+        as roots while their parents remain unavailable.
+
+        The computation uses the latest committed inputs. It records the
+        rewritten ``omni:fabric:worldMatrix`` rows at ``output_ordinal``, also
+        when the column is already sealed there. Compute before you seal when
+        consumers need a complete snapshot at that ordinal. The current
+        implementation ignores ``input_ordinal``.
+        """
         self.compute_hierarchy_async(input_ordinal, output_ordinal, model).wait()
 
     def compute_hierarchy_async(
@@ -741,7 +1071,14 @@ class Stage:
         output_ordinal: int,
         model: int = HierarchyComputationModel.DEFAULT_CPU,
     ) -> Operation:
-        """Enqueue hierarchy-derived data computation for ``input_ordinal``."""
+        """Enqueue hierarchy-derived world transform computation.
+
+        The computation uses the latest committed inputs. It records the
+        rewritten ``omni:fabric:worldMatrix`` rows at ``output_ordinal``, also
+        when the column is already sealed there. Compute before you seal when
+        consumers need a complete snapshot at that ordinal. The current
+        implementation ignores ``input_ordinal``.
+        """
         fn = self._flat_symbol("ovstage_compute_hierarchy")
         res = fn(
             # Range-only on purpose: model ids are discovered at runtime via
@@ -753,7 +1090,12 @@ class Stage:
         return Operation(self, res.status, res.op_index)
 
     def get_hierarchy(self, path_list: int, ordinal: int, relation: int) -> HierarchyResult:
-        """Return parent/children/siblings for an ordered path list (blocking)."""
+        """Return parent/children/siblings for an ordered path list (blocking).
+
+        This reads the current committed hierarchy when the operation
+        executes. ``ordinal`` is echoed as a caller-supplied tag; it does not
+        select a historical hierarchy snapshot.
+        """
         hierarchy = self.get_hierarchy_async(path_list, ordinal, relation)
         try:
             hierarchy.wait()
@@ -831,7 +1173,7 @@ class Stage:
             hierarchy._rollback_release()
         return Operation(self, res.status, res.op_index)
 
-    # -- map / unmap (zero-copy write) -------------------------------------
+    # -- map / unmap (mapped writes) ---------------------------------------
     def map_attribute(
         self,
         query,
@@ -842,25 +1184,53 @@ class Stage:
         dtype: Optional[DLDataType] = None,
         semantic: int = 0,
         element_sizes: Optional[Sequence[int]] = None,
+        attribute_mode: AttributeMode = AttributeMode.REJECT,
+        placement: Optional[Placement] = None,
     ) -> "Map":
-        """Reserve a zero-copy map session for an attribute.
+        """Reserve a map session for writing an attribute.
 
-        ``dtype`` is the element storage type used only when the column does not
-        yet exist (the full per-element tuple width must be encoded in
-        ``dtype.lanes``); it is ignored when the attribute already has a type.
-        Fixed-size map groups expose the same lane-canonical layout as raw
-        reads: ``ndim=1``, ``shape=(data_rows,)``, and the complete tuple width
-        in ``dtype.lanes``. Use the group's ``data_row_index(local)`` to resolve
-        a logical element through any data index map. Map groups do not
-        reconstruct a convenience write shape such as ``(N, 4, 4)``.
+        ``dtype`` specifies the element storage type, with the complete tuple
+        width in ``dtype.lanes``. It is required for a new attribute. If omitted,
+        the existing schema must be unambiguous for the target prims. A requested
+        dtype that conflicts with existing storage, or semantic that conflicts
+        with an authored role on a target prim/name, is rejected; delete that
+        attribute before mapping it with a new schema, or pass
+        ``attribute_mode=AttributeMode.FORCE`` with ``dtype`` to replace that schema
+        when each group commits, under the same rules as a forcing write, including
+        when a commit fails after the previous schema has ended. Setup and each commit
+        are rejected while a prim they would replace has an outstanding read. An
+        omitted semantic
+        adopts an unambiguous compatible existing identity. Specify dtype and
+        semantic when the target prims have multiple same-name identities.
+        Fixed-size map groups expose the same scalar-lane layout as reads:
+        scalar lanes with shape ``(data_rows,)`` for scalars,
+        ``(data_rows, C)`` for tuples, or ``(data_rows, S, S)`` for square
+        matrices. Use the group's ``data_row_index(local)`` to resolve
+        a logical element through any data index map. Shapes follow the stored
+        type and semantic rather than the original convenience write shape.
         ``semantic`` is the :class:`AttributeSemantic` (or raw
         ``ovstage_attribute_semantic_t`` value) carried on the map. Geometric
-        semantics and TIME_CODE record a role on the column when the map
-        creates it; ID semantics select the corresponding ID storage type and
+        semantics and TIME_CODE record a role on the column when unmap
+        succeeds; ID semantics select the corresponding ID storage type and
         require pre-interned ids in the map buffer (``TOKEN_ID`` /
         ``RELATIONSHIP_PATH_ID`` use ``dtype = (kDLUInt, 64, 1)``,
         ``CONNECTION_PATH_ID`` uses ``dtype = (kDLUInt, 64, 2)``).
         ``element_sizes`` gives per-prim element counts for ragged columns.
+
+        Setup and publication use the admission policy described by
+        :meth:`write_attribute`, against the affected cells and applicable prim
+        lifecycles. Every policy retains the applicable write-floor checks.
+        A successful enqueue can still fail ordinal admission during setup,
+        before writable groups are made available. Observe setup failure through
+        the returned map's ``wait()`` or ``fetch_next()``.
+        Successful setup only makes writable staging buffers available. It does
+        not change stage values, create prims or attributes, modify schemas or
+        hierarchy, or record value or prim-lifecycle changes at the session's
+        ordinal. These effects commit only for groups whose unmap succeeds.
+        Commit rechecks the current layout, type/semantic compatibility, prim
+        creation policy, ordinal admission and read overlap, so a ready map can
+        still fail to commit. See :class:`Map`
+        for failure and finalization rules.
         """
         keep: list = []
         sizes_ptr = None
@@ -882,12 +1252,22 @@ class Stage:
         # Range-only on purpose -- see the write_attribute site.
         desc.semantic = check_enum(semantic, "semantic")
         desc.prim_mode = check_enum_member(prim_mode, PrimMode, "prim_mode")
+        desc.attribute_mode = check_enum_member(attribute_mode, AttributeMode, "attribute_mode")
         keep.append(desc)
         handle = _b.ovstage_map_handle_t()
-        res = self._api.ovstage_map_attribute(
-            self._inst, _handle(query), ctypes.byref(desc), check_ordinal(ordinal),
-            sizes_ptr, sizes_count, ctypes.byref(handle),
-        )
+        if placement is None:
+            res = self._api.ovstage_map_attribute(
+                self._inst, _handle(query), ctypes.byref(desc), check_ordinal(ordinal),
+                sizes_ptr, sizes_count, ctypes.byref(handle),
+            )
+        else:
+            # The placed map takes the placement *before* out_map_handle.
+            c_placement = _require_placement(placement)._to_c()
+            keep.append(c_placement)
+            res = self._api.ovstage_map_attribute_on_device(
+                self._inst, _handle(query), ctypes.byref(desc), check_ordinal(ordinal),
+                sizes_ptr, sizes_count, ctypes.byref(c_placement), ctypes.byref(handle),
+            )
         return Map(self, int(handle.value), Operation(self, res.status, res.op_index, keepalive=keep))
 
     def fetch_map_next(self, mapping, timeout: int = TIMEOUT_INFINITE) -> Optional[MapGroup]:
@@ -897,18 +1277,64 @@ class Stage:
             return None
         if code != _b.OVSTAGE_OK:
             raise OvstageError(code, self._last_error())
-        return MapGroup(grp)
+        return MapGroup(grp, mapping=mapping if isinstance(mapping, Map) else None)
 
     def unmap_group(
         self, mapping, group: MapGroup, cuda_event: Optional[int] = None, cuda_stream: Optional[int] = None
     ) -> Operation:
+        """Enqueue a group commit; its changes take effect once on success.
+
+        An accepted commit that fails makes the session terminal. Finalize it
+        with :meth:`unmap_attribute`; retry requires a new session. Previously
+        committed groups remain committed. See :class:`Map` for failure rules.
+        The exception is a session mapped with a :class:`Placement` carrying an
+        ``availability_event``: an otherwise successful commit whose event CUDA
+        refuses to record fails with ``OP_FAILED`` after committing, its changes
+        stay recorded, and the session stays open, so later commits and final
+        unmap proceed as usual.
+
+        Unplaced maps use CPU storage: leave ``cuda_event`` / ``cuda_stream``
+        unset for those maps. A CPU commit with payload rejects a non-zero
+        value as an accepted, terminal failure. For CUDA-placed maps, these
+        arguments supply the source handoff before the commit reads mapped
+        values. A cleanup-only final unmap -- every group already committed --
+        does not inspect the handoff.
+        """
         sync = _b.ovstage_cuda_sync_t(cuda_stream or 0, cuda_event or 0)
-        res = self._api.ovstage_unmap_group(self._inst, _handle(mapping), ctypes.byref(group.raw), sync)
+        handle = _handle(mapping)
+        group._claim_unmap()
+        try:
+            res = self._api.ovstage_unmap_group(self._inst, handle, ctypes.byref(group.raw), sync)
+        except Exception:
+            group._rollback_unmap()
+            raise
+        if res.status != _b.OVSTAGE_OK:
+            group._rollback_unmap()
         return Operation(self, res.status, res.op_index)
 
     def unmap_attribute(
         self, mapping, cuda_event: Optional[int] = None, cuda_stream: Optional[int] = None
     ) -> Operation:
+        """Enqueue remaining commits and release the map handle.
+
+        An accepted finalization consumes the handle even if execution fails.
+        If all groups committed earlier, it only releases the session, without
+        reapplying changes or repeating commit admission checks. If an accepted
+        group commit failed, it releases the session and reports the retained
+        failure without committing remaining data; a group commit that failed
+        only because its ``availability_event`` could not be recorded is not
+        such a failure (see :meth:`unmap_group`). An otherwise successful
+        finalization whose own event cannot be recorded fails with
+        ``OP_FAILED`` after committing the remaining groups, whose changes stay
+        recorded.
+
+        Unplaced maps use CPU storage: leave ``cuda_event`` / ``cuda_stream``
+        unset for those maps. A CPU commit with payload rejects a non-zero
+        value as an accepted, terminal failure. For CUDA-placed maps, these
+        arguments supply the source handoff before the commit reads mapped
+        values. A cleanup-only final unmap -- every group already committed --
+        does not inspect the handoff.
+        """
         claimed = isinstance(mapping, Map)
         handle = mapping._claim_unmap() if claimed else _handle(mapping)
         sync = _b.ovstage_cuda_sync_t(cuda_stream or 0, cuda_event or 0)
@@ -933,6 +1359,8 @@ class Stage:
 
         Advances clamp to the current value, so a non-monotonic ordinal is a no-op
         rather than an error.
+
+        Attribute aliases advance one shared floor.
         """
         desc = _b.ovstage_write_floor_desc_t()
         desc.ordinal = check_ordinal(ordinal)
@@ -955,7 +1383,10 @@ class Stage:
         return OrdinalQuery(self, int(handle.value), Operation(self, res.status, res.op_index))
 
     def get_attribute_write_floor(self, attribute: Optional[Union[int, str]] = None) -> "OrdinalQuery":
-        """Query a per-attribute write floor, or the global write floor if ``attribute`` is None."""
+        """Query a per-attribute write floor, or the global write floor if ``attribute`` is ``None``.
+
+        Aliases of one stored column report the same floor.
+        """
         sot = _b.ovx_string_or_token_t() if attribute is None else _b.make_string_or_token(attribute)
         handle = _b.ovstage_ordinal_query_handle_t()
         res = self._api.ovstage_get_attribute_write_floor(self._inst, sot, ctypes.byref(handle))
@@ -983,10 +1414,11 @@ class Stage:
 
     # ── resources ────────────────────────────────────────────────────────────
     def get_path_dictionary(self) -> "_b.path_dictionary_instance_p":
-        """Return the instance's shared path-dictionary bundle (``{vtable, context}``).
+        """Return the instance's path-dictionary bundle (``{vtable, context}``).
 
-        The dictionary is owned by ovstage and stays valid while at least one
-        instance is alive; callers must not tear it down. This is the raw bundle
+        The dictionary is owned by this instance and stays valid while it is
+        alive; list references do not extend that lifetime. Callers must not
+        tear the dictionary down. This is the raw bundle
         the binding dispatches through, **not** a :class:`ovstage.PathDictionary`
         — to work with tokens, paths, and path lists from Python, construct
         ``PathDictionary(stage)``, which calls this for you.
@@ -1006,8 +1438,7 @@ class _HandleObject:
     even when an error interrupts processing::
 
         with stage.query(filter=f) as q:
-            q.wait()
-            count = q.result().total_prim_count
+            count = q.wait().result().total_prim_count
         # release() runs on block exit
 
     If a handle is dropped without release, :meth:`__del__` issues a best-effort
@@ -1043,15 +1474,25 @@ class _HandleObject:
     def _rollback_release(self) -> None:
         self._released = False
 
-    def wait(self, timeout: int = TIMEOUT_INFINITE) -> None:
-        """Wait on the reserving op (no-op for synchronously-created handles)."""
+    def wait(self: _HandleT, timeout: int = TIMEOUT_INFINITE) -> _HandleT:
+        """Wait on the reserving op and return this handle.
+
+        Returning the handle lets the follow-on call chain — ``group =
+        read.wait().fetch_next()`` — inside the handle's ``with`` block (chaining
+        on the temporary drops the handle unreleased). Waiting is also what
+        releases the reserving op, so it is not redundant with the fetch's own
+        wait. A synchronously-created handle has no reserving op: the call is a
+        no-op that still returns the handle. See :meth:`Operation.wait` for the
+        timeout and error contract.
+        """
         if self.op is not None:
             self.op.wait(timeout)
+        return self
 
     def __int__(self) -> int:
         return self.handle
 
-    def __enter__(self) -> "_HandleObject":
+    def __enter__(self: _HandleT) -> _HandleT:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
@@ -1128,31 +1569,57 @@ class Read(_HandleObject):
 
 
 class Map(_HandleObject):
-    """A reserved zero-copy map (write) session.
+    """A reserved map session for writing an attribute.
 
     Reserve via :meth:`Stage.map_attribute`, iterate writable groups with
     :meth:`groups` / :meth:`fetch_next`, fill each group, and commit it with
     :meth:`unmap_group`. Finalize with :meth:`unmap`, which commits any
     remaining groups and releases the handle.
 
-    An outstanding map pins session state (a reserved layout) and blocks
-    overlapping writes, maps, and deletes on the same prims until it is
-    unmapped. To guarantee release even when an error interrupts the fill loop,
+    Setup only prepares writable staging buffers; :meth:`Stage.map_attribute`
+    describes the effects deferred until successful commit. An outstanding map
+    blocks overlapping operations on the same canonical attribute and prims.
+    Commit rechecks admission against current state, so successful setup does
+    not guarantee a successful commit.
+
+    Fetched groups retain this session, preventing garbage collection from
+    finalizing it while a group is still in use. Accepted group or final unmap
+    submissions invalidate the affected groups immediately. Previously exported
+    arrays and DLPack views must no longer be accessed after submission.
+
+    Each successful group commits its values, any prim or attribute creation,
+    schema or hierarchy changes, and ordinal change records once. A failed group
+    does not record these as completed changes and does not undo groups committed
+    earlier. Map commits are not transactional: a failed commit may have changed
+    some or all stored rows, and those changes can remain observable. No rollback
+    or atomicity is guaranteed.
+
+    An accepted group commit that fails during execution makes the session
+    terminal. Its groups cannot be retried. Final :meth:`unmap` releases the
+    session and reports the retained failure without committing remaining data.
+    Recovery requires a new session or another write operation. The exception
+    is a commit that fails only because a placement's ``availability_event``
+    could not be recorded: it has committed, and the session stays open (see
+    :meth:`Stage.unmap_group`). If all groups
+    committed successfully, final unmap only releases the session; it neither
+    reapplies changes nor repeats commit admission checks. An accepted final
+    unmap consumes the handle even when execution fails. To finalize on exit,
     use the session as a context manager::
 
         with stage.map_attribute(query, attr, ordinal=o) as m:
-            m.wait()
-            for mg in m.groups():
+            for mg in m.wait().groups():
                 fill(mg)
-                m.unmap_group(mg)
+                m.unmap_group(mg).wait()
 
     Leaving the ``with`` block — normally or via an exception — calls
-    :meth:`unmap`. The C API has no cancel: unmap always *commits* whatever the
-    map buffers currently hold, so an exception mid-fill still persists the
-    partially filled storage (there is no rollback). If a session is dropped
-    without ever unmapping, :meth:`__del__` issues a best-effort unmap and emits
-    a :class:`ResourceWarning`; rely on the context manager (or an explicit
-    ``unmap()``) rather than the finalizer.
+    :meth:`unmap`. The C API has no cancel: for a session without a prior accepted
+    commit failure, final unmap attempts to commit whatever the remaining buffers
+    hold. An exception mid-fill can therefore commit partially filled buffers if
+    finalization succeeds. If a session is dropped without unmapping,
+    :meth:`__del__` issues a best-effort unmap and a
+    :class:`ResourceWarning`; it does not wait for or report asynchronous commit
+    failures. Normal context-manager exit waits and reports errors; explicit
+    ``unmap().wait()`` also observes completion.
     """
 
     def __init__(self, stage: Stage, handle: int, op: Optional[Operation]):
@@ -1202,11 +1669,13 @@ class Map(_HandleObject):
         """Commit remaining groups and release the map handle (see class docstring)."""
         return self._stage.unmap_attribute(self, cuda_event, cuda_stream)
 
-    def __enter__(self) -> "Map":
-        return self
-
     def __exit__(self, exc_type, exc, tb) -> None:
-        if self._unmapped:
+        # `not self.handle` matches _HandleObject.__exit__ and Map.__del__: a
+        # synchronously rejected map_attribute returns Map(handle=0), and
+        # unmapping handle 0 fails with INVALID_ARGUMENT, masking the real setup
+        # error. The failed unmap also rolls _unmapped back to False, so without
+        # this guard an explicit unmap() leaves the bogus call to repeat here.
+        if self._unmapped or not self.handle:
             return
         op = self.unmap()
         if exc_type is None:

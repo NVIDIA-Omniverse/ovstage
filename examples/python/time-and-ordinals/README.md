@@ -116,7 +116,7 @@ under `../../../skills/` can reference; keep them intact when editing.
   the entry point exits nonzero. A real application would handle errors
   instead.
 - Everything runs on the CPU; no GPU is needed.
-- The population API's `time_code` arguments are **seconds**, converted to
+- The population API's `time` arguments are **seconds**, converted to
   timecodes via the layer's `timeCodesPerSecond` (16 here), so 0.375 s samples
   timecode 6.
 - `update_from_usd_time` re-evaluates time-sampled values in the domains

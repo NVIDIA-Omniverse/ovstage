@@ -11,24 +11,32 @@
 Population (USD → ovstage)
 ==========================
 
-The population API (``ovstage_population.h``) is the bridge that ingests composed
-USD content into the runtime stage. It is a self-contained C API with its own
-asynchronous model — ``ovstage_population_enqueue_result_t`` and
-``ovstage_population_wait_op`` — that runs parallel to the data-plane
-:doc:`submit/observe model </concepts/async_model>`.
+:term:`Population` transfers selected, composed USD data into the
+:term:`runtime stage <Runtime stage>`. Use ``ovstage.population`` to load a
+scene, apply USD edits, or sample animated values at an :term:`ordinal <Ordinal>`.
+Population has its own operation queue and waits, separate from direct
+attribute reads and writes. See :doc:`/concepts/async_model`.
 
 .. note::
 
    These entry points are **pre-release and provisional** ("Draft — API in
    flux").
 
+Supply an ordinal above the applicable write floors and wait for population to
+complete. Apply any direct writes that override populated values afterward,
+using a newer ordinal. Once all updates are complete, advance the write floor
+and wait for completion before reading or rendering the results. See
+:ref:`population-ordinal-ownership` for sequencing and
+:ref:`ordinal-admission-policies` for policy configuration.
+
 Loading a Scene
 ---------------
 
-``ovstage_population_open_usd_from_file`` (and ``_from_string``) loads a USD
-scene into the runtime table in one op at a chosen ordinal. As with any write,
-seal the ordinal with ``advance_write_floor`` before reading the populated prims
-back:
+Use :func:`ovstage.population.open_usd()` for a file or
+:func:`ovstage.population.open_usd_from_string()` for USDA text. Both block
+until population completes; their ``_async`` variants return an operation.
+Advance the :term:`watermark <Watermark>` and wait before reading the values.
+The following examples load a scene at a chosen ordinal:
 
 .. tab-set::
 
@@ -53,77 +61,305 @@ back:
 Population Domains
 ------------------
 
-Loads take a population **domain** bitmask (``PopulationDomain`` /
-``ovstage_population_domain_t``: ``NONE``, ``RENDERING``, ``PHYSICS``, ``ALL``)
-selecting which consumer's attribute set to populate.
+A population domain is a predefined selection of USD prims and properties
+needed by a consuming library. Pass ``PopulationDomain`` values through the
+``domains`` argument when loading USD:
 
-Descriptions and Selectors
---------------------------
+.. list-table::
+   :header-rows: 1
+   :widths: 24 76
 
-A **description** (``ovstage_population_desc_t`` / ``Desc``) says what to populate. It
-carries a ``domains`` bitmask and a list of **selectors**; the ``_with_desc`` entry
-points take an array of them, whose ``domains`` are OR-ed together and whose selectors
-are combined in array order.
+   * - Domain
+     - What it selects
+   * - ``RENDERING``
+     - Scene data for rendering, including meshes, lights, materials, and cameras.
+   * - ``PHYSICS``
+     - Scene data for physics, including bodies, colliders, joints, materials,
+       and the geometry and hierarchy they need.
+   * - ``ALL``
+     - Both ``RENDERING`` and ``PHYSICS``. This does not mean every USD property.
+   * - ``NONE``
+     - No predefined selection. Use explicit selectors to choose the prims and
+       properties to populate.
 
-A **selector** pairs a **prim predicate** — which prims it puts in scope — with a
-**property predicate** — which of their properties are published — and may also name
-prim and property metadata paths. A prim in scope of more than one selector publishes
-what any of them selects.
+Combine domains with bitwise OR, for example
+``PopulationDomain.RENDERING | PopulationDomain.PHYSICS``. Selecting a domain
+loads data; it does not start a renderer or run a physics simulation. Explicit
+selectors add to the domain's selection, as described below.
 
-Predicates are trees. Each has a *kind* and, depending on the kind, either a list of
-string values or a list of subpredicates. A kind that takes values matches when any one
-of them matches — the values of a single predicate are a disjunction, never a
-conjunction — so a ``HAS_TYPE`` over ``Cube`` and ``Sphere`` matches a prim that is
-either. Requiring more than one condition, or a negated one, is what ``AND`` / ``OR`` /
-``NOT`` are for.
+.. _population-physics-selection:
 
-A prim predicate reaches a property predicate through ``HAS_PROPERTY``, so a prim can
-be gated on the properties it carries.
+Physics Selection
+~~~~~~~~~~~~~~~~~
 
-A predicate kind the build cannot honour, a graph that nests too deeply, one that refers
-back to itself, and one that walks past the node limit are all rejected at enqueue with a
-diagnostic — never populated as a silent no-op. Nested predicates are referenced, not
-copied, so every node must outlive the call.
+``PHYSICS`` selects prims with supported physics types or applied APIs, including
+scenes, rigid bodies, colliders, joints, articulations, and physics materials.
+It also includes supporting prims needed to interpret that data:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 70
+
+   * - Data
+     - What population includes
+   * - Physics properties
+     - Attributes and relationships whose names are declared by the supported
+       physics schemas. Unrelated geometry and display properties inherited
+       from base schemas are excluded unless a separate rule includes them.
+   * - Shape geometry
+     - Selected geometry properties for colliders and other supported physics
+       roles, such as mesh points and topology or primitive dimensions. A plain
+       render mesh is not selected just because it has geometry.
+   * - Relationship targets and subsets
+     - Supporting geometry named by physics relationships, and ``GeomSubset``
+       children of colliders, including their indices and element type.
+   * - Materials
+     - Physics material properties and bindings, including prims that author
+       ``material:binding:physics`` to a physics material even when those prims
+       have no physics API themselves.
+   * - Point instancers
+     - ``PointInstancer`` prims whose prototypes contain physics data. Includes
+       their schema properties except ``extent``, plus ``inactiveIds`` metadata.
+   * - Hierarchy and metadata
+     - Ancestors and transform data, as described in
+       :ref:`population-ancestors-transforms`. Stage metadata includes
+       ``metersPerUnit``, ``kilogramsPerUnit``, and ``upAxis``. On prims selected
+       by a physics schema, population also requests
+       ``customData:physics:localSpaceVelocities``.
+
+Selected attributes can use schema defaults without an authored value. Some
+physics defaults are computed instead: for example, an unauthored scene gravity
+uses the stage's units and up axis. Population also resolves physics material
+bindings and supported physics collections for consumers.
+
+Applying an arbitrary custom API does not make its properties part of the
+physics domain. Add explicit selectors for application attributes. Those
+selectors extend the physics selection; they do not restrict it.
+
+The examples below use ``scene.usda`` from the
+:doc:`population example </examples/population>`. It contains a rigid-body Cube
+at ``/World/Body`` below an Xform at ``/World``. Load its physics data first.
+The later snippets use the same ``stage`` and ``paths`` inside the Python
+context managers; in C, keep ``stage`` and ``dict`` until the end of the example.
+``scene`` names the adjacent ``scene.usda`` file:
 
 .. tab-set::
 
    .. tab-item:: Python
 
-      .. filtered-literalinclude:: ../../tests/python/test_population.py
+      .. filtered-literalinclude:: ../../examples/python/population/main.py
          :language: python
-         :start-after: # [snippet:populate-narrowed]
-         :end-before: # [/snippet:populate-narrowed]
-         :exclude-pattern: ^\s*#\s*\[/?snippet:
-         :dedent:
+         :snippets: population-imports, population-setup
 
    .. tab-item:: C
 
-      .. filtered-literalinclude:: ../../tests/c/test_population.cpp
-         :language: cpp
-         :start-after: // [snippet:populate-narrowed-c]
-         :end-before: // [/snippet:populate-narrowed-c]
-         :exclude-pattern: ^\s*//\s*\[/?snippet:
-         :dedent:
+      ``waitPop()`` checks population completion; ``waitOp()`` waits for runtime
+      operations and releases them. ``check()`` and ``checkOvx()`` stop on errors.
 
-See the ``ovstage_population_prim_predicate_kind_t`` and
-``ovstage_population_property_predicate_kind_t`` enumerators in
-``ovstage_population_predicate.h`` for what each kind matches.
+      .. filtered-literalinclude:: ../../examples/c/population/main.cpp
+         :language: cpp
+         :snippets: population-setup-c
+
+.. _population-rendering-selection:
+
+Rendering Selection
+~~~~~~~~~~~~~~~~~~~
+
+``RENDERING`` builds the scene data needed by the renderer. It handles supported
+geometry, lights, cameras, materials, volumes, and render settings, together
+with their transforms, hierarchy, and instances. It does not copy every USD
+prim and property unchanged.
+
+Property selection depends on the kind of prim:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 70
+
+   * - Data
+     - What population includes
+   * - Geometry, lights, and cameras
+     - The attributes handled for that prim type. Values can come from
+       authored opinions, schema defaults,
+       or rendering-specific defaults. Some runtime attributes are derived,
+       such as combined transforms.
+   * - Applied APIs
+     - Properties of the APIs supported by the relevant rendering handler.
+       Registering and applying an arbitrary API does not guarantee that all
+       its properties are populated.
+   * - Primvars
+     - Supported primvars are collected separately. They are not restricted
+       to a fixed list of schema attributes.
+   * - Materials and shaders
+     - Material networks, shader inputs and outputs, and their connections
+       use material-specific population. These properties need not be declared
+       in a registered USD schema.
+   * - ``RenderSettings``, ``RenderProduct``, and ``RenderVar``
+     - Their supported rendering properties and an additional pass over
+       supported authored attributes.
+   * - Other custom attributes
+     - Generally omitted unless explicitly selected or the extra pass
+       described below is enabled.
+
+Schema-defined properties can therefore be present even when they are absent
+from the USDA text. Conversely, an authored custom property can be absent from
+the runtime stage. Attribute presence is not evidence that the value was authored.
+
+For application data, set a population description's ``domains`` to
+``PopulationDomain.RENDERING`` and provide explicit selectors as described
+below. The selectors add properties; they do not narrow the rendering
+domain's selection.
+
+A boolean ``populateAllAuthoredAttributes`` entry in the root or session layer's
+``customLayerData``, set to true, enables an extra pass over authored attributes on prims
+already populated. The hosting application can also enable this behavior.
+The extra pass skips attributes
+already present or without values, ``xformOp*`` and ``primvars:*`` attributes,
+shader prims, instance proxies, and unsupported types, including asset arrays,
+string arrays, and time codes.
+Use selectors when you need to name exactly which additional properties to copy.
+
+Selecting Prims and Properties
+------------------------------
+
+Use :class:`ovstage.population.Desc` for more control. It contains ``domains``
+and a list of :class:`ovstage.population.Selector` objects. The ``_with_desc``
+functions accept several descriptions; they combine the domains with OR and
+append the selectors in order.
+
+Each selector pairs a prim condition with a property condition. It selects
+which :term:`prims <Prim>` to populate and which of their properties to include.
+If several selectors match, their property selections are combined. An omitted
+property condition selects no properties. Selectors
+can also request prim and property metadata.
+
+Build conditions with :class:`ovstage.population.PrimPredicate` and
+:class:`ovstage.population.PropertyPredicate`:
+
+* Multiple values in one condition mean “match any.” For example,
+  :meth:`has_type("Cube", "Sphere") <ovstage.population.PrimPredicate.has_type>` matches either type.
+* Combine conditions with :meth:`and_() <ovstage.population.PrimPredicate.and_>`, :meth:`or_() <ovstage.population.PrimPredicate.or_>`, and :meth:`not_() <ovstage.population.PrimPredicate.not_>`.
+* :meth:`has_property() <ovstage.population.PrimPredicate.has_property>` selects a prim by a condition on its properties.
+
+Unsupported kinds, cycles, or graphs exceeding the depth or node limits fail
+at submission with a diagnostic. In C, predicate nodes and string arrays are
+borrowed and must remain valid through the call. Python builders retain them.
+
+For the remaining examples, select ``/World/Body`` and name the properties to
+populate. The description also requests metadata, explained below. Populate
+these values at ordinal 2, after the physics-domain load at ordinal 1:
+
+.. tab-set::
+
+   .. tab-item:: Python
+
+      .. filtered-literalinclude:: ../../examples/python/population/main.py
+         :language: python
+         :snippets: population-paths, population-property-metadata, population-stage-metadata
+
+   .. tab-item:: C
+
+      .. filtered-literalinclude:: ../../examples/c/population/main.cpp
+         :language: cpp
+         :snippets: population-paths-c, population-property-metadata-c, population-stage-metadata-c
+
+See :class:`ovstage.population.PrimPredicateKind` and
+:class:`ovstage.population.PropertyPredicateKind` for the supported conditions.
+
+Which Properties Become Runtime Attributes?
+-------------------------------------------
+
+Selecting a prim does not select all its properties. Domains choose the
+properties they need; explicit selectors add the properties their conditions
+match. Schema membership is not required for an explicit selection: the example
+above includes the custom ``temperature`` attribute by name.
+
+For explicit selectors and the ``PHYSICS`` domain, population reads the selected
+properties through USD:
+
+* A selected attribute is populated if USD resolves a value and ovstage supports
+  its value type. The value can come from an authored default, a time sample, or
+  a registered schema's default. It need not be authored in the scene file.
+* A schema-declared attribute with no resolved value is skipped. Merely
+  declaring or selecting an attribute does not create a runtime value.
+* A selected relationship is populated only if it has authored targets.
+  An explicitly authored empty target list is included as an empty array.
+
+Schema defaults require the schema definitions to be registered with the USD
+runtime used by population. For additional schema families, call
+:func:`ovstage.population.register_usd_schemas()` before any code in the process
+first reads USD schema definitions, including population, export, or another USD
+consumer. Registration makes those definitions available; it does not select
+their properties for population.
+
+Domains can also produce derived data or supply domain-specific defaults.
+See :ref:`population-rendering-selection` for the rendering domain’s selection
+and conversion rules.
+
+The example scene declares ``/World/Body`` as a Cube but never authors ``size``.
+The selector above explicitly requests both ``size`` and the custom
+``temperature`` attribute. Reading them returns the Cube schema's default size
+of 2 and the authored temperature of 20:
+
+.. tab-set::
+
+   .. tab-item:: Python
+
+      .. filtered-literalinclude:: ../../examples/python/population/main.py
+         :language: python
+         :snippets: population-default, population-numeric
+
+   .. tab-item:: C
+
+      .. filtered-literalinclude:: ../../examples/c/population/main.cpp
+         :language: cpp
+         :snippets: population-default-c, population-numeric-c
 
 USD Value Types
 ---------------
 
-What a value becomes in ovstage is fixed by its USD value type. With a description
-selecting arbitrary properties this is the contract you size and interpret a read
-against, so the whole mapping is below.
+The USD value type determines the runtime type. For schema attributes, this is
+the type declared by the schema:
 
-Three rules cover almost all of it:
+1. Numeric values retain their scalar type and bit width. DLPack lanes record
+   the component count.
+2. Arrays use the element's dtype with ``is_array=True``. Other values use one
+   fixed-size value per prim.
+3. Strings and paths become 64-bit identifiers resolved through the
+   :doc:`path_dictionary`.
+4. Numeric values authored in a different type are converted to the declared
+   type when possible; see `Values Authored in Another Type Than Declared`_.
 
-#. **Numerics keep their bytes.** The dtype's element type and width come from the USD
-   scalar type, its lane count from the number of components.
-#. **A USD array** populates with its element's dtype and ``is_array = true``. Everything
-   else populates flat, one fixed-size value per prim.
-#. **String-like types do not populate as text.** They are interned through the path
-   dictionary and populate as ``uint64`` ids, resolved back through the dictionary.
+The tables describe storage types and canonical write dtypes. Returned reads
+and maps expand component widths into trailing dimensions with scalar lanes;
+see :doc:`/concepts/dlpack_tensors`.
+
+The tables use ``{code, bits, lanes}`` for :class:`ovstage.DLDataType` and
+:class:`ovstage.AttributeSemantic` names for semantics.
+
+.. _population-implicit-conversions:
+
+Implicit Conversions
+~~~~~~~~~~~~~~~~~~~~
+
+Population converts some USD values for the :term:`runtime stage`:
+
+* **Strings and paths:** store identifiers from the :doc:`path_dictionary`.
+  Exceptions store text bytes; see `Properties That Do Not Follow Their USD Type`_.
+* **Assets:** store identifiers for the authored path and the path USD resolved.
+  Generic attribute population does not resolve the asset again; rendering
+  material inputs have the UDIM exception described below.
+* **Empty strings:** use identifier 0 when stored as identifiers. See `Empty Values`_.
+* **USD roles:** become attribute semantics. For example, ``point3f`` uses
+  three floats with ``POINT`` semantic.
+* **Schema-specific properties:** can use a different type or semantic.
+  See `Properties That Do Not Follow Their USD Type`_.
+* **Numeric type mismatches:** convert to the schema's declared type when possible.
+  See `Values Authored in Another Type Than Declared`_.
+* **Transforms:** combine USD transform operations into ``omni:xform``.
+  See :doc:`transforms`.
+
+:doc:`Export <exporting_to_usd>` uses the stored values, including these conversions.
 
 Numeric scalars
 ~~~~~~~~~~~~~~~
@@ -201,11 +437,29 @@ Numeric scalars
      - no
      - ``TIME_CODE``
 
-A **role-carrying** type populates exactly as the type it is built on and differs only in
-its semantic: ``point3f`` is ``{float, 32, 3}`` with ``POINT``, and ``normal3f``,
-``vector3f``, ``color3f`` and ``texCoord2f`` / ``texCoord3f`` likewise carry ``NORMAL``,
-``VECTOR``, ``COLOR`` and ``TEXTURE_COORDINATE``. ``frame4d`` is a ``matrix4d`` carrying
-``FRAME`` rather than ``MATRIX`` — the role wins where a type has both.
+USD roles change the semantic, not the storage type. For example, ``point3f``
+uses ``{float, 32, 3}`` with ``POINT``. The corresponding roles are ``NORMAL``
+for ``normal3f``, ``VECTOR`` for ``vector3f``, ``COLOR`` for ``color3f``, and
+``TEXTURE_COORDINATE`` for ``texCoord2f`` and ``texCoord3f``.
+``frame4d`` uses the same storage as ``matrix4d`` but has semantic ``FRAME``
+instead of ``MATRIX``.
+
+The scene authors ``float temperature = 20`` on ``/World/Body``. After selecting
+that property and populating at ordinal 2, read its value:
+
+.. tab-set::
+
+   .. tab-item:: Python
+
+      .. filtered-literalinclude:: ../../examples/python/population/main.py
+         :language: python
+         :snippets: population-numeric
+
+   .. tab-item:: C
+
+      .. filtered-literalinclude:: ../../examples/c/population/main.cpp
+         :language: cpp
+         :snippets: population-numeric-c
 
 String-like scalars
 ~~~~~~~~~~~~~~~~~~~
@@ -235,48 +489,112 @@ String-like scalars
      - no
      - ``PATH_EXPRESSION_STRING``
 
-An ``asset`` is the one that is two ids wide: it carries the ``(authored, resolved)``
-pair. ovstage does not resolve assets — the resolved half is whatever USD had resolved
-when the value was read.
+An ``asset`` stores an ``(authored, resolved)`` pair of identifiers. The resolved
+value is whatever USD supplied to generic attribute population; that path does
+not resolve the asset again. Rendering material inputs containing ``<UDIM>`` are
+an exception: rendering derives a resolved pattern from a tile that resolves.
+If no tile resolves, the resolved half is empty, even if USD supplied an anchored
+pattern; the authored half is retained. A ``string`` has semantic ``NONE``, so
+runtime semantic alone cannot distinguish it from ``uint64``. Consult the USD
+type when that distinction matters.
 
-A ``string`` populates with semantic ``NONE``, so semantic alone does not distinguish it
-from a plain ``uint64``. Read the USD type if you need to tell them apart.
+The authored ``token state = "ready"`` becomes an identifier. Resolve it through
+the path dictionary while the read group is alive:
+
+.. tab-set::
+
+   .. tab-item:: Python
+
+      .. filtered-literalinclude:: ../../examples/python/population/main.py
+         :language: python
+         :snippets: population-strings
+
+   .. tab-item:: C
+
+      .. filtered-literalinclude:: ../../examples/c/population/main.cpp
+         :language: cpp
+         :snippets: population-strings-c
 
 Arrays
 ~~~~~~
 
-A USD array populates with ``is_array = true`` and its element's dtype and semantic:
+A USD array populates with ``is_array=True`` and its element's dtype and semantic:
 ``float3[]`` is ``{float, 32, 3}``, and ``matrix4d[]`` is ``{float, 64, 16}`` with
 ``MATRIX``.
 
-String-like arrays carry one id per element, so the element count comes back directly
-rather than having to be recovered from the payload: ``token[]``, ``string[]`` and
-``pathExpression[]`` are ``{uint, 64, 1}``, and ``asset[]`` is ``{uint, 64, 2}`` with one
-pair per element.
+``token[]``, ``string[]``, and ``pathExpression[]`` store one identifier per
+element. ``asset[]`` stores one pair per element. Their tensor element counts
+therefore match the USD array lengths.
 
-A relationship's targets populate as interned path ids, ``{uint, 64, 1}`` with
-``RELATIONSHIP_PATH_ID`` and ``is_array = true``. A relationship authored with no targets
-populates as an empty value rather than being absent, so presence is what tells you it
-was authored.
+Relationship targets use path identifiers with ``{uint, 64, 1}``,
+``RELATIONSHIP_PATH_ID``, and ``is_array=True``. An authored relationship with
+no targets is present as an empty value, rather than absent.
 
-Empty and Valueless
-~~~~~~~~~~~~~~~~~~~
+The scene authors two points in ``point3f[] points``. Read the array from the
+one-prim query and view its three components per point:
 
-An empty ``token``, ``string``, ``pathExpression``, or ``asset`` half populates as **id
-0**. These are values USD authors and reads back, so they are populated rather than
-dropped, and absence means the property was not authored at all — not that it was
-authored empty. In an array an empty element is id 0 and keeps its place.
+.. tab-set::
 
-``opaque`` carries no value by definition. Nothing is populated for it and nothing is
-reported: there is no payload to store and nothing a consumer could read.
+   .. tab-item:: Python
+
+      .. filtered-literalinclude:: ../../examples/python/population/main.py
+         :language: python
+         :snippets: population-arrays
+
+   .. tab-item:: C
+
+      .. filtered-literalinclude:: ../../examples/c/population/main.cpp
+         :language: cpp
+         :snippets: population-arrays-c
+
+Empty Values
+~~~~~~~~~~~~
+
+Where the interned representation applies, empty tokens, strings, path
+expressions, and either half of an asset pair use identifier 0. A text-backed
+exception such as ``UsdRenderVar.sourceName`` uses a zero-length STRING value. Empty array elements keep their position. An authored empty value
+is distinct from an absent property.
+
+``opaque`` has no value to store and is skipped without a diagnostic.
+
+The authored empty token ``emptyName`` is present with identifier 0:
+
+.. tab-set::
+
+   .. tab-item:: Python
+
+      .. filtered-literalinclude:: ../../examples/python/population/main.py
+         :language: python
+         :snippets: population-empty
+
+   .. tab-item:: C
+
+      .. filtered-literalinclude:: ../../examples/c/population/main.cpp
+         :language: cpp
+         :snippets: population-empty-c
+
+An authored ``float[] emptyArray = []`` also produces a read group. Its tensor
+has zero elements; an absent property would produce no group:
+
+.. tab-set::
+
+   .. tab-item:: Python
+
+      .. filtered-literalinclude:: ../../examples/python/population/main.py
+         :language: python
+         :snippets: population-empty-array
+
+   .. tab-item:: C
+
+      .. filtered-literalinclude:: ../../examples/c/population/main.cpp
+         :language: cpp
+         :snippets: population-empty-array-c
 
 Properties That Do Not Follow Their USD Type
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-A few properties populate in a type their USD type does not predict. The ``RENDERING``
-domain publishes each of these in a fixed type and both domains have to agree on a shared
-stage, so population matches it — in every domain, so that what you read never depends on
-which domains you asked for.
+The following schema properties use fixed runtime types so that population
+domains agree when sharing a stage:
 
 .. list-table::
    :header-rows: 1
@@ -288,137 +606,566 @@ which domains you asked for.
      - instead of
    * - ``extent`` (any ``UsdGeomImageable``)
      - ``float3[]``, two points
-     - ``{float, 64, 6}``, ``is_array = false``, ``NONE``
+     - ``{float, 64, 6}``, ``is_array=False``, ``NONE``
      - ``{float, 32, 3}`` array
    * - ``normals`` (``UsdGeomCurves``, ``UsdGeomPoints``)
      - ``normal3f[]``
      - ``POINT``
      - ``NORMAL``
-   * - ``inputs:color`` (``UsdLuxLightAPI``), ``inputs:shadow:color`` (``UsdLuxShadowAPI``)
+   * - ``inputs:color`` (``UsdLuxLightAPI``), ``inputs:shadow:color`` (``UsdLuxShadowAPI``); ``inputs:shaping:focusTint`` (``UsdLuxShapingAPI`` on a ``DistantLight``, ``DiskLight``, ``RectLight``, ``SphereLight``, ``CylinderLight`` or ``DomeLight``)
      - ``color3f``
      - ``VECTOR``
      - ``COLOR``
+   * - Scalar ``string`` attributes on ``UsdRenderSettings``, ``UsdRenderProduct``,
+       or ``UsdRenderVar``, including ``sourceName`` and schema defaults. Excludes
+       ``xformOp*`` and ``primvars:*``.
+     - ``string``
+     - ``{uint, 8, 1}``, ``is_array = true``, ``STRING``
+     - interned ``{uint, 64, 1}``
+   * - On ``UsdGeomCamera``: ``sensorModelPluginName``, ``sensorModelConfig``,
+       ``sensorModelSignals``, and ``crossCameraReferenceName``. Also includes
+       ``string`` attributes declared by applied ``OmniSensor*`` schemas on
+       cameras or ``OmniSensor``-family prims, and by applied
+       ``OmniLensDistortion*`` or ``PhysicalCameraResponsivityAPI`` schemas on cameras.
+     - ``string``
+     - ``{uint, 8, 1}``, ``is_array = true``, ``STRING``
+     - interned ``{uint, 64, 1}``
+   * - Scalar ``string`` attributes matching ``inputs:*`` or
+       ``omni:simready:nonvisual:*`` on ``UsdShadeMaterial``, ``UsdShadeNodeGraph``,
+       or ``UsdShadeShader``. Also ``config:*`` on ``UsdShadeMaterial`` and
+       ``info:*sourceCode`` on ``UsdShadeShader``.
+     - ``string``
+     - ``{uint, 8, 1}``, ``is_array = true``, ``STRING``
+     - interned ``{uint, 64, 1}``
+   * - Scalar ``string`` primvars with a value, on any prim
+     - ``string``
+     - ``{uint, 8, 1}``, ``is_array = true``, ``STRING``
+     - interned ``{uint, 64, 1}``
+   * - ``semantic:<instance>:params:semanticType``, ``semantic:<instance>:params:semanticData`` (applied ``SemanticsAPI:<instance>``)
+     - ``string``
+     - ``{uint, 64, 1}``, ``TOKEN_ID``
+     - ``{uint, 64, 1}``, ``NONE``
    * - ``omni:rtx:domeLight:size`` (``OmniFiniteDomeLightAPI``); ``nerf:crop:minBounds``, ``nerf:crop:maxBounds``, ``nerf:offset`` (``OmniNerfVolumeAPI``); ``omni:nurec:crop:minBounds``, ``omni:nurec:crop:maxBounds``, ``omni:nurec:offset`` (``OmniNuRecVolumeAPI``)
      - ``float3``
      - ``VECTOR``
      - ``NONE``
 
-``extent`` is the only one whose dtype differs; the rest differ only in semantic and their
-bytes are unchanged. Each is gated on the schema shown, so a property that merely shares
-one of these names elsewhere — on your own schema, say — is untouched and follows its USD
-type.
+``extent`` and text stored as bytes change dtype or shape. The other exceptions
+change only the semantic. Each rule applies only to the schemas or prim types
+listed above. ``string[]`` attributes and primvars still store identifiers.
+
+These schema-specific rules do not apply to arbitrary properties with the same
+name. When rendering populates a non-schema ``color3f``, ``point3f``, ``normal3f``,
+``vector3f``, or ``texCoord3f`` property, its authored role is preserved through
+value edits. This does not depend on the property's ``custom`` flag. Schema
+properties retain their required rendering representation; for example, a light's
+``inputs:color`` still uses ``VECTOR`` even if authored with ``custom = true``.
+
+If a value cannot use the required representation (for example, an authored
+``token`` where a rule requires ``string`` bytes), population skips the value and
+logs a warning. The attribute keeps its required type and its last written value;
+this conversion mismatch does not fail the population operation.
+
+Values Authored in Another Type Than Declared
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When an authored numeric value differs from its schema's declared type,
+population tries to convert it to that type. Attributes without a schema
+declaration use their authored type, subject to the representation rules above.
+
+Conversion requires matching shapes: scalar to scalar, array to array, or
+vectors with the same number of components. Supported types are:
+
+* Scalars and their arrays: ``bool``, ``uchar``, ``int``, ``uint``, ``int64``,
+  ``uint64``, ``half``, ``float``, and ``double``.
+* Vectors and their arrays: 2, 3, or 4 components of ``int``, ``half``, ``float``,
+  or ``double``, including role types such as ``point3f`` and ``color3f``.
+
+Each component converts using USD's numeric conversion rules:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 40 60
+
+   * - Authored as, declared as
+     - Result
+   * - integer or ``bool``, integer or ``bool``
+     - the same value if it is in the declared type's range (``0`` or ``1`` for ``bool``);
+       otherwise no conversion
+   * - floating point, integer or ``bool``
+     - the value truncated toward zero if that is in the declared type's range;
+       otherwise, and for an infinity or NaN, no conversion
+   * - any, floating point
+     - the value rounded to the declared type. A value beyond the declared type's range
+       becomes an infinity, and a nonzero value too small for it becomes zero.
+       Infinities and NaN convert unchanged.
+
+Every array element and vector component must convert successfully. If conversion
+fails, population skips the whole value and logs a warning; the attribute keeps
+its declared type and its last written value. Shape mismatches and nonnumeric
+type mismatches involving ``token``, ``string``, or ``asset`` follow the same rule.
+The mismatch does not fail population, so consumers must not assume that a
+successful population operation updated every value.
+
+This differs from re-authoring the property's type: population replaces a column
+when its declared type or role changes, using ``FORCE`` attribute replacement.
+An unconvertible value does not trigger that replacement.
+
+Read ``extent`` to see the fixed-size representation of its two bounds:
+
+.. tab-set::
+
+   .. tab-item:: Python
+
+      .. filtered-literalinclude:: ../../examples/python/population/main.py
+         :language: python
+         :snippets: population-extent
+
+   .. tab-item:: C
+
+      .. filtered-literalinclude:: ../../examples/c/population/main.cpp
+         :language: cpp
+         :snippets: population-extent-c
 
 Stage Metadata
 --------------
 
-Stage metadata is populated onto the root prim, ``/``, when something asks for it: a
-selected domain may bring stage metadata of its own, and a description names whatever
-it wants through ``stage_metadata_paths``. Each field lands under the
-``usd-metadata:<path>`` prefix. With nothing asking, none is populated.
+Population writes requested stage metadata to ``/`` as attributes named
+``usd-metadata:<path>``. Domains may request fields; descriptions request them
+through ``stage_metadata_paths``. Unrequested fields are not populated.
 
-A path is a stage metadata field name, extended with a ``:``-joined key path to reach
-inside a dictionary field.
+A metadata path names a field and optional dictionary keys separated by ``:``:
 
-- ``timeCodesPerSecond`` — populates that field.
-- ``customLayerData:myTool:version`` — populates one value from inside a dictionary.
-- ``customLayerData`` — names a dictionary rather than a single value, so every value
-  beneath it is populated, one attribute each, under its flattened path.
+* ``timeCodesPerSecond`` selects one field.
+* ``customLayerData:myTool:version`` selects a nested value.
+* ``customLayerData`` selects all values in that dictionary, each stored under
+  its own full path.
 
-A path that does not resolve populates nothing. A path with an empty component — a
-leading, trailing or doubled ``:`` — names neither a field nor a key, and is rejected
-wherever one is taken.
+Missing paths produce no value. Leading, trailing, or repeated ``:`` characters
+create empty components and are rejected.
+
+The description above requests ``timeCodesPerSecond``. Read the field from
+the root path. This scene uses 24 time codes per second:
+
+.. tab-set::
+
+   .. tab-item:: Python
+
+      .. filtered-literalinclude:: ../../examples/python/population/main.py
+         :language: python
+         :snippets: population-stage-metadata-read
+
+   .. tab-item:: C
+
+      .. filtered-literalinclude:: ../../examples/c/population/main.cpp
+         :language: cpp
+         :snippets: population-stage-metadata-read-c
 
 Prim and Property Metadata
 --------------------------
 
-A selector also names ``prim_metadata_paths`` and ``property_metadata_paths``: USD
-metadata to populate for each prim it puts in scope, and for each property it publishes.
-Paths take the same form as the stage metadata paths above, and land under the same
-``usd-metadata:`` prefix:
+Selectors use ``prim_metadata_paths`` and ``property_metadata_paths`` to request
+metadata for selected prims and properties. They use the same path syntax:
 
-- Prim metadata — ``usd-metadata:<path>``
-- Property metadata — ``<property>:usd-metadata:<path>``
+* Prim metadata becomes ``usd-metadata:<path>``.
+* Property metadata becomes ``<property>:usd-metadata:<path>``.
 
-``HAS_METADATA`` selects on those same paths, and there is one of each kind: the prim kind
-puts a prim in scope when the prim resolves one of the paths named, and the property kind
-publishes a property when the property resolves one. Presence, not value — a path resolving
-to ``false`` matches.
+:meth:`has_metadata() <ovstage.population.PrimPredicate.has_metadata>` matches the presence of any requested path, including a value
+of ``False``. It can be used in prim or property conditions. A dictionary field
+matches when any value beneath it resolves, including schema-provided metadata.
+Name a specific key, such as ``customData:myTool:export``, when that is what you
+need to select.
 
-Name a key, not a whole dictionary field. A field matches whenever anything resolves
-beneath it, including what a schema registers rather than the prim authoring it;
-``customData:myTool:export`` selects the prims carrying that key.
+The selector above requests the prim label and each selected property’s
+``customData:unit``. Read the populated temperature unit:
+
+.. tab-set::
+
+   .. tab-item:: Python
+
+      .. filtered-literalinclude:: ../../examples/python/population/main.py
+         :language: python
+         :snippets: population-property-metadata-read
+
+   .. tab-item:: C
+
+      .. filtered-literalinclude:: ../../examples/c/population/main.cpp
+         :language: cpp
+         :snippets: population-property-metadata-read-c
+
+The same selector requested ``customData:label`` on the prim itself. Read that
+value without the property-name prefix:
+
+.. tab-set::
+
+   .. tab-item:: Python
+
+      .. filtered-literalinclude:: ../../examples/python/population/main.py
+         :language: python
+         :snippets: population-prim-metadata-read
+
+   .. tab-item:: C
+
+      .. filtered-literalinclude:: ../../examples/c/population/main.cpp
+         :language: cpp
+         :snippets: population-prim-metadata-read-c
 
 Reserved Prim Attributes
 ------------------------
 
-Every populated prim carries ``usd-prim-type``, whatever put it in scope and whatever
-its properties are. A prim USD gives no type name gets the reserved untyped name
-instead (``ovstage_population_untyped_type_name()``), so it is never absent.
+An ordinary populated prim with a USD type name carries ``usd-prim-type``. A typeless prim
+is still populated but has no ``usd-prim-type``; there is no synthetic type name.
+These metadata rules also apply when a selector requests no properties.
 
-``usd-schemas`` carries the prim's applied API schema names, and is populated only when
-it has any — a prim with none does not carry it at all, rather than carrying an empty
-one.
+Outside ``RENDERING``, ``usd-schemas`` contains the applied API names, or an empty
+set when none apply. ``HAS`` therefore matches even an empty set; use
+``CONTAINS`` to select a particular API. ``RENDERING`` also adds the schemas and
+tags described below, including on geometry without authored APIs; it can omit
+``usd-schemas`` when neither applied APIs nor rendering tags are present.
 
-Neither depends on the selector's property predicate. A selector that publishes no
-properties at all still yields these.
+A multiple-apply schema records both its instance name and bare name. For
+example, ``CollectionAPI:parts`` also adds ``CollectionAPI``. Typed export skips
+that accompanying bare name rather than treating it as an additional API instance.
 
-Path Predicates
----------------
+For ordinary prims populated through selectors or ``PHYSICS``, these names
+come from USD's type token and composed applied-API list. Use those identifiers,
+rather than C++ or Python class names:
 
-``HAS_PATH`` and ``IS_UNDER_PATH`` take an absolute prim path, or ``/``. A property,
-target, or variant-selection path is rejected at enqueue.
+.. list-table::
+   :header-rows: 1
+   :widths: 50 50
 
-Neither matches a prim inside a native instance.
+   * - USD declaration
+     - Runtime name
+   * - ``def Cube "Body"``
+     - ``usd-prim-type`` contains ``Cube``.
+   * - ``apiSchemas = ["PhysicsRigidBodyAPI"]``
+     - ``usd-schemas`` includes ``PhysicsRigidBodyAPI``.
+   * - ``apiSchemas = ["CollectionAPI:parts"]``
+     - ``usd-schemas`` includes ``CollectionAPI:parts`` and ``CollectionAPI``.
 
-Populated Ancestors
+For example, use ``Cube``, not ``UsdGeomCube`` or ``UsdGeom.Cube``, as the type
+name in a population predicate. The applied-API list is composed by USD, so it
+can include APIs supplied by schema definitions as well as those written in
+an ``apiSchemas`` statement. Do not rely on its runtime array order.
+
+``usd-ancestor-types`` lists the USD types the prim derives from, excluding
+its own type. These are schema ancestors, not parent prims: a ``Mesh`` includes
+``PointBased``, ``Gprim``, ``Boundable``, ``Xformable``, ``Imageable``,
+``Typed``, ``SchemaBase``, and ``TfType::_Root``.
+Use ``CONTAINS`` to select prims by a base type. Typeless and unknown types
+have no ancestor set in non-rendering population, even if ``fallbackPrimTypes``
+provides a fallback. Live type edits update or remove the set with the prim type.
+
+Outside authored ``PointInstancer`` descendants, instance roots use the following
+metadata in every population domain, with the ``RENDERING``-only exception below:
+
+- ``usd-prim-type`` is ``XformInstance``, or ``ScopeInstance`` when it is a ``Scope``,
+  whatever its authored type.
+- ``usd-schemas`` also carries ``GeomInstanceAPI``, and ``GeomInstanceRootAPI`` when the
+  instance root is outside a prototype. No USD schema applies these names.
+- ``usd-ancestor-types`` is ``Xformable`` alone.
+
+With ``RENDERING`` alone, a ``Scope`` and a non-``Scope`` instance sharing a prototype
+may both receive the instance type selected from the first instance encountered.
+``PHYSICS`` and selector population classify each root separately, including when
+combined with ``RENDERING``. Consumers must therefore not assume identical
+``usd-prim-type`` values across these modes for such a shared prototype.
+
+When ``PHYSICS`` or a selector populates an instanceable prim authored beneath
+a ``PointInstancer``, it keeps its authored type and applied schemas, including
+alongside ``RENDERING``. At that authored path it receives neither instance tag
+nor the rendering-derived tags listed below. It still links its prototype and
+remains discoverable through the :doc:`instancing` queries. Without ``RENDERING``,
+it also receives its normal USD ancestor set. With ``RENDERING`` selected,
+population does not synthesize ``usd-ancestor-types`` at these authored paths;
+use their type or APIs rather than relying on an ancestor set. Rendering uses
+relocated prototype geometry, whose metadata is a separate representation.
+
+An instance root's authored properties are populated as for any other prim. A root
+populated by ``PHYSICS`` or a selector also carries its composed authored type
+as ``usd-metadata:typeName``, even when the root itself matches no selector.
+
+Every prim the ``PHYSICS`` domain populates also carries ``usd-metadata:typeName``: its
+composed USD type name, as authored, including a type no loaded schema declares.
+This includes structural ancestors populated to reach physics content. On an
+instance root it is the authored type, not ``XformInstance`` or ``ScopeInstance``. Live
+edits update it, and a prim that loses its type name loses the attribute. A prim with no
+type name carries none. A desc selector publishes the same attribute when it selects the
+``typeName`` metadata path.
+
+Wherever the ``PHYSICS`` domain or a selector publishes a ``PointInstancer``'s
+``prototypes`` relationship, population also publishes its authored targets, in authored
+order, as ``prototypes:usd-targets``: the list ``protoIndices`` indexes, whichever domains are
+selected. Live edits update it, including an edit that clears the targets.
+
+When the ``RENDERING`` domain is selected, the following hold for every prim it populates,
+including prims a selector or the ``PHYSICS`` domain also populates:
+
+- A ``PointInstancer``'s ``prototypes`` lists the geometry ``RENDERING`` renders for its
+  prototypes, at paths beneath the instancer, not the authored relationship's targets.
+  ``protoIndices`` does not index that list. The authored targets are in
+  ``prototypes:usd-targets`` when ``PHYSICS`` or a selector also publishes the instancer's
+  ``prototypes``. Its ``extent`` is the bounds of those prototypes, not the authored
+  ``extent``.
+- ``usd-schemas`` includes ``MaterialBindingAPI`` on supported geometry and ``DomeLight``, even
+  without an authored material binding. This is a recognized USD API and typed
+  export applies it. Instance roots are excluded; material-binding subsets are
+  included only under a non-instance ``Mesh``.
+- ``usd-schemas`` also carries rendering tags that are not applied USD APIs:
+
+  - ``PrimvarsAPI`` on a prim with a primvar that has a value, other than a string array,
+    or with an authored ``normals`` attribute.
+  - ``MeshSubdivision`` on a ``Mesh`` whose subdivision scheme, boundary or face-varying
+    interpolation, or triangle subdivision rule differs from its default, or that has
+    creases or corners, and on every ``TetMesh``.
+  - ``SkelBindingAPI_Geom`` on a ``Mesh`` outside a prototype, or on curves, with a
+    ``primvars:skel:jointIndices`` attribute.
+  - ``SkelBindingAPI_Skel`` on a non-instance ``Skeleton``.
+  - ``GeomPrototypeAPI`` on supported geometry inside a USD prototype, excluding
+    the prototype root and instance roots.
+  - Light-attribute tags such as ``LightVisibleInPrimaryRayAPI``,
+    ``LightGhostFactorAPI``, ``LightDisableFogInteractionAPI``,
+    ``LightIsProjectorAPI``, ``LightProjectorDirectionTextureAPI``,
+    ``LightEnableCausticsAPI``, ``LightUsdLuxVersionAPI``, ``DomeLightFiniteAPI``,
+    and ``LightShapingForwardAxisAPI``, when their rendering attributes apply.
+
+These tags are preserved when ``RENDERING`` is combined with selectors or
+``PHYSICS``. They are not added at authored paths beneath a ``PointInstancer``.
+
+Rendering population supplies the ancestor set when selected, including alongside
+selectors, except at the authored ``PointInstancer`` descendant paths described
+above. Its other current exceptions are:
+
+* Typeless prims carry ``Imageable``.
+* Instance proxies carry only ``Xformable`` (instance-root rules are above).
+* ``GeomSubset`` and USD prototype prims carry no ancestor types.
+* Unknown types resolved to geometry through ``fallbackPrimTypes`` carry that
+  fallback's ancestors. With rendering alone the prim type is also the fallback;
+  a selector can retain the source type name instead.
+* ``LODSelector``, which has no USD schema, carries ``Imageable``.
+
+Writing ``usd-prim-type`` does not derive a new ancestor set. If the new type
+already appears in ``usd-ancestor-types``, it is removed from that set because a
+prim's own type is excluded. When changing a type directly, also write its
+matching ancestor set. Both this set and ``usd-schemas`` are replaced as a whole
+by a write. Typed export does
+not author ``usd-ancestor-types``. Custom properties named after USD types or
+API schemas, such as ``Boundable`` on a Mesh, are unsupported.
+
+.. _population-instance-types:
+
+USD scene-graph instance roots use ``XformInstance`` or ``ScopeInstance`` as
+described above. With ``RENDERING`` population (including ``ALL``), their
+populated contents can also use types such as ``MeshInstance`` and
+``CubeInstance``: a ``Mesh`` beneath an instance root can become ``MeshInstance``. You author ordinary USD prims
+with references and ``instanceable = true``; population generates these runtime
+types. You do not author ``MeshInstance`` or ``XformInstance`` in USD.
+
+A ``PointInstancer`` does not generate one such prim per point. Instanceable
+prims authored beneath it keep their authored metadata as described above;
+rendering's relocated prototype geometry is a separate representation.
+See :doc:`instancing` for scene-graph instancing examples and queries.
+
+Consequently, a runtime ``usd-prim-type`` value can differ from the source USD
+type. Population predicates inspect the source USD prim; runtime queries
+inspect the populated stage.
+
+Read the populated type of ``/World/Body`` and resolve its token:
+
+.. tab-set::
+
+   .. tab-item:: Python
+
+      .. filtered-literalinclude:: ../../examples/python/population/main.py
+         :language: python
+         :snippets: population-reserved
+
+   .. tab-item:: C
+
+      .. filtered-literalinclude:: ../../examples/c/population/main.cpp
+         :language: cpp
+         :snippets: population-reserved-c
+
+Read ``usd-schemas`` to find the applied APIs. This scene applies
+``PhysicsRigidBodyAPI`` to ``/World/Body``:
+
+.. tab-set::
+
+   .. tab-item:: Python
+
+      .. filtered-literalinclude:: ../../examples/python/population/main.py
+         :language: python
+         :snippets: population-schemas
+
+   .. tab-item:: C
+
+      .. filtered-literalinclude:: ../../examples/c/population/main.cpp
+         :language: cpp
+         :snippets: population-schemas-c
+
+.. _population-runtime-owned-prims:
+
+Runtime-Owned Prims
 -------------------
 
-A prim that ``PHYSICS`` domain or a desc's selectors put in scope is published
-together with every one of its ancestor prims, so a consumer can walk the prim tree
-down to it however sparse the selection is.
+Rendering population keeps bookkeeping prims alongside the scene. They are not
+USD content and remain after :func:`reset_usd() <ovstage.population.reset_usd>` or removal of a reference. Unfiltered
+queries count them too. Other population domains do not create these prims.
 
-An ancestor that no selector matches on its own merit carries none of the data a
-selected prim does — no attributes, relationships, or metadata — only the reserved
-ones above. It does carry the derived transform attributes below when it is
-xformable, which is what lets world-transform composition run the whole chain.
+To enumerate scene content, filter by its root path or expected types; see
+:doc:`queries`. Their paths, types, and count are implementation details. Do not
+write to them.
 
-Derived Transform Attributes
-----------------------------
+Path Conditions
+---------------
 
-For every prim that ``PHYSICS`` domain or a desc's selectors put in scope, and that is
-USD-xformable, population also publishes the prim's local transform state:
+:meth:`has_path() <ovstage.population.PrimPredicate.has_path>` and :meth:`is_under_path() <ovstage.population.PrimPredicate.is_under_path>` accept absolute prim paths, including
+``/``. Property, target, and variant-selection paths fail at submission. Neither
+condition matches prims inside a native instance.
 
-- ``omni:xform`` — the prim's USD transform ops composed into a 4x4 row-major
-  matrix (``float64``, 16 lanes, ``MATRIX`` semantic). This is the input
-  ``ovstage_compute_hierarchy`` reads to derive world transforms.
-- ``omni:resetXformStack`` — ``bool``, true when the prim resets the inherited
-  parent transform stack.
-- ``omni:fabric:worldMatrix`` — created, not maintained, and only when ``RENDERING``
-  is not among the selected domains. ``ovstage_compute_hierarchy`` updates this value but
-  does not create it, so population creates it for a qualifying prim that has none and
-  then leaves it alone: the value is written once, at creation, as the local transform,
-  and later derived values come from hierarchy computation. Treat this provisionally
-  named attribute as read-only output as described in :doc:`transforms`. A prim that
-  stops being xformable loses it. With ``RENDERING`` selected that domain owns it outright
-  and population neither creates nor writes it.
+For an exact match, use :meth:`has_path() <ovstage.population.PrimPredicate.has_path>` as the selector’s prim condition:
 
-A prim that is not xformable gets none of these. Being xformable does not by itself
-put a prim in scope: the derivation only ever applies to prims population already
-publishes. See :doc:`transforms` for transform authoring and
-``ovstage_population.h`` for the full population contract.
+.. tab-set::
+
+   .. tab-item:: Python
+
+      .. filtered-literalinclude:: ../../examples/python/population/main.py
+         :language: python
+         :snippets: population-paths
+
+   .. tab-item:: C
+
+      .. filtered-literalinclude:: ../../examples/c/population/main.cpp
+         :language: cpp
+         :snippets: population-paths-c
+
+To select Cube prims below ``/World``, combine a subtree condition with a type
+condition. This example also includes the ``PHYSICS`` domain: the selector adds
+``size`` to the domain’s selection. It runs at ordinal 7, after the time-update
+examples below have used ordinals 3 through 6:
+
+.. tab-set::
+
+   .. tab-item:: Python
+
+      .. filtered-literalinclude:: ../../examples/python/population/main.py
+         :language: python
+         :snippets: population-subtree
+
+   .. tab-item:: C
+
+      .. filtered-literalinclude:: ../../examples/c/population/main.cpp
+         :language: cpp
+         :snippets: population-subtree-c
+
+.. _population-ancestors-transforms:
+
+Ancestors and Transforms
+------------------------
+
+The ``PHYSICS`` domain and explicit selectors also populate ancestors of selected
+prims so consumers can follow the hierarchy. An ancestor that no selector matches
+gets the reserved attributes above and, if USD-xformable, transform data.
+It does not receive other attributes, relationships, or metadata, except
+``usd-metadata:typeName`` on ancestors populated by ``PHYSICS`` and on instance
+roots populated by ``PHYSICS`` or a selector.
+
+For each USD-xformable prim selected this way, including ancestors, population
+writes:
+
+* ``omni:xform`` — composed local USD transform, stored as a row-major 4×4
+  ``float64`` matrix with 16 lanes and semantic ``MATRIX``.
+* ``omni:resetXformStack`` — a boolean indicating whether the prim ignores its
+  parent's transform.
+
+When ``RENDERING`` is not selected, population also creates
+``omni:fabric:worldMatrix`` if absent, initially using the local matrix. Later
+world-transform values come from :meth:`ovstage.Stage.compute_hierarchy()`;
+population does not overwrite them. A prim that stops being xformable loses this
+attribute. When ``RENDERING`` is selected, that domain manages it instead.
+
+Treat the provisionally named world-matrix attribute as read-only output.
+Hierarchy computation updates existing rows but does not create them.
+Non-xformable prims receive none of these derived attributes, and being
+xformable does not by itself select a prim for population. See :doc:`transforms`.
+
+These names belong to population. A USD property named ``omni:xform``,
+``omni:resetXformStack``, or ``omni:fabric:worldMatrix`` is never
+published, even when a selector names or matches it, on any prim.
+
+Selecting ``/World/Body`` also populates the transform of its ancestor
+``/World``. Its authored translation is 10 along X:
+
+.. tab-set::
+
+   .. tab-item:: Python
+
+      .. filtered-literalinclude:: ../../examples/python/population/main.py
+         :language: python
+         :snippets: population-ancestor
+
+   .. tab-item:: C
+
+      .. filtered-literalinclude:: ../../examples/c/population/main.cpp
+         :language: cpp
+         :snippets: population-ancestor-c
+
+Rebuilding from the Current USD Source
+--------------------------------------
+
+:func:`population.repopulate_usd_with_desc() <ovstage.population.repopulate_usd_with_desc>`
+rewrites selected attributes from the current USD source at the supplied
+:term:`ordinal`. Use it to replace runtime edits with USD values. Pass ``time``
+in seconds, or :data:`ovstage.population.DEFAULT_TIME` for default opinions.
+Use :func:`population.repopulate_usd_with_desc_async() <ovstage.population.repopulate_usd_with_desc_async>`
+for asynchronous execution.
+
+Repopulation keeps unselected prims and attributes, including runtime-created
+data. Delete them explicitly if they must be removed. The supplied descriptions
+also set the population scope for later updates.
+
+The USD stage, root and session layers, edits, composition state, edit target,
+and reference handles stay valid.
+
+For incremental updates, use
+:func:`population.apply_usd_changes() <ovstage.population.apply_usd_changes>` or
+:func:`population.update_from_usd_time() <ovstage.population.update_from_usd_time>`. These
+rewrite changed or time-sampled USD values, so they can leave runtime edits in
+place on other attributes.
 
 Editing the USD Source
 ----------------------
 
-After a scene is live you can edit the USD source and propagate the change into
-the runtime table at a fresh ordinal:
+Reference edits change the USD source first. Apply them to the runtime stage
+at a new ordinal:
 
-- ``ovstage_population_add_usd_reference_from_file`` / ``_from_string`` — add a
-  reference onto an existing prim.
-- ``ovstage_population_remove_usd_reference`` / ``ovstage_population_reset_usd`` —
-  remove a reference or reset.
-- ``ovstage_population_apply_usd_changes`` — propagate pending USD edits into the
-  table (at a new ordinal).
+* :func:`population.add_usd_reference() <ovstage.population.add_usd_reference>` or :func:`add_usd_reference_from_string() <ovstage.population.add_usd_reference_from_string>` adds
+  a reference. An absolute-root target adds a sublayer; a prim target adds a
+  reference at that prim.
+* :func:`population.remove_usd() <ovstage.population.remove_usd>` removes a reference by its returned handle.
+* :func:`population.reset_usd() <ovstage.population.reset_usd>` clears the USD source.
+* :func:`population.apply_usd_changes() <ovstage.population.apply_usd_changes>` transfers pending edits to the runtime stage.
+
+The reference target decides what the next apply republishes. A
+not-yet-existing prim path republishes only the new prim and the content
+beneath it. An existing prim path republishes that prim and every prim beneath
+it, including prims the reference does not add or change; the absolute root
+republishes the whole stage. Every selected attribute of a republished prim is
+written at the apply ordinal even when its value is unchanged, so a read of
+that ordinal range reports it as changed, and the written value replaces any
+value written directly into the runtime stage since. To add content without
+republishing existing prims, target a not-yet-existing prim path.
+
+.. note::
+
+   Clearing all USD values of a populated application attribute, with no fallback
+   remaining, removes its runtime column on the next ``apply_usd_changes``.
+   With ``RENDERING`` enabled, renderer-retained columns are exceptions: schema
+   attributes, primvars, properties of shader and node-graph prims, and authored
+   properties of ``RenderSettings``, ``RenderProduct``, and ``RenderVar`` prims.
+
+These examples update the USD source, apply its changes, and read the result:
 
 .. tab-set::
 
@@ -443,25 +1190,46 @@ the runtime table at a fresh ordinal:
 Advancing Time
 --------------
 
-``ovstage_population_apply_usd_time`` re-samples time-sampled attributes at a new
-time and writes them at a fresh ordinal. Call it once per tick when playing back
-time-sampled USD content.
+Use :func:`ovstage.population.update_from_usd_time()` to sample animated USD
+values at a new time and write them at a new ordinal. It uses the domains and
+selectors from the opening call, including selectors with ``domains=NONE``.
+Edits to time samples are picked up without a separate :func:`apply_usd_changes() <ovstage.population.apply_usd_changes>`.
 
-Values are re-sampled from the current USD state, so edits to an attribute's time
-samples are picked up even without an intervening
-``ovstage_population_apply_usd_changes``. What is re-sampled is whatever the
-opening ``open_usd_*`` put in scope — for a description that is its selectors as
-well as its domains, so one carrying selectors and ``domains == 0`` is advanced
-like any other.
+The ``time`` argument is in **seconds**, converted using the stage's
+``timeCodesPerSecond``. Pass ``population.DEFAULT_TIME`` for USD's default time
+code; it is also the default for the basic open functions. The ``_with_desc``
+functions require an explicit time.
 
-Propagating structural edits — prims added or removed, and attribute or
-relationship changes that are not time samples — is
-``ovstage_population_apply_usd_changes``'s job. ``RENDERING`` is the exception: for
-that domain this call propagates them as well. Other domains do not, and the
-difference is expected to go away.
+``DEFAULT_TIME`` is NaN, so test it with :func:`population.is_default_time() <ovstage.population.is_default_time>` rather
+than ``==``. In C, use ``OVSTAGE_POPULATION_DEFAULT_TIME`` and
+:c:func:`ovstage_population_is_default_time() <ovstage_population_is_default_time>`.
+
+Reapplying the same time rewrites in-scope time-sampled properties in every
+domain, including at default time. It is not a no-op.
+
+Use :func:`apply_usd_changes() <ovstage.population.apply_usd_changes>` for structural edits and changes to properties that
+are not time samples. The ``RENDERING`` domain currently propagates these during
+time updates too; other domains do not. Do not rely on that difference.
+
+The example temperature has samples of 20 at USD time code 0 and 30 at
+time code 24. Sample one second at ordinal 3, then read 30:
+
+.. tab-set::
+
+   .. tab-item:: Python
+
+      .. filtered-literalinclude:: ../../examples/python/population/main.py
+         :language: python
+         :snippets: population-time
+
+   .. tab-item:: C
+
+      .. filtered-literalinclude:: ../../examples/c/population/main.cpp
+         :language: cpp
+         :snippets: population-time-c
 
 Python ↔ C Name Mapping
-------------------------
+-----------------------
 
 Several Python wrappers use shorter names than their C entry points:
 
@@ -470,38 +1238,149 @@ Several Python wrappers use shorter names than their C entry points:
 
    * - Python (``ovstage.population``)
      - C entry point
-   * - ``open_usd`` / ``open_usd_async``
-     - ``ovstage_population_open_usd_from_file``
-   * - ``add_usd_reference``
-     - ``ovstage_population_add_usd_reference_from_file``
-   * - ``remove_usd``
-     - ``ovstage_population_remove_usd_reference``
-   * - ``update_from_usd_time``
-     - ``ovstage_population_apply_usd_time``
-   * - ``open_usd_with_desc``
-     - ``ovstage_population_open_usd_from_file_with_desc``
+   * - :func:`open_usd <ovstage.population.open_usd>` / :func:`open_usd_async <ovstage.population.open_usd_async>`
+     - :c:func:`ovstage_population_open_usd_from_file <ovstage_population_open_usd_from_file>`
+   * - :func:`add_usd_reference <ovstage.population.add_usd_reference>`
+     - :c:func:`ovstage_population_add_usd_reference_from_file <ovstage_population_add_usd_reference_from_file>`
+   * - :func:`remove_usd <ovstage.population.remove_usd>`
+     - :c:func:`ovstage_population_remove_usd_reference <ovstage_population_remove_usd_reference>`
+   * - :func:`update_from_usd_time <ovstage.population.update_from_usd_time>`
+     - :c:func:`ovstage_population_apply_usd_time <ovstage_population_apply_usd_time>`
+   * - :func:`open_usd_with_desc <ovstage.population.open_usd_with_desc>`
+     - :c:func:`ovstage_population_open_usd_from_file_with_desc <ovstage_population_open_usd_from_file_with_desc>`
 
-The ``time_code`` parameter on ``open_usd*`` / ``update_from_usd_time`` is in
-**seconds** — it maps to the C ``time`` parameter, converted internally via the
-stage's ``timeCodesPerSecond``. ``math.nan`` (the ``open_usd*`` default)
-evaluates at USD's Default time code.
+.. _population-ordinal-ownership:
 
-Ordinal Ownership
+Choosing Ordinals
 -----------------
 
-Population never opens or seals an ordinal for you — the application owns the
-ordinal lifecycle. Pass the current ordinal to each call and seal each tick with
-``advance_write_floor``. Keep ordinals monotonic (populate at 1, then writes and
-USD edits at higher ordinals); an operation at or below the floor is a write-floor
-violation.
+The application assigns ordinals to population operations and seals completed
+updates with ``advance_write_floor``. Population never chooses, increments, or
+seals an ordinal for you. A tick may use several ordinals; seal through the final
+one once its updates complete. An operation at or below an applicable floor is
+a write-floor violation under every admission policy.
+
+Python requires an explicit ``ordinal`` for ``open_usd`` (file/URL),
+``open_usd_from_string``, ``apply_usd_changes``, and their ``_async`` variants.
+Pass it positionally or as ``ordinal=...``. The former
+implicit value of 1 has been removed; calls that omit it raise ``TypeError``.
+The ``_with_desc`` and ``update_from_usd_time`` helpers already require an
+explicit ordinal.
 
 A newly created instance already has a write floor of 0, so the first population
 must use an ordinal of at least 1 — 0 is never a usable *write* ordinal, even
 though it is a perfectly valid ordinal to read at. An application whose frame
 counter starts at 0 should offset it rather than pass 0 through.
 
-Where to Go Next
-----------------
+Use increasing ordinals for successive updates to the same data. For example,
+open at ordinal 1, propagate later USD edits with ``apply_usd_changes`` at 2,
+and update time-sampled properties with ``update_from_usd_time`` at 3. Wait for
+each operation before starting the next, then seal through ordinal 3. Use higher
+values when other writers or floors have already advanced the stage.
+
+If you apply direct overrides after population, the same sequence applies:
+populate at 1, wait, write the overrides at 2, wait, then seal through 2.
+See :ref:`ordinal-admission-policies` for the policy options and their
+configuration.
+
+After using ordinals 1 through 3, start the next updates at 4 even though the
+frame counter starts at 0:
+
+.. tab-set::
+
+   .. tab-item:: Python
+
+      .. filtered-literalinclude:: ../../examples/python/population/main.py
+         :language: python
+         :snippets: population-ordinals
+
+   .. tab-item:: C
+
+      .. filtered-literalinclude:: ../../examples/c/population/main.cpp
+         :language: cpp
+         :snippets: population-ordinals-c
+
+Repopulating a Stage
+--------------------
+
+Opening a new USD source adds or updates its data without removing values left
+by the previous source. Prims missing from the new scene remain, as do old
+attributes that the new scene no longer publishes.
+
+To replace previously populated content:
+
+1. Call :func:`population.reset_usd(stage) <ovstage.population.reset_usd>` to clear the USD source.
+2. Call :func:`population.apply_usd_changes(stage, ordinal=n) <ovstage.population.apply_usd_changes>` to remove its populated
+   content. Prims created only by direct application writes remain.
+3. Call :func:`population.open_usd(stage, path, ordinal=n + 1) <ovstage.population.open_usd>` to load the replacement.
+
+Wait for each step before starting the next. The blocking Python functions do
+this; with asynchronous calls or C, observe each operation's completion.
+The following examples clear and reload a small Cube scene. ``CUBE_USDA`` in
+Python and ``kCubeUsda`` in C hold the scene text. Their test helpers count prims
+under ``/World`` to check removal:
+
+.. tab-set::
+
+   .. tab-item:: Python
+
+      .. filtered-literalinclude:: ../../tests/python/test_population.py
+         :language: python
+         :start-after: # [snippet:reset-usd]
+         :end-before: # [/snippet:reset-usd]
+         :dedent:
+
+   .. tab-item:: C
+
+      .. filtered-literalinclude:: ../../tests/c/test_population.cpp
+         :language: cpp
+         :start-after: // [snippet:reset-usd-c]
+         :end-before: // [/snippet:reset-usd-c]
+         :dedent:
+
+To clear the whole stage, including application-created prims, use an unfiltered
+:meth:`stage.query() <ovstage.Stage.query>`, wait, then call :meth:`stage.delete_attributes(query, [], n) <ovstage.Stage.delete_attributes>`.
+An empty attribute list deletes the selected prims. Wait for deletion and release
+the query before opening the new source. In C, the same operations are
+:c:func:`ovstage_query() <ovstage_query>` with no filter and :c:func:`ovstage_delete_attributes() <ovstage_delete_attributes>` with no
+attribute names, followed by :c:func:`ovstage_release_query() <ovstage_release_query>`.
+
+Use a fresh ordinal for deletion and another for population. Wait for deletion
+to complete before starting population.
+
+Failure and the Ordinal
+-----------------------
+
+A submission failure means the operation never ran. It leaves previously
+populated content unchanged, so the same ordinal can be retried if it still
+satisfies current watermarks, admission policy, and stage state. In C, this is
+the enqueue result's ``status``.
+
+A failure while waiting may follow partial writes or removal of previous
+content. Retry population at a higher ordinal. Python raises ``OvstageError``;
+in C, inspect :c:func:`ovstage_population_get_last_error() <ovstage_population_get_last_error>` after the failed
+:c:func:`ovstage_population_wait_op() <ovstage_population_wait_op>`. The status code alone does not show how much
+work completed.
+
+This example deliberately opens a missing file, distinguishes rejection from
+failure during execution, and retries with the valid scene:
+
+.. tab-set::
+
+   .. tab-item:: Python
+
+      .. filtered-literalinclude:: ../../examples/python/population/main.py
+         :language: python
+         :snippets: population-failure
+
+   .. tab-item:: C
+
+      .. filtered-literalinclude:: ../../examples/c/population/main.cpp
+         :language: cpp
+         :snippets: population-failure-c
+
+Further Reading
+---------------
 
 - :doc:`/guides/runtime_loop` — the full populate → read → update → read loop.
 - :doc:`exporting_to_usd` — author selected runtime state back into a USD layer.

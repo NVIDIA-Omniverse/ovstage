@@ -31,9 +31,6 @@ tests/docs/c/build-dev/
 # Generated license file.
 PACKAGE-DEPS.yaml
 
-# Local package-manager user overrides
-*.packman.xml.user
-
 # vscode settings are copied and filled in from 'settings.json.template'
 .vscode/settings.json
 
@@ -51,6 +48,7 @@ PACKAGE-DEPS.yaml
 # Crash dumps and logs
 **/*.dmp.zip.toml
 **/*.dmp.zip
+**/*.nvcudmp
 **/crash*.txt
 
 /CMakeSettings.json

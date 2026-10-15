@@ -48,6 +48,7 @@ add_executable(ovstage_public_tests
     test_population_export.cpp
     test_clone.cpp
     test_queries.cpp
+    test_change_feed.cpp
     test_error_handling.cpp
     test_attribute_shapes.cpp
     test_write_modes.cpp
@@ -56,7 +57,8 @@ add_executable(ovstage_public_tests
     test_attributes.cpp
     test_map_attribute.cpp
     test_logging.cpp
-    test_support_api.cpp)
+    test_support_api.cpp
+    test_placement.cpp)
 target_link_libraries(ovstage_public_tests PRIVATE ovstage::ovstage GTest::gtest_main)
 
 include(GoogleTest)
@@ -67,3 +69,12 @@ include(GoogleTest)
 # path, so both discovery and execution find the runtime. DISCOVERY_TIMEOUT covers
 # the one-time cost of loading ovstage's runtime closure while listing tests.
 gtest_discover_tests(ovstage_public_tests DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 120)
+
+# A separate process and static loader are essential: a previously loaded runtime
+# would hide an omitted or late binary-package-root configuration.
+add_executable(ovstage_static_config_tests test_static_config.cpp)
+target_link_libraries(ovstage_static_config_tests PRIVATE ovstage::ovstage_static GTest::gtest_main)
+get_filename_component(OVSTAGE_TEST_BINARY_ROOT "${ovstage_DIR}/../../../bin" ABSOLUTE)
+add_test(NAME StaticConfig.NonDefaultBinaryRoot COMMAND ovstage_static_config_tests)
+set_tests_properties(StaticConfig.NonDefaultBinaryRoot PROPERTIES
+    ENVIRONMENT "OVSTAGE_TEST_BINARY_ROOT=${OVSTAGE_TEST_BINARY_ROOT}")

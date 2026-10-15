@@ -9,88 +9,35 @@
 .. its affiliates is strictly prohibited.
 
 String Handling
-===============
+=======================
 
-ovstage passes strings as ``ovx_string_t``, a non-owning ``(ptr, length)`` view
-that is **not required to be null-terminated**. The caller owns the pointed-to
-bytes, ``length`` is a byte count (not a code-point count), and the text is
-UTF-8. Many entry points — attribute names, filter attributes, prim paths —
-accept the dual-mode ``ovx_string_or_token_t``, which carries either a
-pre-resolved path-dictionary token or a raw string.
+Python accepts a ``str`` or integer :term:`token <Token>` for scalar dual-mode
+attribute-name arguments, such as write, map, delete, and attribute-floor lookup.
+The list arguments ``Stage.read_attributes(attrs)``, ``Stage.query(attrs=...)``,
+and ``Stage.advance_write_floor(attributes=...)`` require integer tokens.
+Use :meth:`PathDictionary.intern_token() <ovstage.PathDictionary.intern_token>`
+for those lists, and reuse tokens when passing the same names repeatedly.
 
-``ovx_string_t``
-----------------
+In C, :c:type:`ovx_string_t` contains a pointer and a byte length. The text is
+UTF-8. An input string need not end with a null character; use its length when
+reading it. The view does not own its buffer.
 
-.. code-block:: c
+Passing Strings or Tokens
+---------------------------------
 
-   typedef struct ovx_string_t {
-       const char* ptr;     // borrowed bytes, not necessarily null-terminated
-       size_t      length;  // byte count
-   } ovx_string_t;
+In C, arguments of type :c:type:`ovx_string_or_token_t` accept a string or a
+:term:`token <Token>`. A nonzero ``token`` is used directly; otherwise the name in
+``string`` is resolved through the path dictionary. Reuse a token when passing
+the same name repeatedly.
 
-Always use both fields together:
-
-- **Print** with ``%.*s``, passing ``(int)length, ptr`` — never assume a
-  terminator:
-
-  .. code-block:: c
-
-     printf("%.*s\n", (int)name.length, name.ptr);
-
-- **Compare** by checking ``length`` first, then ``memcmp`` / ``strncmp`` over
-  exactly ``length`` bytes.
-- In C++, wrap a borrowed view as ``std::string_view{ s.ptr, s.length }``; copy
-  to a ``std::string`` if it must outlive the source buffer:
-
-  .. filtered-literalinclude:: ../../examples/c/minimal/main.cpp
-     :language: cpp
-     :start-after: // [snippet:string-view-from-ovx-string]
-     :end-before: // [/snippet:string-view-from-ovx-string]
-     :exclude-pattern: ^\s*//\s*\[/?snippet:
-     :dedent:
-
-A string view returned from the path dictionary is valid only for the
-dictionary's lifetime — copy it to outlive the dictionary.
-
-``ovx_string_or_token_t``: String or Token
-------------------------------------------
-
-.. code-block:: c
-
-   typedef struct ovx_string_or_token_t {
-       ovx_token_t  token;   // uint64; 0 == unresolved (use string)
-       ovx_string_t string;  // resolved through the dictionary when token == 0
-   } ovx_string_or_token_t;
-
-If ``token != 0`` the token is used directly; if ``token == 0`` the ``string`` is
-resolved through the path dictionary at call time. Pre-resolving a token avoids
-per-call hashing in hot loops:
-
-.. filtered-literalinclude:: ../../examples/c/minimal/main.cpp
-   :language: cpp
-   :start-after: // [snippet:string-or-token-arg]
-   :end-before: // [/snippet:string-or-token-arg]
-   :exclude-pattern: ^\s*//\s*\[/?snippet:
-   :dedent:
-
-In Python
----------
-
-Python has no ``ovx_string_t``. Methods accept a plain ``str`` (interned each
-call) or a pre-interned ``int`` token (cheaper for repeated use):
+Python accepts a ``str`` or an integer token for these arguments. The snippets
+below show an attribute passed as a string in Python and as a token in C.
+The Python snippet assumes an existing stage and query; the C snippet uses the
+previously resolved ``attr`` token.
 
 .. tab-set::
 
-   .. tab-item:: Intern and Resolve
-
-      .. filtered-literalinclude:: ../../examples/python/minimal/main.py
-         :language: python
-         :start-after: # [snippet:intern-and-resolve]
-         :end-before: # [/snippet:intern-and-resolve]
-         :exclude-pattern: ^\s*#\s*\[/?snippet:
-         :dedent:
-
-   .. tab-item:: String or Token Argument
+   .. tab-item:: Python
 
       .. filtered-literalinclude:: ../../examples/python/minimal/main.py
          :language: python
@@ -99,8 +46,50 @@ call) or a pre-interned ``int`` token (cheaper for repeated use):
          :exclude-pattern: ^\s*#\s*\[/?snippet:
          :dedent:
 
-Where to Go Next
-----------------
+   .. tab-item:: C
 
-- :doc:`/scene/path_dictionary` — interning, token identity, and token lifetime.
-- :doc:`error_handling` — the ``ovx_string_t`` values returned by the diagnostics accessors.
+      .. filtered-literalinclude:: ../../examples/c/minimal/main.cpp
+         :language: cpp
+         :start-after: // [snippet:string-or-token-arg]
+         :end-before: // [/snippet:string-or-token-arg]
+         :exclude-pattern: ^\s*//\s*\[/?snippet:
+         :dedent:
+
+Use the stage's dictionary to create tokens. See :doc:`/scene/path_dictionary`
+for the Python and C examples and token lifetimes.
+
+Reading Returned Strings in C
+----------------------------------------
+
+* Read ``length`` bytes. A null pointer with zero length represents no value;
+  a null pointer with nonzero length is invalid.
+* Compare lengths first, then compare that many bytes with ``memcmp()``.
+  For zero-length strings, no byte comparison is needed. ``strncmp()`` stops
+  at a null character and is not a general byte comparison.
+* In C++, use ``std::string_view`` to borrow a string or ``std::string`` to copy it.
+* A nonempty library-produced ``ovx_string_t`` has a trailing null character,
+  as specified by its header. This does not extend the buffer's lifetime.
+
+In C, write the specified bytes without requiring a trailing null character.
+For a valid ``name`` view, this also avoids narrowing its length to ``int``.
+Include ``<stdio.h>`` and check the returned byte count for output errors:
+
+.. code-block:: c
+
+   // An empty view may have a null pointer.
+   if (name.length != 0)
+       fwrite(name.ptr, 1, name.length, stdout);
+
+The C++ snippet below borrows the returned string using its pointer and length:
+
+.. filtered-literalinclude:: ../../examples/c/minimal/main.cpp
+   :language: cpp
+   :start-after: // [snippet:string-view-from-ovx-string]
+   :end-before: // [/snippet:string-view-from-ovx-string]
+   :exclude-pattern: ^\s*//\s*\[/?snippet:
+   :dedent:
+
+Keep the owner alive while using a borrowed string. Dictionary strings last for
+the dictionary's lifetime. Operation error messages have a shorter lifetime;
+see :doc:`error_handling`. Copy a string if you need it after its owner releases
+or replaces the buffer.

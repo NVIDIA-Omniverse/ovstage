@@ -134,6 +134,100 @@ protected:
     ovstage_query_handle_t query_ = OVSTAGE_INVALID_QUERY_HANDLE;
 };
 
+class WriteModesPolicyTest : public WriteModesTest,
+                             public ::testing::WithParamInterface<ovstage_ordinal_admission_policy_t>
+{
+protected:
+    void SetUp() override
+    {
+        const auto entry = ovstage_config_entry_runtime_default_ordinal_admission_policy(GetParam());
+        const ovstage_config_t config{ &entry, 1 };
+        const auto status = ovstage_initialize(&config);
+        initialized_ = status == OVSTAGE_OK;
+        ASSERT_EQ(status, OVSTAGE_OK);
+        WriteModesTest::SetUp();
+    }
+    void TearDown() override
+    {
+        WriteModesTest::TearDown();
+        if (initialized_)
+            EXPECT_EQ(ovstage_shutdown(), OVSTAGE_OK);
+    }
+private:
+    bool initialized_ = false;
+};
+
+TEST_P(WriteModesPolicyTest, CommittedCellsApplyPolicyWithoutSealing)
+{
+    int64_t shape[] = { 2 };
+    int64_t strides[] = { 1 };
+    float values[] = { 10.0f, 20.0f };
+    DLTensor tensor = scalarTensor(values, shape, strides);
+    uint64_t mask = 0b01;
+    ovstage_write_data_t write{};
+    write.tensors = &tensor;
+    write.tensor_count = 1;
+    write.is_array = false;
+    write.count = 2;
+    write.mask = &mask;
+    ASSERT_TRUE(waitOp(stage_,
+        ovstage_write_attribute(stage_, query_, { score_, {} }, 5, write, OVSTAGE_PRIM_MODE_UPSERT), "write A"));
+
+    // Each policy orders retained pair history independently of the write floor.
+    float expectedA = 10.0f;
+    for (ovstage_ordinal_t ordinal : { 5, 4 })
+    {
+        values[0] = ordinal == 5 ? 99.0f : 88.0f;
+        const bool admitted = GetParam() == OVSTAGE_ORDINAL_ADMISSION_FLOOR_ONLY ||
+            (ordinal == 5 && GetParam() == OVSTAGE_ORDINAL_ADMISSION_NONDECREASING);
+        const auto op = ovstage_write_attribute(stage_, query_, { score_, {} }, ordinal, write,
+                                                OVSTAGE_PRIM_MODE_UPSERT);
+        ASSERT_EQ(op.status, OVSTAGE_OK);
+        ASSERT_NE(op.op_index, OVSTAGE_INVALID_OP_ID);
+        ovstage_op_wait_result_t wait{};
+        EXPECT_EQ(ovstage_wait_op(stage_, op.op_index, OVSTAGE_TIMEOUT_INFINITE, &wait),
+                  admitted ? OVSTAGE_OK : OVSTAGE_ERROR_OP_FAILED);
+        if (admitted)
+            expectedA = values[0];
+        else
+        {
+            const ovx_string_t error = ovstage_get_last_op_error(stage_, op.op_index);
+            const std::string message(error.ptr ? error.ptr : "", error.ptr ? error.length : 0);
+            EXPECT_NE(message.find("ordinal"), std::string::npos) << message;
+        }
+        EXPECT_EQ(ovstage_release_op(stage_, op.op_index), OVSTAGE_OK);
+    }
+
+    // A different cell remains writable at 5, despite A's committed change.
+    mask = 0b10;
+    ASSERT_TRUE(waitOp(stage_,
+        ovstage_write_attribute(stage_, query_, { score_, {} }, 5, write, OVSTAGE_PRIM_MODE_UPSERT), "write B"));
+    seal(5);
+    float actual[2] = {};
+    readTwo(5, actual);
+    EXPECT_FLOAT_EQ(actual[0], expectedA);
+    EXPECT_FLOAT_EQ(actual[1], 20.0f);
+
+    // Sealing prohibits replay under every policy; a newer ordinal still works.
+    const auto sealed = ovstage_write_attribute(stage_, query_, { score_, {} }, 5, write,
+                                                OVSTAGE_PRIM_MODE_UPSERT);
+    EXPECT_EQ(sealed.status, OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION);
+    EXPECT_EQ(sealed.op_index, OVSTAGE_INVALID_OP_ID);
+    mask = 0b01;
+    values[0] = 77.0f;
+    ASSERT_TRUE(waitOp(stage_, ovstage_write_attribute(stage_, query_, { score_, {} }, 6, write,
+                                                     OVSTAGE_PRIM_MODE_UPSERT), "newer A"));
+    seal(6);
+    readTwo(6, actual);
+    EXPECT_FLOAT_EQ(actual[0], 77.0f);
+    EXPECT_FLOAT_EQ(actual[1], 20.0f);
+}
+
+INSTANTIATE_TEST_SUITE_P(OrdinalPolicies, WriteModesPolicyTest,
+    ::testing::Values(OVSTAGE_ORDINAL_ADMISSION_STRICTLY_INCREASING,
+                      OVSTAGE_ORDINAL_ADMISSION_NONDECREASING,
+                      OVSTAGE_ORDINAL_ADMISSION_FLOOR_ONLY));
+
 TEST_F(WriteModesTest, UpsertVsInsert)
 {
     int64_t shape[] = { 2 };

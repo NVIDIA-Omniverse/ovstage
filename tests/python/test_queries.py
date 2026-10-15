@@ -6,7 +6,6 @@
 # file holds the compact asserted snippets (per-predicate match counts + query
 # introspection) that the stage-queries skill sources.
 
-import math
 
 import numpy as np
 import pytest
@@ -107,7 +106,7 @@ def _populate_query_scene(stage, paths):
     """Populate QUERY_USDA and write example:count to two prims. Returns the
     (usd-prim-type, example:count) tokens the filter/introspection cases use."""
     population.open_usd_from_string(
-        stage, QUERY_USDA, ordinal=1, time_code=math.nan, domains=PopulationDomain.ALL
+        stage, QUERY_USDA, ordinal=1, time=population.DEFAULT_TIME, domains=PopulationDomain.ALL
     )
     stage.advance_write_floor(ordinal=1).wait()
 

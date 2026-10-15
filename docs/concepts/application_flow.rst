@@ -9,43 +9,36 @@
 .. its affiliates is strictly prohibited.
 
 Application Flow
-================
+========================
 
-ovstage is a data stage, not a renderer. A program creates an instance,
-identifies prims and attributes through the instance-owned
-:doc:`path dictionary </scene/path_dictionary>`, writes attribute columns at
-explicit *ordinals*, seals them by advancing the write floor, and reads them
-back. Every step rides on the same asynchronous submit/observe model: enqueues
-are synchronous and return an ``op_index`` immediately, while the actual work
-runs later and is observed with ``ovstage_wait_op`` or a ``fetch_*`` call.
+This page shows how to create an ovstage instance, write
+:term:`attributes <Attribute>`, and read them back. See :doc:`overview` for the
+data model and :doc:`async_model` for waiting on operations.
 
-Two cross-cutting rules govern every stage:
+Create, Write, and Read
+-------------------------------
 
-- **Asynchronous enqueue/observe** — an enqueue returns an ``op_index``
-  immediately; nothing has executed until you wait or fetch. Refer to
-  :doc:`async_model`.
-- **Ordinals and the write floor** — writes carry an ``ordinal``; advancing the
-  write floor seals everything at or below it. Reads target sealed data at or
-  below the write floor; queries resolve against the latest committed state.
+1. Create the stage with the :class:`ovstage.Stage` context manager.
+2. Obtain its :class:`ovstage.PathDictionary` and build a list of :term:`prims <Prim>`.
+3. Open a query over the list with :meth:`ovstage.Stage.query_from_path_list()`.
+4. Write values at an :term:`ordinal <Ordinal>` that clears the current
+   :term:`watermark <Watermark>` and satisfies :ref:`ordinal-admission-policies`.
+   Wait for the write to complete and check for errors.
+5. Advance the watermark and wait for completion.
+6. Read the values, then release the results before updating the same data.
+7. Release the read and query handles and the path list before destroying the stage.
+   In C, also release tracking for completed operations. Do not destroy the
+   instance-owned path dictionary separately.
 
-Canonical Lifecycle
--------------------
+In Python, ``Operation.ok`` checks only enqueue acceptance. Call ``wait()``
+on mutations and observe query/read/map operations inside their context managers.
+Cleanup is not a substitute for checking completion errors.
 
-The minimal program follows this order:
-
-1. ``ovstage_create_instance`` — create the stage.
-2. ``ovstage_get_path_dictionary`` — obtain the instance-owned dictionary.
-3. Intern a token / build a prim-path list.
-4. ``ovstage_query_from_path_list`` — open a :doc:`query </scene/queries>` over those prims.
-5. ``ovstage_write_attribute`` — :doc:`write </scene/writing_attributes>` a column at an ``ordinal``.
-6. ``ovstage_advance_write_floor`` — seal the ordinal so it becomes readable.
-7. ``ovstage_read_attributes`` / ``ovstage_fetch_read_next`` — :doc:`read </scene/reading_attributes>` the column back.
-8. Release in reverse: ``ovstage_release_group`` → ``ovstage_release_read`` →
-   release the path list → ``ovstage_destroy_instance``.
-
-The path dictionary is instance-owned and must never be freed by the caller.
-
-The write → seal → read core, in both languages:
+The snippets below write three temperature values at ordinal 1, advance the
+watermark, and read them back. ``query`` selects three prims; ``attr`` identifies
+``temperature``. Python imports NumPy as ``np`` and ``OrdinalRange`` from
+``ovstage``. The C API example uses C++; its ``waitOp()`` helper waits, checks
+errors, and releases operation tracking.
 
 .. tab-set::
 
@@ -67,59 +60,25 @@ The write → seal → read core, in both languages:
          :exclude-pattern: ^\s*//\s*\[/?snippet:
          :dedent:
 
-Python vs. C
-------------
+      The C example releases the read handle separately during cleanup:
 
-.. list-table::
-   :header-rows: 1
+      .. filtered-literalinclude:: ../../examples/c/minimal/main.cpp
+         :language: cpp
+         :start-after: // [snippet:overview-release-read]
+         :end-before: // [/snippet:overview-release-read]
+         :exclude-pattern: ^\s*//\s*\[/?snippet:
+         :dedent:
 
-   * - Concern
-     - Python
-     - C
-   * - Instance Lifetime
-     - Managed by the ``Stage`` context manager.
-     - ``ovstage_create_instance`` / ``ovstage_destroy_instance``.
-   * - Enqueue
-     - Methods return handle objects (``Query``, ``Read``, ``Map``).
-     - Functions return ``ovstage_enqueue_result_t`` (status + ``op_index``).
-   * - Observe
-     - ``.wait(timeout=...)`` on the handle.
-     - ``ovstage_wait_op`` / ``ovstage_fetch_*``.
-   * - Attribute Data
-     - DLPack-compatible arrays (NumPy, etc.).
-     - ``DLTensor`` payloads (refer to :doc:`dlpack_tensors`).
-   * - Errors
-     - Raise ``ovstage.OvstageError`` / ``ovstage.OvxError``.
-     - Return status codes; inspect with the diagnostics accessors.
+Python releases the read when its ``with`` block exits. Within that block,
+:meth:`read.wait().fetch_next() <ovstage.Read.fetch_next>` can combine the wait and fetch; :meth:`wait() <ovstage.Read.wait>` returns
+the read handle. In both languages,
+releasing a read handle does not release its returned groups of data. Release
+those explicitly, as shown above. This example returns one group; general readers
+must fetch all groups. See :doc:`/scene/reading_attributes`.
 
-Common Failure Modes
---------------------
+Further Reading
+-----------------------
 
-- **Reading selected unsealed state fails** with
-  ``OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION``. Advance the write floor first
-  (step 6).
-- **A fixed range rejects a later change to the same selected key.** If a
-  selected ``(attribute, path)`` also has a retained change after the range end,
-  the read fails with ``OVSTAGE_ERROR_OUT_OF_RANGE`` whether or not that later
-  change is sealed. Widen or rebase the range, repoll from a newer cursor, or
-  request current state when that is what the consumer wants. Advancing the
-  floor alone does not resolve this error.
-- **Writing at or below the write floor is rejected** with
-  ``OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION``. Choose an ordinal above the current
-  floor. (Advancing the floor backwards is *not* an error — it clamps.)
-
-.. note::
-
-   This build retains only the **latest committed** state. Fixed ranges select
-   the keys that changed, not historical payloads, and return
-   ``OVSTAGE_ERROR_OUT_OF_RANGE`` when a selected key changed again after the
-   range end.
-
-Where to Go Next
-----------------
-
-- :doc:`async_model` — enqueue vs. execution, op ids, waits, and timeouts.
-- :doc:`/scene/path_dictionary` — interning tokens, paths, and path lists.
-- :doc:`/scene/writing_attributes` / :doc:`/scene/reading_attributes` — the write and read paths in detail.
-- :doc:`error_handling` — status codes, per-op errors, and Python exceptions.
-- :doc:`/scene/population` — ingesting USD content into the stage.
+* :doc:`/scene/path_dictionary` — create path lists and resolve names.
+* :doc:`error_handling` — check errors and recover from failed writes.
+* :doc:`/scene/population` — load USD content into the stage.

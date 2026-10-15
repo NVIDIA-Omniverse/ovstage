@@ -53,11 +53,9 @@ static void checkOvx(path_dictionary_instance_t* dict, ovx_api_result_t result, 
 }
 
 // [snippet:enqueue-wait-error]
-// Drive an async enqueue to completion. Enqueue success (OVSTAGE_OK) only
-// means the op was accepted, so wait on the op id, report any per-op errors
-// surfaced by the wait, and retire the op (ovstage_destroy_instance requires
-// every op released first). The examples fail fast; a real application would
-// propagate the errors instead.
+// Wait for the operation and its dependencies, then inspect any errors.
+// Read messages before another wait and release tracking after completion.
+// This example exits on error; applications can propagate the error instead.
 static void waitOp(ovstage_instance_t* stage, ovstage_enqueue_result_t enq, const char* what)
 {
     check(stage, enq.status, what);
@@ -135,8 +133,10 @@ int main()
     // ---- 3. write one float per prim, seal ordinal 1, read it back ----
     // [snippet:minimal-write-read]
     // Write one float per prim into the "temperature" column (UPSERT creates
-    // the prims on first write), seal it by advancing the write floor to
-    // ordinal 1, then read the column back.
+    // the prims on first write), advance the watermark to ordinal 1,
+    // then read the column back.
+    // Describe three contiguous CPU floats, one per prim in query order.
+    // The tensor references this array; keep it alive until the write completes.
     float values[] = { 1.0f, 2.0f, 3.0f };
     int64_t shape[] = { 3 };
     int64_t strides[] = { 1 };
@@ -148,21 +148,29 @@ int main()
     tensor.shape = shape;
     tensor.strides = strides;
 
+    // This is one scalar per prim, rather than a variable-length array per prim.
     ovstage_write_data_t write{};
     write.tensors = &tensor;
     write.tensor_count = 1;
     write.is_array = false;
 
+    // Submit the values at ordinal 1. UPSERT creates missing prims/attributes.
+    // waitOp checks both acceptance and completion before we proceed.
     ovstage_enqueue_result_t enq =
         ovstage_write_attribute(stage, query, attrArg, /*ordinal*/ 1, write, OVSTAGE_PRIM_MODE_UPSERT);
     waitOp(stage, enq, "write_attribute");
 
+    // Finish writes through ordinal 1 for all attributes. Once this completes,
+    // the values can be read and further writes at ordinals <= 1 are rejected.
     ovstage_write_floor_desc_t writeFloor{};
     writeFloor.ordinal = 1;
     writeFloor.scope = OVSTAGE_SCOPE_ALL;
     enq = ovstage_advance_write_floor(stage, &writeFloor);
     waitOp(stage, enq, "advance_write_floor");
 
+    // Read the values at ordinal 1 (a snapshot: no start ordinal). A later change
+    // to this attribute would make this read fail with OUT_OF_RANGE; use
+    // UINT64_MAX as the end to read current values.
     ovstage_ordinal_range_t range{};
     range.end_ordinal = 1;
     range.has_start_ordinal = false;
@@ -170,6 +178,8 @@ int main()
     enq = ovstage_read_attributes(stage, query, &attr, 1, range, &read);
     waitOp(stage, enq, "read_attributes");
 
+    // Fetch the result data after the read completes. This uniform example
+    // returns one group; general readers fetch until END_OF_ITERATION.
     ovstage_read_group_t group{};
     status = ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group);
     check(stage, status, "fetch_read_next");
@@ -178,6 +188,8 @@ int main()
         std::fprintf(stderr, "unexpected read layout\n");
         return EXIT_FAILURE;
     }
+    // Borrow the returned floats while the group is alive. Releasing the group
+    // invalidates this pointer; copy the values first if they must live longer.
     const float* out = static_cast<const float*>(group.data.tensors[0].data);
     std::printf("read back ordinal %llu: %.1f %.1f %.1f\n", (unsigned long long)group.ordinal, out[0], out[1], out[2]);
     ovstage_release_group(stage, &group); // the tensor data is only valid until the group is released
@@ -202,8 +214,11 @@ int main()
 
     // Release every handle, then destroy: ovstage_destroy_instance requires
     // all ops and handles released first.
+    // [snippet:overview-release-read]
+    // Release the read handle after releasing its returned data.
     enq = ovstage_release_read(stage, read);
     waitOp(stage, enq, "release_read");
+    // [/snippet:overview-release-read]
     enq = ovstage_release_query(stage, query);
     waitOp(stage, enq, "release_query");
     path_dictionary_release_path_list_reference(dict, pathList);

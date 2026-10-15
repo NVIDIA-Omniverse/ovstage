@@ -213,6 +213,22 @@ def configure_prototypes(lib: ctypes.CDLL) -> None:
                 ovstage_ordinal_t,
             ]
             lib.ovstage_population_export_desc_init_snapshot.restype = err
+        if hasattr(lib, "ovstage_population_export_to_usd_layer_identifier"):
+            lib.ovstage_population_export_to_usd_layer_identifier.argtypes = [
+                inst,
+                ovx_string_t,
+                ctypes.POINTER(ovstage_population_export_desc_t),
+                ctypes.POINTER(ovstage_population_export_report_t),
+            ]
+            lib.ovstage_population_export_to_usd_layer_identifier.restype = err
+        if hasattr(lib, "ovstage_population_export_to_usd_stage_identifier"):
+            lib.ovstage_population_export_to_usd_stage_identifier.argtypes = [
+                inst,
+                ovx_string_t,
+                ctypes.POINTER(ovstage_population_export_desc_t),
+                ctypes.POINTER(ovstage_population_export_report_t),
+            ]
+            lib.ovstage_population_export_to_usd_stage_identifier.restype = err
         if hasattr(lib, "ovstage_population_export_destination_create"):
             lib.ovstage_population_export_destination_create.argtypes = [
                 inst,
@@ -250,6 +266,22 @@ def configure_prototypes(lib: ctypes.CDLL) -> None:
             ]
             lib.ovstage_population_export_to_usd_file.restype = err
 
+    if hasattr(lib, "ovstage_population_export_enqueue_to_usd_layer_identifier"):
+        enqueue_layer = lib.ovstage_population_export_enqueue_to_usd_layer_identifier
+        enqueue_layer.argtypes = [
+            inst,
+            ovx_string_t,
+            ctypes.POINTER(ovstage_population_export_desc_t),
+        ]
+        enqueue_layer.restype = ovstage_population_enqueue_result_t
+    if hasattr(lib, "ovstage_population_export_enqueue_to_usd_stage_identifier"):
+        enqueue_stage_identifier = lib.ovstage_population_export_enqueue_to_usd_stage_identifier
+        enqueue_stage_identifier.argtypes = [
+            inst,
+            ovx_string_t,
+            ctypes.POINTER(ovstage_population_export_desc_t),
+        ]
+        enqueue_stage_identifier.restype = ovstage_population_enqueue_result_t
     if hasattr(lib, "ovstage_population_export_destination_enqueue_create"):
         enqueue_create = lib.ovstage_population_export_destination_enqueue_create
         enqueue_create.argtypes = [
@@ -303,6 +335,6 @@ def load() -> ctypes.CDLL:
 
 def available() -> bool:
     try:
-        return hasattr(load(), "ovstage_population_export_to_usd_file")
+        return hasattr(load(), "ovstage_population_export_to_usd_layer_identifier")
     except Exception:  # noqa: BLE001 - library not loadable in this environment
         return False

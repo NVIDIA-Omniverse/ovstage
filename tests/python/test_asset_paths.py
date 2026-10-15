@@ -37,12 +37,13 @@ def _pairs(rows) -> np.ndarray:
 def _check_asset_group(group):
     """An asset column is a fixed 16-byte id pair, not a ragged byte row."""
     assert not group.is_array
-    assert AttributeSemantic(group.raw.semantic) == AttributeSemantic.ASSET_PATH_ID
+    assert group.semantic == AttributeSemantic.ASSET_PATH_ID
     for row in range(group.tensor_count):
         dtype = group.tensor(row).dtype
         assert dtype.code == DLDataTypeCode.kDLUInt
         assert dtype.bits == 64
-        assert dtype.lanes == 2
+        assert dtype.lanes == 1
+        assert group.tensor(row).shape_tuple[-1] == 2
 
 
 def _pairs_by_path(group, paths):

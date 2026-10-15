@@ -1,0 +1,27 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    timeCodesPerSecond = 24
+)
+def Xform "World"
+{
+    double3 xformOp:translate = (10, 0, 0)
+    uniform token[] xformOpOrder = ["xformOp:translate"]
+    def Cube "Body" (
+        prepend apiSchemas = ["PhysicsRigidBodyAPI"]
+        customData = { string label = "robot" }
+    )
+    {
+        custom float temperature = 20 (
+            customData = { string unit = "C" }
+        )
+        custom float temperature.timeSamples = { 0: 20, 24: 30 }
+        custom token state = "ready"
+        custom point3f[] points = [(1, 2, 3), (4, 5, 6)]
+        custom token emptyName = ""
+        custom float[] emptyArray = []
+        float3[] extent = [(-1, -1, -1), (1, 1, 1)]
+        double3 xformOp:translate = (2, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+}

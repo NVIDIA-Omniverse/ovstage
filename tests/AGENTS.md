@@ -45,11 +45,11 @@ runs via `pytest`. Both build and run against the produced package, not the buil
 tree.
 
 There is no separate `usd/` suite. Runtime-to-USD export is covered through both
-public-contract suites. Both use the saved-file and reusable-destination APIs and
-inspect the persisted USD through public test/report behavior and the saved text,
-without coupling to OpenUSD C++ ABI types. ovstage owns every export
-destination, so no public route authors into a caller-owned layer or stage and
-no public test may assume the caller shares ovstage's USD runtime.
+public-contract suites. The C suite uses the one-shot saved-file API and inspects
+the persisted USD through public test/report behavior without coupling to OpenUSD
+C++ ABI types. The Python suite additionally keeps a destination layer resident,
+authors through its identifier, applies the resulting USD notice, and verifies
+publication through the destination's population owner.
 
 ### Data flow: test → snippet → skill → doc
 
@@ -110,8 +110,18 @@ consumed by an ovstage skill and/or public documentation.
 
 | Snippet | Source file | Used in |
 |---------|-------------|---------|
-| `write-read-roundtrip-c` | `tests/c/test_minimal.cpp` | `skills/application-flow` |
+| `initialize-static-loader-c` | `tests/c/test_static_config.cpp` | `skills/project-setup-c`, `skills/application-flow` |
+| `dlpack-three-prim-query` | `tests/python/test_minimal.py` | `docs/concepts/dlpack_tensors.rst` |
+| `dlpack-three-prim-query-c` | `tests/c/test_minimal.cpp` | `docs/concepts/dlpack_tensors.rst` |
+| `dlpack-pass-values` | `tests/python/test_minimal.py` | `docs/concepts/dlpack_tensors.rst` |
+| `dlpack-pass-values-c` | `tests/c/test_minimal.cpp` | `docs/concepts/dlpack_tensors.rst` |
+| `dlpack-copy-result` | `tests/python/test_minimal.py` | `docs/concepts/dlpack_tensors.rst` |
+| `dlpack-copy-result-c` | `tests/c/test_minimal.cpp` | `docs/concepts/dlpack_tensors.rst` |
+| `dlpack-map-existing` | `tests/python/test_map_attribute.py` | `docs/concepts/dlpack_tensors.rst` |
+| `dlpack-map-existing-c` | `tests/c/test_map_attribute.cpp` | `docs/concepts/dlpack_tensors.rst` |
+| `write-read-roundtrip-c` | `tests/c/test_minimal.cpp` | `skills/application-flow`, `skills/dlpack-tensor-exchange` |
 | `write-read-roundtrip` | `tests/python/test_minimal.py` | `skills/application-flow` |
+| `nonblocking-poll-c` | `tests/c/test_minimal.cpp` | `skills/cpu-ahead-gpu-async` |
 | `populate-and-query-c` | `tests/c/test_population.cpp` | `skills/loading-usd` |
 | `populate-and-query` | `tests/python/test_population.py` | `skills/loading-usd` |
 | `usd-reference-c` | `tests/c/test_population.cpp` | `skills/loading-usd` |
@@ -139,6 +149,8 @@ consumed by an ovstage skill and/or public documentation.
 | `export-runtime-to-usd-async` | `tests/python/test_population_export.py` | `skills/exporting-to-usd`, `docs/scene/exporting_to_usd.rst` |
 | `clone-and-verify-c` | `tests/c/test_clone.cpp` | `skills/clone-subtree-multienv` |
 | `clone-and-verify` | `tests/python/test_clone.py` | `skills/clone-subtree-multienv` |
+| `clone-result-c` | `tests/c/test_clone.cpp` | `skills/clone-subtree-multienv`, `docs/scene/cloning.rst` |
+| `clone-result` | `tests/python/test_clone.py` | `skills/clone-subtree-multienv`, `docs/scene/cloning.rst` |
 | `clone-target-exists-error-c` | `tests/c/test_error_handling.cpp` | `skills/error-handling` |
 | `clone-target-exists-error` | `tests/python/test_error_handling.py` | `skills/error-handling` |
 | `query-by-usd-path-c` | `tests/c/test_queries.cpp` | `skills/stage-queries` |
@@ -149,10 +161,16 @@ consumed by an ovstage skill and/or public documentation.
 | `query-predicate-matrix` | `tests/python/test_queries.py` | `skills/stage-queries` |
 | `query-result-introspection-c` | `tests/c/test_queries.cpp` | `skills/stage-queries` |
 | `query-result-introspection` | `tests/python/test_queries.py` | `skills/stage-queries` |
+| `empty-change-range-c` | `tests/c/test_change_feed.cpp` | `skills/application-flow` |
+| `empty-change-range` | `tests/python/test_change_feed.py` | `skills/application-flow` |
+| `include-seal-change-range-c` | `tests/c/test_change_feed.cpp` | `skills/application-flow` |
+| `include-seal-change-range` | `tests/python/test_change_feed.py` | `skills/application-flow` |
+| `frozen-vs-fresh-query-c` | `tests/c/test_change_feed.cpp` | `skills/application-flow` |
+| `frozen-vs-fresh-query` | `tests/python/test_change_feed.py` | `skills/application-flow` |
 | `canonical-fixed-shapes-c` | `tests/c/test_minimal.cpp` | `skills/dlpack-tensor-exchange` |
 | `canonical-fixed-shapes` | `tests/python/test_minimal.py` | `skills/dlpack-tensor-exchange` |
-| `attribute-shapes-fixed-c` | `tests/c/test_attribute_shapes.cpp` | `skills/dlpack-tensor-exchange` |
-| `attribute-shapes-fixed` | `tests/python/test_attribute_shapes.py` | `skills/dlpack-tensor-exchange` |
+| `attribute-shapes-fixed-c` | `tests/c/test_attribute_shapes.cpp` | `skills/dlpack-tensor-exchange`, `docs/concepts/dlpack_tensors.rst` |
+| `attribute-shapes-fixed` | `tests/python/test_attribute_shapes.py` | `skills/dlpack-tensor-exchange`, `docs/concepts/dlpack_tensors.rst` |
 | `attribute-shapes-ragged-c` | `tests/c/test_attribute_shapes.cpp` | `skills/dlpack-tensor-exchange` |
 | `attribute-shapes-ragged` | `tests/python/test_attribute_shapes.py` | `skills/dlpack-tensor-exchange` |
 | `semantic-roles-c` | `tests/c/test_attributes.cpp` | `skills/dlpack-tensor-exchange` |
@@ -165,8 +183,8 @@ consumed by an ovstage skill and/or public documentation.
 | `map-dlpack-readonly` | `tests/python/test_map_attribute.py` | `skills/dlpack-tensor-exchange` |
 | `upsert-vs-insert-c` | `tests/c/test_write_modes.cpp` | `skills/error-handling` |
 | `upsert-vs-insert` | `tests/python/test_write_modes.py` | `skills/error-handling` |
-| `sparse-index-map-and-mask-c` | `tests/c/test_sparse_writes.cpp` | _(test only)_ |
-| `sparse-index-map-and-mask` | `tests/python/test_sparse_writes.py` | _(test only)_ |
+| `sparse-index-map-and-mask-c` | `tests/c/test_sparse_writes.cpp` | `docs/concepts/dlpack_tensors.rst` |
+| `sparse-index-map-and-mask` | `tests/python/test_sparse_writes.py` | `docs/concepts/dlpack_tensors.rst` |
 | `delete-attribute-then-prim-c` | `tests/c/test_delete.cpp` | _(test only)_ |
 | `delete-attribute-then-prim` | `tests/python/test_delete.py` | _(test only)_ |
 | `log-callback-filter-c` | `tests/c/test_logging.cpp` | `skills/logging` |
@@ -174,6 +192,10 @@ consumed by an ovstage skill and/or public documentation.
 | `version-and-error-c` | `tests/c/test_support_api.cpp` | `skills/error-handling` |
 | `dlpack-round-trip` | `tests/python/test_support_api.py` | `skills/dlpack-tensor-exchange` |
 | `configure-transform-updates` | `tests/python/test_config.py` | `docs/guides/project_setup_python.rst` |
+| `configure-ordinal-admission-c` | `tests/c/test_support_api.cpp` | `docs/guides/project_setup_c.rst` |
+| `configure-ordinal-admission` | `tests/python/test_config.py` | `docs/guides/project_setup_python.rst` |
+| `wait-chaining` | `tests/python/test_minimal.py` | `skills/error-handling`, `skills/cpu-ahead-gpu-async` |
+| `write-with-placement` | `tests/python/test_placement.py` | _(test only)_ |
 
 These are asserted tested snippets (they verify behavior, not just print it). Most
 feed an ovstage skill; a few are `(test only)` until a matching skill exists. New
@@ -211,3 +233,113 @@ cd c && cmake -B build -DCMAKE_PREFIX_PATH=/path/to/ovstage && cmake --build bui
 ctest --test-dir build --output-on-failure
 cd ../python && python -m pytest -v      # ovstage on PYTHONPATH + libovstage on the loader path
 ```
+
+### Query existence examples
+
+These runnable example snippets supplement the asserted `query-by-usd-path`
+and `query-has-attribute` tests above. Both examples are included in
+`docs/scene/queries.rst` and their adjacent READMEs.
+
+| Snippet | Example source |
+|---------|----------------|
+| `query-prim-exists`, `query-attribute-exists` | `examples/python/queries/main.py` |
+| `query-prim-exists-c`, `query-attribute-exists-c` | `examples/c/queries/main.cpp` |
+
+### Common query examples
+
+These runnable snippets supplement the existing `query-predicate-matrix` and
+query introspection tests. Each has Python/C tabs in `docs/scene/queries.rst`
+and an identical excerpt in its example README.
+
+| Snippet | Example source |
+|---------|----------------|
+| `query-filter-imports` | `examples/python/queries/main.py` |
+| `query-type-subtree` | `examples/python/queries/main.py` |
+| `query-type-subtree-c` | `examples/c/queries/main.cpp` |
+| `query-direct-children` | `examples/python/queries/main.py` |
+| `query-direct-children-c` | `examples/c/queries/main.cpp` |
+| `query-required-attributes` | `examples/python/queries/main.py` |
+| `query-required-attributes-c` | `examples/c/queries/main.cpp` |
+| `query-matched-paths` | `examples/python/queries/main.py` |
+| `query-matched-paths-c` | `examples/c/queries/main.cpp` |
+
+Applied-schema query examples (Python/C tabs in `docs/scene/queries.rst`):
+
+| Snippet | Example source |
+|---------|----------------|
+| `query-applied-schema` | `examples/python/queries/main.py` |
+| `query-list-schemas` | `examples/python/queries/main.py` |
+| `query-applied-schema-c` | `examples/c/queries/main.cpp` |
+| `query-list-schemas-c` | `examples/c/queries/main.cpp` |
+
+### Attribute write examples
+
+Runnable examples in `examples/python/write-flavors/main.py` and
+`examples/c/write-flavors/main.cpp` supply the Writing Attributes snippets.
+Each C marker has a `-c` suffix; README excerpts match the source.
+
+| Snippet | Demonstrates |
+|---------|--------------|
+| `write-parameters` | Basic write arguments and lifetime |
+| `write-fixed-shape` | Compact fixed-size vector layout |
+| `write-array-width` | Explicit lanes and unequal per-prim array lengths |
+| `write-index-map` | Reusing source rows |
+| `write-mask` | Selecting target prims |
+| `write-count` | Writing only the first two prims |
+| `write-watermark` | Selected-attribute and global advances |
+| `write-semantic` | Interned tokens with TOKEN_ID |
+
+### Transform examples
+
+`examples/python/transforms/main.py` and `examples/c/transforms/main.cpp`
+provide `transform-layout`, `transform-write`, `transform-compute`,
+`transform-override`, and `transform-read` (C markers append `-c`).
+Python's `transform-imports` supplies the shared imports. These snippets
+appear in `docs/scene/transforms.rst` and the example READMEs. The examples
+populate matching `car.usda` fixtures and run with CPU hierarchy computation.
+
+The CUDA-buffer helper snippets `gpu-transform-write` and
+`gpu-transform-write-c` live in `examples/{python,c}/transforms/gpu_write.*`.
+They accept caller-owned GPU buffers and a recorded completion event; running
+them requires a working CUDA device and a producer supplying those inputs.
+
+### Attribute read examples
+
+The write-flavors examples provide `read-copy-groups`, `read-fixed-vectors`,
+`read-change-range`, and `read-retained-records` (C markers append `-c`).
+They read back the write-options data and appear in Reading Attributes and
+the example READMEs. The metadata section reuses `query-matched-paths`.
+
+### Clone operation examples
+
+The write-flavors examples provide `clone-duplicate-targets`,
+`clone-async-report`, and `clone-specific-failure` (C markers append `-c`).
+They appear in Cloning Subtrees and the example READMEs, demonstrating
+submission rejection, asynchronous completion, and fetching a failure before release.
+
+### Population walkthrough examples
+
+`examples/{python,c}/population/main.*` supplies `population-*` snippets for
+`docs/scene/population.rst` and `docs/examples/population.rst`: setup, paths,
+property-metadata, stage-metadata, default, numeric, strings, arrays, empty, extent,
+stage-metadata-read, property-metadata-read, reserved, ancestor, time, ordinals,
+failure, empty-array, prim-metadata-read, schemas, and subtree. C markers have a `-c` suffix; Python also has `population-imports`.
+Run both examples against the local population-enabled library when editing them.
+
+### USD export walkthrough examples
+
+`examples/{python,c}/usd-export/main.*` supplies `export-write-runtime`,
+`export-example-setup`, `export-file`, `export-lifetime`, `export-reuse`, `export-custom`, `export-rule`,
+`export-rename`, `export-selection`, `export-matrix`, `export-report`,
+`export-async`, `export-changed`, and `export-mesh` (C appends `-c`). Python also
+has `export-example-imports`; existing `typed-hierarchy-*-example` markers remain.
+Used by `docs/scene/exporting_to_usd.rst` and `docs/examples/usd_export.rst`.
+Run both complete examples against a local population/export-enabled build.
+
+### Instancing walkthrough examples
+
+`examples/{python,c}/queries/main.*` supplies `instancing-queries`,
+`instancing-timing`, `instancing-nested`, and `instancing-not-found`
+(C appends `-c`) for `docs/scene/instancing.rst`. Python also supplies
+`instancing-imports`. Keep both `nested.usda` fixtures identical and run both
+complete query examples when updating these snippets.

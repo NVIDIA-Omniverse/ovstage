@@ -8,97 +8,152 @@
 .. without an express license agreement from NVIDIA CORPORATION or
 .. its affiliates is strictly prohibited.
 
-Asynchronous Submit/Observe Model
-=================================
+Asynchronous Operations
+===============================
 
-ovstage is an asynchronous, ordinal-keyed submit/observe system. State-mutating
-and data-producing calls **enqueue** synchronously — they return an
-``ovstage_enqueue_result_t`` (status + ``op_index``) immediately — while the real
-work runs later. This lets the CPU run ahead of execution: a producer can push
-many ordinals of data while consumers **observe** at their own cadence.
+Asynchronous calls return without waiting for their work to complete. Check whether the call was
+accepted, then wait when you need its result. Work can finish before you call the
+wait function.
 
-Enqueue vs. Execution
+Submit and Wait
+-----------------------
+
+In Python, :meth:`ovstage.Operation.wait()` waits, checks errors, and releases
+operation tracking after completion. On success it returns the operation itself.
+A read or map handle's :meth:`wait() <ovstage.Operation.wait>` returns that handle, so a subsequent fetch can
+chain. Keep the handle in a ``with`` block while using it. A completed operation
+cannot be waited again. Submission or execution failures raise
+:class:`ovstage.OvstageError`. Use :meth:`ovstage.Stage.wait_op()` when
+you need to inspect completion without releasing the :term:`operation ID <Operation ID>`.
+
+A mutation's ``Operation.ok`` reports only enqueue acceptance, even if execution
+later fails. Retain it and call ``wait()``. Use query/read/map context managers
+for ownership and explicitly observe their operations; finalizers provide cleanup,
+not reliable error reporting.
+
+Mutation calls return an :class:`ovstage.Operation`;
+:meth:`ovstage.Stage.clone_async()` returns a :class:`ovstage.CloneOperation`.
+Its :meth:`ovstage.CloneOperation.result()` returns the clone report.
+
+In C, an asynchronous call returns ``ovstage_enqueue_result_t``. Check its
+``status`` before using ``op_index``; a rejected call returns
+``OVSTAGE_INVALID_OP_ID``. Call :c:func:`ovstage_wait_op()` to wait, then check both
+its return status and ``error_op_ids``. Copy messages before the next wait on the
+same thread. For a clone report, use :c:func:`ovstage_fetch_clone_result()`.
+See :doc:`error_handling`.
+
+Ordering
+----------------
+
+Writes, clones, deletes, and writes completed through mapped buffers carry an
+:term:`ordinal <Ordinal>`. Operations at the same ordinal execute in submission order.
+Operations at different ordinals may run concurrently and do not guarantee
+execution order.
+
+Under the ``STRICTLY_INCREASING`` policy, ordering does not allow multiple
+modifications to the same cell at one ordinal. Writes, map commits, clones and
+deletes must use an ordinal newer than the retained committed changes to each
+affected cell, and clear applicable floors and prim-lifecycle checks. Disjoint
+cells may share an ordinal. Process configuration can select ``NONDECREASING`` to
+allow equal unsealed ordinals or ``FLOOR_ONLY`` to skip retained-history
+conflicts; see :ref:`ordinal-admission-policies`.
+
+Producers updating disjoint cells can proceed independently, subject to shared
+write floors and prim-lifecycle checks. Producers updating the same cells must
+coordinate completion or handle rejection: if ordinal 11 commits first, a later
+write at 10 is rejected under both ``STRICTLY_INCREASING`` and ``NONDECREASING``.
+For successive updates that must all succeed, wait for the earlier update to
+complete successfully before submitting the next. An atomic ordinal counter
+alone does not order submission or completion.
+
+WRITE and MAP enqueue check known floors provisionally. A retained value
+conflict can fail WRITE at execution or MAP at setup; MAP also checks again at
+publication. Always wait or fetch the result before treating an enqueue as
+successful. For partially failed operations, completed entries remain
+committed. Repair and same-ordinal retries depend on the selected policy and
+current stage state; see :doc:`error_handling` for the full recovery rules.
+
+
+Advancing a :term:`watermark <Watermark>` is ordered after preceding writes in its scope at
+or below the target ordinal. Reads do not automatically wait for that advance;
+observe its successful completion before issuing dependent reads.
+
+Waiting for an operation also waits for its dependencies. It does not wait for
+every operation on the stage. Retain input buffers until the operation using
+them completes, and release read results before overlapping writes. With a
+placement availability event, operation completion can precede device completion:
+keep sources and result groups alive through their device work. See
+:ref:`ovstage-placement-synchronization`.
+
+Running producers ahead does not preserve earlier values for later reads.
+See :doc:`overview` for the historical-read limitations.
+
+Reads During Rendering
+----------------------
+
+When ovrtx renders from an attached runtime stage, it
+holds an internal lock while accessing that stage. Queries and attribute reads
+can complete while this lock is held. New writes, deletes, mapped writes,
+clones, hierarchy computations, and watermark advances submitted through
+ovstage wait until the lock is released.
+
+Complete the required :term:`watermark <Watermark>` advances before rendering;
+ovrtx rejects a rendering step if the stage still has changes above their
+watermarks. The lock does not preserve historical values: queries still select
+prims from the current stage, and reads have the retention limits described in
+:doc:`overview`.
+
+Shared Stage Lifetime
 ---------------------
 
-- An enqueue returning ``OVSTAGE_OK`` means the op was *accepted*, not
-  *completed*. Check ``status == OVSTAGE_OK`` before using ``op_index``; a
-  non-OK enqueue yields ``OVSTAGE_INVALID_OP_ID``.
-- Per-op execution errors surface later, at ``ovstage_wait_op`` (or the matching
-  ``ovstage_fetch_*``), not at enqueue time. Refer to :doc:`error_handling`.
+An attached renderer can retain its own handle to the runtime stage. In that
+case, :meth:`Stage.destroy() <ovstage.Stage.destroy>` releases the application's
+handle, while the renderer's handle keeps the shared stage alive. The same rule
+applies to :c:func:`ovstage_destroy_instance()` in C.
 
-Ordinal Ordering and Concurrency
---------------------------------
+Do not use the released handle or destroy it while another thread is using it.
+Pending operations remain valid through a surviving handle to the same stage;
+complete and release them through that handle. Before releasing the final
+handle, release all operations, query/read/map handles, and read results.
+For normal application cleanup, finish and release your work before destroying
+your :class:`ovstage.Stage`.
 
-Writes, deletes, and map commits carry an explicit ``ordinal``:
+Timeouts and Polling
+----------------------------
 
-- **Same-ordinal** ops execute in submission order.
-- **Different-ordinal** ops are independent and can run concurrently.
-
-A ``ovstage_wait_op`` that returns ``OVSTAGE_OK`` does **not** imply all your
-enqueues finished — ops in other ordinal buckets can still be in flight. Wait on
-the specific ``op_id`` whose result you need. ``ovstage_wait_op`` waits for the
-whole dependency chain up to and including that ``op_id``.
-
-Blocking, Polling, and Timeouts
--------------------------------
-
-``ovstage_wait_op(instance, op_id, timeout, &wait_result)`` (and the
-``ovstage_fetch_*`` calls) share one timeout convention:
+Python waits and fetches take timeouts in nanoseconds. Use
+:data:`ovstage.TIMEOUT_INFINITE` to wait without a time limit:
 
 .. list-table::
    :header-rows: 1
 
-   * - ``timeout``
+   * - Timeout
      - Behavior
    * - ``0``
-     - Poll — return immediately; ``OVSTAGE_ERROR_TIMEOUT`` means "not ready yet."
-   * - ``OVSTAGE_TIMEOUT_INFINITE``
-     - Block until the op completes.
-   * - other (nanoseconds)
-     - Wait up to that long, then report ``OVSTAGE_ERROR_TIMEOUT``.
+     - Return immediately. ``ErrorCode.TIMEOUT`` means the result is not ready.
+   * - ``TIMEOUT_INFINITE``
+     - Wait without a time limit.
+   * - Any other value
+     - Wait up to that many nanoseconds.
 
-``ovstage_timeout_ns_t`` is a ``uint64_t`` nanosecond count and
-``OVSTAGE_TIMEOUT_INFINITE`` is ``~0ULL``. ``OVSTAGE_ERROR_TIMEOUT`` is a
-"not-ready" signal, distinct from the terminal ``OVSTAGE_ERROR_OP_FAILED``. On a
-timeout, ``wait_result.lowest_pending_op_id`` reports the lowest still-pending op
-in the chain — a partial-progress cursor.
+In the result from :meth:`ovstage.Stage.wait_op()`, ``lowest_pending_op_id`` identifies the earliest unfinished
+operation among those the wait depends on. A timeout does not mean the operation
+failed. Once it finishes, read its diagnostics and call
+:meth:`ovstage.Stage.release_op()`. Do not reuse the ID after release.
 
-After an op completes, release its tracking with ``ovstage_release_op``;
-the id must not be reused afterward.
-
-Running the CPU Ahead
----------------------
-
-To run ahead, keep enqueuing across ordinals without blocking, and only wait or
-fetch when you actually need a result. Python mirrors the same model — enqueue
-methods return handles whose ``.wait(timeout=...)`` polls (``timeout=0``) or
-blocks (``TIMEOUT_INFINITE``) and raises ``ovstage.OvstageError`` on op failure:
-
-.. filtered-literalinclude:: ../../examples/python/minimal/main.py
-   :language: python
-   :start-after: # [snippet:nonblocking-poll]
-   :end-before: # [/snippet:nonblocking-poll]
-   :exclude-pattern: ^\s*#\s*\[/?snippet:
-   :dedent:
-
-In C, the same shape is: enqueue, check the enqueue status, then
-``ovstage_wait_op`` on the ``op_index`` and inspect per-op errors:
-
-.. filtered-literalinclude:: ../../examples/c/minimal/main.cpp
-   :language: cpp
-   :start-after: // [snippet:enqueue-wait-error]
-   :end-before: // [/snippet:enqueue-wait-error]
-   :exclude-pattern: ^\s*//\s*\[/?snippet:
-   :dedent:
+In C, :c:type:`ovstage_timeout_ns_t` is an unsigned 64-bit nanosecond count,
+and ``OVSTAGE_TIMEOUT_INFINITE`` disables the time limit. Release completed
+operation tracking with :c:func:`ovstage_release_op()`.
 
 .. note::
 
-   This build retains only the **latest committed** state — do not design async
-   flows that read back older ordinals.
+   For repeated polling in Python, use :meth:`ovstage.Stage.wait_op()` with
+   ``timeout=0``. It returns the status, failed operation IDs, and the earliest
+   pending ID. Check both the status and failed IDs, then release operation
+   tracking after completion. Keep input buffers alive while polling.
+   You can also poll with :meth:`Operation.wait(timeout=0) <ovstage.Operation.wait>`. A timeout raises
+   ``OvstageError`` with ``ErrorCode.TIMEOUT`` and leaves the operation waitable,
+   retaining its input buffers. Successful completion consumes the operation.
 
-Where to Go Next
-----------------
-
-- :doc:`error_handling` — enqueue vs. per-op errors and the diagnostics accessors.
-- :doc:`dlpack_tensors` — CPU/GPU tensor exchange and ``cuda_sync`` synchronization.
-- :doc:`application_flow` — where waiting fits in the overall lifecycle.
+See :doc:`application_flow` for the write-and-wait sequence in Python and C, and
+:doc:`error_handling` for the error-checking helpers.

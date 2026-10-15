@@ -10,9 +10,10 @@
 //
 // Client-side authoring + hierarchy (C): build a multi-environment world with
 // ZERO USD -- prims come into existence via attribute writes to nested paths --
-// then show that derived world transforms are pull-computed: they stay stale
-// until a hierarchy computation model runs. The world-transform compute runs
-// on the GPU in this ovstage revision, so a CUDA-capable device is required.
+// then show that derived world transforms are pull-computed: the rows start
+// absent, the client seeds them, and a hierarchy computation model fills or
+// refreshes them. The compute runs on the GPU in this ovstage revision, so a
+// CUDA-capable device is required.
 //
 // Expected output: see README.md. Snippet markers are referenced by the
 // skills under ../../../skills/ -- keep them intact.
@@ -134,10 +135,10 @@ static void writeLocalTranslation(ovstage_instance_t* stage, path_dictionary_ins
     path_dictionary_release_path_list_reference(dict, list);
 }
 
-// Materialize the derived world-matrix output column client-side: one identity
-// placeholder row per prim (prototype + every cloned environment prim). USD
-// population creates this column automatically; a pure client-side stage must
-// author it before a hierarchy computation model has an output to fill.
+// Create the derived world-matrix output column client-side: one identity seed
+// row per prim (prototype + every cloned environment prim). USD population
+// creates this column automatically. A pure client-side stage must author it
+// before a hierarchy computation model has an output to fill.
 static void seedWorldMatrixRows(ovstage_instance_t* stage, path_dictionary_instance_t* dict, ovx_token_t worldMatrix,
                                 ovstage_ordinal_t ordinal)
 {
@@ -212,10 +213,12 @@ static bool tryReadWorldTranslation(ovstage_instance_t* stage, path_dictionary_i
     const ovstage_api_status_t fetched = ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group);
     if (fetched == OVSTAGE_OK)
     {
-        // This single-prim query must yield exactly one 16-lane float64 row.
-        if (group.data.tensor_count != 1 || !group.data.tensors[0].data || group.data.tensors[0].ndim != 1 ||
-            group.data.tensors[0].shape[0] != 1 || group.data.tensors[0].dtype.code != kDLFloat ||
-            group.data.tensors[0].dtype.bits != 64 || group.data.tensors[0].dtype.lanes != 16)
+        // This single-prim query must yield one scalar-lane float64 4x4 matrix row.
+        if (group.data.tensor_count != 1 || !group.data.tensors[0].data || group.data.tensors[0].ndim != 3 ||
+            !group.data.tensors[0].shape || group.data.tensors[0].shape[0] != 1 ||
+            group.data.tensors[0].shape[1] != 4 || group.data.tensors[0].shape[2] != 4 ||
+            group.data.tensors[0].dtype.code != kDLFloat || group.data.tensors[0].dtype.bits != 64 ||
+            group.data.tensors[0].dtype.lanes != 1)
         {
             std::fprintf(stderr, "unexpected %s read-group shape for %s\n", kWorldMatrixAttr, path);
             std::exit(EXIT_FAILURE);
@@ -241,7 +244,7 @@ static bool tryReadWorldTranslation(ovstage_instance_t* stage, path_dictionary_i
 }
 
 // Fail-fast sibling of tryReadWorldTranslation for reads that must succeed
-// (every read after the placeholder rows were seeded).
+// (every read after the output rows were seeded and computed).
 static void readWorldTranslation(ovstage_instance_t* stage, path_dictionary_instance_t* dict, ovx_token_t worldMatrix,
                                  const char* path, ovstage_ordinal_t endOrdinal, double out[3])
 {
@@ -514,9 +517,7 @@ int main()
     // [/snippet:author-applied-schemas]
 
     // [snippet:author-local-transforms]
-    // Author local transforms: omni:xform is the canonical 4x4 double
-    // local-matrix column (an alias of the derived `omni:fabric:localMatrix`);
-    // The current implementation stores each matrix as ONE 16-lane float64 element per prim (see
+    // Write omni:xform as one 16-lane float64 MATRIX element per prim (see
     // writeMatrixRows). Each level gets a distinct translation so world
     // compositions are recognizable sums down the chain.
     double protoMatrices[kProtoCount * 16];
@@ -543,7 +544,9 @@ int main()
     // Stamp out the environments: clone the prototype subtree to three targets
     // in ONE call (clone is an ordinal-keyed write; the source must exist, the
     // targets must not), then give each environment root a distinct
-    // translation so the environments tile along +X.
+    // translation so the environments tile along +X. The clone records every
+    // copied cell at its ordinal, so the strict policy requires a
+    // newer ordinal for customization.
     ovx_string_t cloneTargets[kEnvCount];
     for (size_t i = 0; i < kEnvCount; ++i)
         cloneTargets[i] = ovx_string_t{ kEnvPaths[i], std::strlen(kEnvPaths[i]) };
@@ -551,7 +554,9 @@ int main()
     waitOp(stage, enq, "clone");
     for (size_t i = 0; i < kEnvCount; ++i)
         writeLocalTranslation(stage, dict, xform, kEnvPaths[i], 100.0 * static_cast<double>(i + 1), 0.0, 0.0,
-                              /*ordinal*/ 2);
+                              /*ordinal*/ 3);
+    // Seal only 2 here. Ordinal 3 stays open for the output-row seed and
+    // hierarchy computation below, then is sealed before result reads.
     sealOrdinal(stage, /*ordinal*/ 2);
     std::printf("cloned /World/Proto -> %s %s %s\n", kEnvPaths[0], kEnvPaths[1], kEnvPaths[2]);
     // [/snippet:clone-prototype-envs]
@@ -574,16 +579,18 @@ int main()
     std::printf("\n");
     // [/snippet:hierarchy-computation-models]
 
-    // ---- 6. staleness demo (the heart of this example): world transforms are pull-computed ----
+    // ---- 6. derived world transforms are pull-computed ----
 
     // [snippet:world-matrix-staleness]
     // Before any compute the derived column does not even exist: reading
     // `omni:fabric:worldMatrix` yields no rows (a normal state, not an error). A
-    // pure client-side stage then materializes the output column itself
-    // (identity placeholder rows -- USD population would have created them);
-    // the placeholders stay STALE until a computation model runs.
-    // ovstage_compute_hierarchy takes the ordinal to compute from (input) and
-    // the ordinal stamped onto derived results (output).
+    // pure client-side stage creates the output rows itself (identity rows --
+    // USD population would have created them), then runs a computation model.
+    // ovstage_compute_hierarchy computes from the latest committed inputs and
+    // stamps output_ordinal onto the derived results. The current
+    // implementation ignores input_ordinal. Compute first, then seal that
+    // ordinal: the derived rows are recorded at output_ordinal, and the seal
+    // then publishes a complete snapshot to readers.
     double t[3] = {};
     const bool present = tryReadWorldTranslation(stage, dict, worldMatrix, "/World/Env_0/Body/Tip", /*endOrdinal*/ 2,
                                                  t);
@@ -591,17 +598,15 @@ int main()
                 present ? "unexpectedly present" : "absent (derived rows are pull-computed)");
 
     seedWorldMatrixRows(stage, dict, worldMatrix, /*ordinal*/ 3);
-    sealOrdinal(stage, /*ordinal*/ 3);
-    readWorldTranslation(stage, dict, worldMatrix, "/World/Env_0/Body/Tip", /*endOrdinal*/ 3, t);
-    std::printf("stale placeholder world translation /World/Env_0/Body/Tip: %.1f %.1f %.1f\n", t[0], t[1], t[2]);
 
     // The compute runs on the GPU; without a CUDA-capable device the op fails
     // (waitOp prints the op error and exits).
     enq = ovstage_compute_hierarchy(stage, OVSTAGE_HIERARCHY_COMPUTATION_MODEL_GPU_INCREMENTAL,
                                     /*input_ordinal*/ 3, /*output_ordinal*/ 3);
     waitOp(stage, enq, "compute_hierarchy");
+    sealOrdinal(stage, /*ordinal*/ 3);
 
-    // Now the derived rows are correct compositions: each Tip world
+    // The derived rows are correct compositions: each Tip world
     // translation is the sum of the pure translations down its chain.
     for (size_t i = 0; i < kTipCount; ++i)
     {
@@ -614,19 +619,20 @@ int main()
 
     // [snippet:recompute-after-edit]
     // Update ONE environment's local transform at a later ordinal, then run
-    // compute_hierarchy again with the new input ordinal to fold the edit into
-    // the derived rows (the tip's z becomes 47.0). Reading the derived column
+    // compute_hierarchy again to fold the edit into the derived rows (the tip's
+    // z becomes 47.0). The computation uses the latest committed inputs. The
+    // current implementation ignores input_ordinal. Reading the derived column
     // between the edit and the recompute is NOT a reliable staleness probe:
     // the read itself can pull an incremental refresh. Only the explicit
-    // compute guarantees derived rows consistent with the new input ordinal --
+    // compute guarantees derived rows consistent with the latest inputs --
     // which is why this example reads only after it.
     writeLocalTranslation(stage, dict, xform, "/World/Env_1", 200.0, 0.0, 40.0, /*ordinal*/ 4);
-    sealOrdinal(stage, /*ordinal*/ 4);
     std::printf("moved /World/Env_1 at ordinal 4\n");
 
     enq = ovstage_compute_hierarchy(stage, OVSTAGE_HIERARCHY_COMPUTATION_MODEL_GPU_INCREMENTAL,
                                     /*input_ordinal*/ 4, /*output_ordinal*/ 4);
     waitOp(stage, enq, "compute_hierarchy");
+    sealOrdinal(stage, /*ordinal*/ 4);
     readWorldTranslation(stage, dict, worldMatrix, "/World/Env_1/Body/Tip", /*endOrdinal*/ 4, t);
     std::printf("recomputed world translation /World/Env_1/Body/Tip: %.1f %.1f %.1f\n", t[0], t[1], t[2]);
     // [/snippet:recompute-after-edit]

@@ -50,7 +50,9 @@ Resolve inputs in this order: existing repository files and referenced snippets,
 
 - The scene: a USD file path (`open_usd`) or inline USDA string (`open_usd_from_string`).
 - The prims to query and the attribute(s) to read/write (as interned tokens or strings).
-- The caller-owned **ordinals**: one per populate/write/apply step, advanced monotonically.
+- The caller-owned **ordinals**: under strict admission, use newer
+  ordinals for repeated changes to a cell; disjoint producers may share an ordinal
+  above their applicable floors.
 - Which update path(s) the request needs: direct runtime-table write, USD-source edit, or both.
 - Target API surface: C, Python, or both.
 - The shipped headers and the referenced example snippets are the authoritative contract.
@@ -78,8 +80,11 @@ Resolve inputs in this order: existing repository files and referenced snippets,
 4. **Update path 2 — USD source.** `add_usd_reference` (or `_from_string`) edits only USD;
    `apply_usd_changes` at a fresh ordinal propagates it into the runtime table. Advance the floor,
    then re-read to see the change.
-5. **Own the ordinals.** Keep ordinals monotonic across all steps; a write/apply at or below the
-   floor is a write-floor violation.
+5. **Own the ordinals.** Clear applicable floors and satisfy the configured
+   admission policy for affected cells and prim lifecycle. Under the
+   `STRICTLY_INCREASING` policy, disjoint cells may share an ordinal; rewriting a
+   cell needs a newer ordinal even before sealing. See
+   [Ordinal Admission Policies](../../docs/scene/writing_attributes.rst) for options.
 
 ## Output Format
 
@@ -98,8 +103,8 @@ This skill has no scripts.
 - **Transform layout: `omni:xform` is one 16-lane element per prim.** The canonical 4×4 double
   tensor uses `dtype.lanes = 16`, `shape = [1]` (`semantic = MATRIX`, row-vector convention,
   translation in row `[3][0..2]`). A compact `shape = [1, 4, 4]`, `lanes = 1` copy-in is also
-  accepted, but the trailing dimensions are folded and not preserved: raw reads and maps return
-  the canonical `shape = [1]`, `lanes = 16` layout.
+  accepted. The input dimensions are folded into storage; raw reads and maps reconstruct
+  `shape = [1, 4, 4]`, `lanes = 1`. Their strides count scalar elements.
 - **Transform scope.** This loop reads back only the local `omni:xform` value **it wrote itself**.
   It does not validate hierarchy-derived world-transform reads. Derived world rows may be absent or
   stale until their owning workflow materializes them and runs hierarchy computation; follow
@@ -177,8 +182,10 @@ Update path 2 — edit the USD source and propagate it through:
 
 - **Read fails with `OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION` after populate** — advance the write
   floor to the populate ordinal; reads only see sealed data at/below the floor.
-- **`OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION`** — a write/`apply_usd_changes` used an ordinal at/below
-  the floor. Keep ordinals monotonic (populate 1 → writes 2..N → USD edit N+1).
+- **`OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION`** — the ordinal conflicts with a floor or
+  the configured admission policy for affected cells or prim lifecycle. Use a
+  newer ordinal for overlapping updates in this default-policy loop
+  (for example, populate 1 → write 2 → USD edit 3).
 - **USD edit didn't show up in reads** — `add_usd_reference` only edits USD; you must call
   `apply_usd_changes` at a fresh ordinal and advance the floor before re-reading.
 - **Transform read looks wrong / empty** — confirm the `omni:xform` recipe and that the query

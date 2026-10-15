@@ -41,8 +41,8 @@ def test_clone_to_existing_target_fails(stage):
             # Clone targets are create-only. The first clone to a fresh path
             # succeeds; a second clone onto the now-existing target fails. The
             # failure surfaces from the blocking call as an OvstageError whose
-            # op-level code is OP_FAILED, with the reason ("already exists") in
-            # the message.
+            # op-level code is OP_FAILED, with the reason ("already exists") and
+            # the colliding target path in the message.
             stage.clone("/World/Source", ["/World/Target"], ordinal=2)
             stage.advance_write_floor(ordinal=2).wait()
             assert _prim_count(stage, "/World/Target") == 1
@@ -51,6 +51,7 @@ def test_clone_to_existing_target_fails(stage):
                 stage.clone("/World/Source", ["/World/Target"], ordinal=3)
             assert exc.value.code == ErrorCode.OP_FAILED
             assert "already exists" in exc.value.message
+            assert "/World/Target" in exc.value.message
             # [/snippet:clone-target-exists-error]
         finally:
             stage.release_query(query).wait()

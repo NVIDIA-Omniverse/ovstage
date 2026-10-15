@@ -31,8 +31,7 @@ author = "NVIDIA Corporation"
 # VERSION.md is the single source of truth for the ovstage version (the wheel
 # packaging CI derives the wheel version from it). Read it directly: docs always
 # build from a source checkout, where the generated ovstage/_version.py does not
-# exist and ovstage.__version__ resolves to a hand-written fallback literal that
-# could silently drift from VERSION.md.
+# exist and ovstage.__version__ reads this same VERSION.md file.
 _docs_dir = os.path.dirname(os.path.abspath(__file__))
 with open(os.path.join(_docs_dir, "..", "VERSION.md"), encoding="utf-8") as _fh:
     release = _fh.read().strip()
@@ -40,8 +39,8 @@ if not re.fullmatch(r"\d+\.\d+\.\d+", release):
     raise ValueError(f"VERSION.md must contain a MAJOR.MINOR.PATCH version, got {release!r}")
 version = release
 
-# Fail the build if the other hand-maintained version copies disagree with
-# VERSION.md, so a release bump that misses one is caught by every docs build
+# Fail the build if the other version copies disagree with VERSION.md, so a
+# release bump that misses one is caught by every docs build
 # (local `make html` and the GitHub docs workflow) instead of publishing docs
 # with a stale version. Installed wheels append a build number to the version,
 # hence the prefix tolerance on __version__.
@@ -50,7 +49,7 @@ from ovstage import __version__
 if __version__ != release and not __version__.startswith(release + "."):
     raise ValueError(
         f"ovstage.__version__ is {__version__!r} but VERSION.md says {release!r}; "
-        "update the fallback version in python/ovstage/__init__.py"
+        "check the generated wheel version or the packaged VERSION.md"
     )
 with open(os.path.join(_docs_dir, "..", "python", "pyproject.toml"), encoding="utf-8") as _fh:
     _match = re.search(r'^version\s*=\s*"([^"]*)"', _fh.read(), re.MULTILINE)

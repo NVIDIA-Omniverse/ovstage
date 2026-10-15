@@ -92,8 +92,7 @@ ovstage skills under `../../../skills/`; keep them intact when editing.
 - The example uses the canonical `omni:xform` layout: **one 16-lane float64
   element per prim** (`ndim=1`, `dtype={kDLFloat, 64, 16}`,
   `OVSTAGE_SEMANTIC_MATRIX`). A convenience input shaped `[N, 4, 4]` with
-  `lanes=1` is also accepted, but the trailing shape is not preserved; raw
-  reads/maps return `[N]` with 16 lanes. The memory remains row-major 4×4 with
+  `lanes=1` is also accepted. Raw reads and maps return `[N, 4, 4]` with scalar lanes. The memory remains row-major 4×4 with
   translation in elements `[12..14]`.
 - The inline USDA layer needs the prim body braces and each statement on their
   own lines; a single-line `def ... { ... }` is a parse error.

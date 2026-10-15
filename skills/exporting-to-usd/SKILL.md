@@ -4,12 +4,12 @@
 name: exporting-to-usd
 description: >
   Export selected ovstage runtime state to USD from C or Python. Use for saved
-  typed hierarchies, sparse overlays, reusable USD destinations, async export
-  completion, or changed-property export.
+  typed hierarchies, sparse overlays, reusable USD destinations, host-owned
+  layer/stage identifiers, async export completion, or changed-property export.
   Prefer the metadata-driven typed-hierarchy workflow for ordinary USD-populated
   subtrees and explicit rules only for intentional mapping differences.
 license: LicenseRef-NvidiaProprietary
-version: "0.1.0"
+version: "0.4.0"
 author: NVIDIA ovstage
 tags:
   - ovstage
@@ -41,8 +41,8 @@ Resolve inputs in this order: existing repository files and referenced snippets,
   changed properties.
 - The source selection: a subtree root for the typed helper, or the prim and
   property predicates for an explicit descriptor.
-- The destination identifier and its form: one-shot file or reusable destination
-  (`EMPTY` or `OPEN_EXISTING`).
+- The destination identifier and its form: one-shot file, reusable destination
+  (`EMPTY` or `OPEN_EXISTING`), or a host-owned layer/stage identifier.
 - Whether the call is synchronous or asynchronous, since async adds a terminal
   wait and changes who may touch the destination while it is pending.
 - The shipped `ovstage_population_export.h` header and the referenced test
@@ -80,15 +80,12 @@ Resolve inputs in this order: existing repository files and referenced snippets,
 | Write one typed hierarchy to a new/replaced file | Python `export_typed_hierarchy_to_usd_file` or C descriptor helper + `ovstage_population_export_to_usd_file` | The one-shot file route saves before return |
 | Write one explicit sparse overlay | `export_to_usd_file` / C file API | The one-shot file route saves before return |
 | Accumulate several exports or preserve a layer stack | `ExportDestination` / C destination handle with `OPEN_EXISTING` | Caller calls `save()` / `*_destination_save` |
+| Author one exact host layer | Layer-identifier route | Host saves |
+| Author a stage opened from its root identifier | Stage-root-identifier route | Host saves |
 
 For a resolver identifier, do not assume an OS file path. Reopen or inspect it
 through USD/resolver APIs. A one-shot file route starts `EMPTY` and replaces
 stored content only on successful save.
-
-ovstage opens and owns every destination. There is no route that authors into a
-caller-owned USD layer or stage: layer/stage identifiers are not portable across
-USD runtimes, so hand off through storage — export to a file, then open or reload
-it in the host's USD runtime.
 
 ## Typed Hierarchy: Default Recipe
 
@@ -130,12 +127,26 @@ namespace, relationship, connection, or metadata mapping.
   use generic `ovstage_population_wait_op` / the Python population wait separately
   to observe and drain unrelated population failures.
 - Do not mix synchronous destination access with pending async destination work.
+  Do not concurrently read/write a host USD object while an async identifier
+  export is pending.
 - A failed reusable export leaves prior in-memory destination state unchanged.
   A failed save has no portable atomic-replacement guarantee for stored output.
 
 `since_ordinal` filters dirty membership in `(since_ordinal, ordinal]`; selected
 values are authored as current USD default opinions, never intermediate time
 samples.
+
+## Identifier Route Decision
+
+Use a layer identifier when the caller must author that exact layer. Use a stage
+root identifier only when opening it and authoring the default edit target is
+acceptable: it cannot preserve a caller-owned custom edit target. Both routes
+author host-owned objects, so the host saves them.
+
+Synchronous identifier exports bypass the population/export FIFO, author in
+place, provide no rollback, and require caller serialization. Async identifier
+exports retain/resolve the destination for queued work; forbid host USD access
+until terminal completion.
 
 ## Output Format
 

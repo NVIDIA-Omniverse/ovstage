@@ -11,10 +11,10 @@
 name: stage-queries
 description: >
   Find prims with filter queries — predicates over reserved metadata built-ins
-  (usd-path, usd-prim-type, usd-parent, usd-children, usd-schemas) and attribute
+  (usd-path, usd-prim-type, usd-parent, usd-children, usd-schemas, usd-ancestor-types) and attribute
   presence — instead of explicit path lists, then introspect what a query matched.
   Use when the user asks to query, filter, select, or find prims by type, path,
-  parent, child, applied schema, or attribute presence, or to read a query result's
+  parent, child, applied schema, base type, or attribute presence, or to read a query result's
   count / attributes / reusable handle.
 license: LicenseRef-NvidiaProprietary
 version: "0.1.0"
@@ -45,7 +45,7 @@ Resolve inputs in this order: existing repository files and referenced snippets,
 - The selection criterion: which built-in metadata attribute + operator, or attribute-presence (`HAS`).
 - Whether the prims carry the metadata built-ins (these require **population**; a purely
   client-written attribute column has `usd-path` and `HAS`-able columns but not
-  `usd-prim-type`/`usd-parent`/`usd-children`/`usd-schemas`).
+  `usd-prim-type`/`usd-parent`/`usd-children`/`usd-schemas`/`usd-ancestor-types`).
 - Target API surface: C, Python, or both.
 - Whether the caller needs just a count, the matched set to read from, or the reported attributes.
 - The shipped headers and the referenced example/test snippets are the authoritative contract.
@@ -55,7 +55,8 @@ Resolve inputs in this order: existing repository files and referenced snippets,
 - Use an ovstage checkout that contains the `include/` headers and the referenced snippets.
 - Read the relevant `> **Source:**` snippet before writing or explaining API usage.
 - Understand the async **submit/observe** model (`cpu-ahead-gpu-async`): `query` is an enqueue
-  returning a handle; drive it to completion (`ovstage_wait_op` / `.wait()`) before fetching.
+  returning a handle; drive it to completion (`ovstage_wait_op` / `.wait()`, which returns the
+  query so `q.wait().result()` chains) before fetching.
 - Queries resolve against the **latest committed state** — no write-floor advance is needed for a
   query to see a populated/written prim (reads of matched columns still target sealed data).
 
@@ -90,7 +91,7 @@ This skill has no scripts.
   (`NOT_SUPPORTED`).
 - **Values are always strings**, even for token/type attributes. Predicates in one `Filter` AND
   together.
-- **Metadata built-ins need population.** `usd-prim-type`/`usd-parent`/`usd-children`/`usd-schemas`
+- **Metadata built-ins need population.** `usd-prim-type`/`usd-parent`/`usd-children`/`usd-schemas`/`usd-ancestor-types`
   are auto-maintained by the population bridge; a scene built only with `write_attribute` exposes
   `usd-path` and `HAS`-able user columns but not those relational built-ins.
 - **Instancing queries require populated content.** C exposes the native `ovstage_instancing.h`
@@ -110,6 +111,7 @@ matched. The supported predicate matrix:
 | `usd-children` | `CONTAINS` | prims having the named child |
 | `usd-prim-type` | `IN` | prims of the named type(s) |
 | `usd-schemas` | `CONTAINS` | applied-schema membership |
+| `usd-ancestor-types` | `CONTAINS` | prims whose type derives from the named type |
 
 > **`usd-active` is not supported.** It appears in the header contract for
 > stability, but a live prim is always active, so the attribute carries no
@@ -181,16 +183,17 @@ Introspection — match count, the scoped attribute list, and the reusable `all_
 - **Enqueue rejected `OVSTAGE_ERROR_NOT_SUPPORTED`** — the attribute+operator pairing is outside
   the matrix above. Use a supported pairing; the bindings advertise more than the engine accepts.
 - **Zero matches for a metadata predicate** — the scene wasn't populated, so
-  `usd-prim-type`/`usd-parent`/`usd-children`/`usd-schemas` aren't authored. Populate first, or
+  `usd-prim-type`/`usd-parent`/`usd-children`/`usd-schemas`/`usd-ancestor-types` aren't authored. Populate first, or
   filter on `usd-path`/`HAS`, which work on client-written prims.
 - **`PREFIX "/World"` matches `/Worldwide`** — `usd-path` PREFIX is byte-prefix matching on the
   path string. Append a trailing `/` to scope to the subtree (`PREFIX "/World/"`).
 - **`OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION` reading a matched set** — the selected columns weren't
   sealed; advance the write floor to/above the write ordinal before reading (queries see latest
   committed state, but reads target sealed data). See `application-flow`.
-- **`OVSTAGE_ERROR_OUT_OF_RANGE` reading a fixed range** — a selected `(attribute, path)` has a
-  retained successor after the range end, so latest-only storage cannot represent the window.
-  Widen/rebase the range or request latest state; advancing the floor alone does not fix it.
+- **`OVSTAGE_ERROR_OUT_OF_RANGE` when reading** — a selected `(attribute, path)` has a recorded
+  change after the requested end, and older values are not retained.
+  If newer values are acceptable, move the end forward or request current values with end
+  `UINT64_MAX` (Python: `(1 << 64) - 1`); a selected unsealed change still returns `WRITE_FLOOR_VIOLATION`.
 - **Handle leak / teardown crash** — release the query (and in C the query result) before
   destroying the instance; read-group prim lists are borrows, never `destroy_path_list` them.
 

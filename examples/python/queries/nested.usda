@@ -1,0 +1,17 @@
+#usda 1.0
+(defaultPrim = "World"; metersPerUnit = 1; upAxis = "Z")
+def Xform "World"
+{
+    def Xform "LeafSource"
+    {
+        def Cube "Box" (prepend apiSchemas = ["PhysicsCollisionAPI"])
+        {
+            double size = 1
+        }
+    }
+    def Xform "OuterSource"
+    {
+        def Xform "NestedLeaf" (instanceable = true; prepend references = </World/LeafSource>) {}
+    }
+    def Xform "OuterA" (instanceable = true; prepend references = </World/OuterSource>) {}
+}

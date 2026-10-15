@@ -9,11 +9,8 @@
 """Pythonic wrapper for the ovstage path-dictionary interning API.
 
 The path dictionary interns strings (tokens), prim paths, and ordered prim-path
-lists shared across ovstage / ovrtx / application code. It is owned by an ovstage
-instance and obtained through the ``get_path_dictionary`` vtable slot (see
-``ovstage_api.h`` and ``ovx/path_dictionary/path_dictionary.h``); in the current
-implementation all live instances share one refcounted dictionary,
-so handles minted through any instance are usable from the others.
+lists. Each Stage owns its dictionary; obtain it with ``PathDictionary(stage)``.
+List handles are local to that Stage and cannot be passed to a different Stage.
 
 Handle-lifetime regimes:
     * tokens / prim paths are dict-lifetime (no per-handle release);
@@ -142,9 +139,8 @@ class PathList(int):
 
     The finalizer stays silent only once the C dictionary itself is gone — that
     is, when the :class:`Stage` backing it was destroyed. Closing a
-    ``PathDictionary(stage)`` wrapper does *not* qualify: the shared dictionary
-    outlives it, so a list outstanding at that point is still a live leak and is
-    still reclaimed and reported.
+    ``PathDictionary(stage)`` wrapper leaves the dictionary alive while the Stage
+    lives, so an outstanding list is still reclaimed and reported.
     """
 
     def __new__(cls, path_list: int, dictionary: "PathDictionary", owner: List[int]) -> "PathList":
@@ -161,14 +157,10 @@ class PathList(int):
         # handle the C side may already have recycled.
         self._owner = owner
         self._registry = dictionary._registry()
-        # The C dictionary is kept alive by the backing Stage, NOT by this Python
-        # wrapper: PathDictionary.destroy() only tears the C side down when it owns
-        # that Stage. Capture both so the finalizer can tell "the list really died"
-        # from "the wrapper was merely closed" -- with the documented
-        # PathDictionary(stage) form the latter leaves the list very much alive.
+        # Capture the Stage weakly and retain the borrowed C pointer so cleanup
+        # can distinguish a closed wrapper from a destroyed Stage.
         self._pd = dictionary._pd
-        stage = dictionary._stage
-        self._stage = weakref.ref(stage) if stage is not None else None
+        self._stage = weakref.ref(dictionary._stage)
         return self
 
     @property
@@ -179,11 +171,10 @@ class PathList(int):
     def _c_dictionary_alive(self) -> bool:
         """Whether the C path dictionary behind this handle still exists.
 
-        Tied to the backing :class:`Stage`, which owns the shared dictionary — not
-        to the :class:`PathDictionary` wrapper, which may be closed while the
-        dictionary (and this list) live on.
+        The backing :class:`Stage` owns the dictionary. Closing a
+        :class:`PathDictionary` wrapper leaves it alive while the Stage lives.
         """
-        if self._stage is None or not self._pd:
+        if not self._pd:
             return False
         stage = self._stage()
         return stage is not None and bool(getattr(stage, "_inst", None))
@@ -209,9 +200,8 @@ class PathList(int):
         if dictionary is not None and dictionary._pd:
             dictionary.destroy_path_list(self)  # keeps the registry in step
             return
-        # The wrapper is gone or closed but the C dictionary outlived it (the
-        # shared-Stage form). Release through the pointer captured at construction
-        # rather than leaking the reference.
+        # The wrapper is gone or closed. If the Stage still owns the dictionary,
+        # release through the pointer captured at construction.
         if not self._c_dictionary_alive():
             raise OvxError(
                 _b.OVX_API_ERROR,
@@ -271,9 +261,8 @@ class PathList(int):
         # dictionary itself is gone (its Stage destroyed, including at interpreter
         # shutdown) -- then every handle it minted died with it, so there is
         # nothing to reclaim and a warning would be un-actionable teardown noise.
-        # Note this deliberately does NOT key on the PathDictionary wrapper being
-        # closed: with the shared-Stage form the C dictionary outlives it, and a
-        # list outstanding then is a live leak that must still be reclaimed.
+        # Closing the PathDictionary wrapper leaves the dictionary alive while
+        # the Stage lives, so outstanding lists still need to be reclaimed.
         try:
             if self.released or not self._c_dictionary_alive():
                 return
@@ -299,30 +288,22 @@ class PathList(int):
 
 
 class PathDictionary:
-    """A shared interning dictionary for tokens, prim paths, and path lists.
+    """Access a Stage's interning dictionary for tokens, paths, and path lists.
 
-    The dictionary is owned by an ovstage instance. Pass an existing
-    :class:`~ovstage.Stage` to share its dictionary, or omit ``stage`` to manage
-    a private backing instance whose lifetime is tied to this object.
+    ``stage`` is required. The wrapper borrows its dictionary; destroying this
+    wrapper does not destroy the Stage. List references never extend Stage life.
     """
 
-    def __init__(self, stage=None):
+    def __init__(self, stage):
         from .stage import Stage  # local import avoids a module import cycle
 
-        if stage is None:
-            self._stage = Stage(name="ovstage-path-dictionary")
-            self._owns_stage = True
-        else:
-            self._stage = stage
-            self._owns_stage = False
-        self._pd = self._stage.get_path_dictionary()
+        if not isinstance(stage, Stage):
+            raise TypeError("stage must be an ovstage.Stage")
+        self._stage = stage
+        self._pd = stage.get_path_dictionary()
 
     # ── lifecycle ──────────────────────────────────────────────────────────
     def destroy(self) -> None:
-        # The dictionary is owned by the instance; dropping the backing instance
-        # (only when we created it) releases our hold on the shared dictionary.
-        if self._owns_stage and self._stage is not None:
-            self._stage.destroy()
         self._stage = None
         self._pd = None
 
@@ -342,7 +323,7 @@ class PathDictionary:
     def _ensure_alive(self) -> None:
         if self._pd is None:
             raise OvxError(_b.OVX_API_ERROR, "PathDictionary has been destroyed")
-        if self._stage is not None and hasattr(self._stage, "_inst") and not self._stage._inst:
+        if not self._stage._inst:
             raise OvxError(_b.OVX_API_ERROR, "PathDictionary backing Stage has been destroyed")
 
     @property
@@ -414,6 +395,12 @@ class PathDictionary:
 
     # ── prim paths ────────────────────────────────────────────────────────────
     def intern_path(self, path: str) -> int:
+        """Intern a prim-path string and return its dictionary-lifetime handle.
+
+        An absolute path yields the same handle as construction from its
+        component tokens through the C API in the same dictionary. Use ``"/"``
+        for the root, which corresponds to zero component tokens in C.
+        """
         arr, _refs = self._string_array([path])
         out = (_b.ovx_primpath_t * 1)()
         self._check(self._vtable.create_paths_from_strings(self._context, arr, 1, out))

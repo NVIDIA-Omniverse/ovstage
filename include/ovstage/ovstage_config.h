@@ -75,6 +75,24 @@ static inline ovstage_config_entry_t ovstage_config_entry_runtime_default_hierar
 }
 
 /**
+ * Configure ordinal admission for data-plane writes, maps, clones and deletes.
+ *
+ * DEFAULT means no override. A fresh process-state lifetime uses
+ * NONDECREASING; later DEFAULT entries inherit the active policy.
+ * Supply a concrete policy on the first process reference. Later concrete
+ * values must match until all initialization and instance references are gone.
+ *
+ * @param policy The ordinal admission policy.
+ */
+static inline ovstage_config_entry_t ovstage_config_entry_runtime_default_ordinal_admission_policy(
+    ovstage_ordinal_admission_policy_t policy)
+{
+    return ovstage_config_entry_uint64(
+        OVSTAGE_CONFIG_RUNTIME_DEFAULT_ORDINAL_ADMISSION_POLICY,
+        (uint64_t)policy);
+}
+
+/**
  * Configure the ovstage "binary package root" directory.
  *
  * This is used by the static loader (ovstage-static) to locate the ovstage

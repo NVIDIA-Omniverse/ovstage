@@ -21,6 +21,9 @@
 // under ../../../skills/ -- keep them intact.
 
 #include <ovstage/ovstage.h>
+#include <algorithm>
+#include <stdexcept>
+#include <vector>
 #include <ovx/path_dictionary/path_dictionary.h>
 #include <dlpack/dlpack.h>
 
@@ -256,6 +259,62 @@ int main()
         path_dictionary_release_path_list_reference(dict, protoList);
     }
 
+    {
+        // [snippet:clone-duplicate-targets-c]
+        // A target path may appear only once in a clone request.
+        const ovx_string_t targets[] = { literal_to_ovx_string("/World/Duplicate/Rig"),
+            literal_to_ovx_string("/World/Duplicate/Rig") };
+        const auto operation = ovstage_clone(stage, literal_to_ovx_string("/World/Proto/Rig"), targets, 2, 4);
+        if (operation.status != OVSTAGE_ERROR_INVALID_ARGUMENT)
+        {
+            std::fprintf(stderr, "Expected duplicate targets to be rejected\n");
+            std::exit(EXIT_FAILURE);
+        }
+        // Submission failed, so there is no pending operation to wait for or release.
+        std::printf("Duplicate targets rejected before cloning.\n");
+        // Duplicate targets rejected before cloning.
+        // [/snippet:clone-duplicate-targets-c]
+    }
+
+    {
+        // [snippet:clone-async-report-c]
+        const ovx_string_t target = literal_to_ovx_string("/World/Async/Rig");
+        const auto operation = ovstage_clone(stage, literal_to_ovx_string("/World/Proto/Rig"), &target, 1, 4);
+        check(stage, operation.status, "submit clone");
+        // Independent application work can run here while the clone is pending.
+        ovstage_op_wait_result_t wait{};
+        check(stage, ovstage_wait_op(stage, operation.op_index, OVSTAGE_TIMEOUT_INFINITE, &wait), "wait clone");
+        checkWait(stage, wait, "clone completion");
+        ovstage_clone_result_t report{};
+        check(stage, ovstage_fetch_clone_result(stage, operation.op_index, OVSTAGE_TIMEOUT_INFINITE, &report),
+              "fetch clone report");
+        std::printf("Async clone copied %llu prim to %llu target\n",
+            static_cast<unsigned long long>(report.prims_cloned), static_cast<unsigned long long>(report.target_count));
+        // Async clone copied 1 prim to 1 target
+        check(stage, ovstage_release_op(stage, operation.op_index), "release clone operation");
+        // Advance the watermark before reading copied values.
+        // [/snippet:clone-async-report-c]
+    }
+
+    {
+        // [snippet:clone-specific-failure-c]
+        const ovx_string_t target = literal_to_ovx_string("/World/MissingCopy");
+        const auto operation = ovstage_clone(stage, literal_to_ovx_string("/World/Missing"), &target, 1, 4);
+        check(stage, operation.status, "submit clone");
+        // Fetch waits for completion and returns the clone-specific failure code.
+        ovstage_clone_result_t report{};
+        const auto status = ovstage_fetch_clone_result(stage, operation.op_index, OVSTAGE_TIMEOUT_INFINITE, &report);
+        check(stage, ovstage_release_op(stage, operation.op_index), "release failed clone operation");
+        if (status != OVSTAGE_ERROR_NOT_FOUND)
+        {
+            std::fprintf(stderr, "Expected a missing-source clone failure\n");
+            std::exit(EXIT_FAILURE);
+        }
+        std::printf("Clone source was not found.\n");
+        // Clone source was not found.
+        // [/snippet:clone-specific-failure-c]
+    }
+
     // ---- 3. pipelined submission ----
     {
         std::printf("== 3. pipelined submission ==\n");
@@ -320,6 +379,324 @@ int main()
 
         ovstage_enqueue_result_t enq = ovstage_release_query(stage, query);
         waitOp(stage, enq, "release_query");
+        path_dictionary_release_path_list_reference(dict, list);
+    }
+
+    // Demonstrate write options over the same three prims in a known order.
+    {
+        const ovx_string_t names[] = { literal_to_ovx_string("/World/Writes/A"),
+            literal_to_ovx_string("/World/Writes/B"), literal_to_ovx_string("/World/Writes/C") };
+        ovx_primpath_list_t list = OVX_INVALID_PRIMPATH_LIST;
+        checkOvx(dict, path_dictionary_create_path_list_from_strings(dict, names, 3, &list), "create write paths");
+        ovstage_query_handle_t query = OVSTAGE_INVALID_QUERY_HANDLE;
+        check(stage, ovstage_query_from_path_list(stage, list, &query), "query write paths");
+        {
+            // [snippet:write-parameters-c]
+            float values[] = { 10, 20, 30 };
+            int64_t shape[] = { 3 };
+            DLTensor tensor{};
+            tensor.data = values;
+            tensor.device = { kDLCPU, 0 };
+            tensor.ndim = 1;
+            tensor.dtype = { kDLFloat, 32, 1 };
+            tensor.shape = shape;
+            // Keep the source buffer and descriptors alive until completion.
+            ovstage_write_data_t write{};
+            write.tensors = &tensor;
+            write.tensor_count = 1;
+            write.is_array = false;
+
+            waitOp(stage, ovstage_write_attribute(stage, query, { 0, literal_to_ovx_string("heat") },
+                9, write, OVSTAGE_PRIM_MODE_UPSERT), "write heat");
+            // [/snippet:write-parameters-c]
+        }
+        {
+            // [snippet:write-fixed-shape-c]
+            // Three rows, each containing one three-component vector.
+            float values[3][3] = { { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 } };
+            int64_t shape[] = { 3, 3 };
+            DLTensor tensor{};
+            tensor.data = values;
+            tensor.device = { kDLCPU, 0 };
+            tensor.ndim = 2;
+            tensor.dtype = { kDLFloat, 32, 1 };
+            tensor.shape = shape;
+            // Keep the source buffer and descriptors alive until completion.
+            ovstage_write_data_t write{};
+            write.tensors = &tensor;
+            write.tensor_count = 1;
+            write.is_array = false;
+
+            waitOp(stage, ovstage_write_attribute(stage, query, { 0, literal_to_ovx_string("velocity") },
+                10, write, OVSTAGE_PRIM_MODE_UPSERT), "write velocity");
+            // [/snippet:write-fixed-shape-c]
+        }
+        {
+            // [snippet:write-array-width-c]
+            // Two float3 elements for A, one for B, and three for C.
+            float a[] = { 0, 0, 0, 1, 0, 0 };
+            float b[] = { 0, 1, 0 };
+            float c[] = { 0, 0, 1, 1, 0, 1, 2, 0, 1 };
+            int64_t lengths[] = { 2, 1, 3 };
+            DLTensor tensors[] = {
+                { a, { kDLCPU, 0 }, 1, { kDLFloat, 32, 3 }, &lengths[0], nullptr, 0 },
+                { b, { kDLCPU, 0 }, 1, { kDLFloat, 32, 3 }, &lengths[1], nullptr, 0 },
+                { c, { kDLCPU, 0 }, 1, { kDLFloat, 32, 3 }, &lengths[2], nullptr, 0 },
+            };
+            ovstage_write_data_t write{};
+            write.tensors = tensors;
+            write.tensor_count = 3;
+            write.is_array = true; // Each tensor describes one prim's array.
+            waitOp(stage, ovstage_write_attribute(stage, query, { 0, literal_to_ovx_string("points") },
+                11, write, OVSTAGE_PRIM_MODE_UPSERT), "write points");
+            // [/snippet:write-array-width-c]
+        }
+        {
+            // [snippet:write-index-map-c]
+            // A and B use row 0; C uses row 1.
+            float values[] = { 100, 200 };
+            int64_t shape[] = { 2 };
+            DLTensor tensor{};
+            tensor.data = values;
+            tensor.device = { kDLCPU, 0 };
+            tensor.ndim = 1;
+            tensor.dtype = { kDLFloat, 32, 1 };
+            tensor.shape = shape;
+            // Keep the source buffer and descriptors alive until completion.
+            ovstage_write_data_t write{};
+            write.tensors = &tensor;
+            write.tensor_count = 1;
+            write.is_array = false;
+            const uint32_t indexMap[] = { 0, 0, 1 };
+            write.index_map = indexMap;
+            write.count = 3;
+            waitOp(stage, ovstage_write_attribute(stage, query, { 0, literal_to_ovx_string("heat") },
+                12, write, OVSTAGE_PRIM_MODE_UPSERT), "write heat");
+            // A = 100, B = 100, C = 200.
+            // [/snippet:write-index-map-c]
+        }
+        {
+            // [snippet:write-mask-c]
+            // Only B receives a value, but the source still has a row for each prim.
+            float values[] = { 0, 250, 0 };
+            int64_t shape[] = { 3 };
+            DLTensor tensor{};
+            tensor.data = values;
+            tensor.device = { kDLCPU, 0 };
+            tensor.ndim = 1;
+            tensor.dtype = { kDLFloat, 32, 1 };
+            tensor.shape = shape;
+            // Keep the source buffer and descriptors alive until completion.
+            ovstage_write_data_t write{};
+            write.tensors = &tensor;
+            write.tensor_count = 1;
+            write.is_array = false;
+            const uint64_t mask[] = { 0b010 };
+            write.mask = mask;
+            write.count = 3;
+            waitOp(stage, ovstage_write_attribute(stage, query, { 0, literal_to_ovx_string("heat") },
+                13, write, OVSTAGE_PRIM_MODE_UPSERT), "write heat");
+            // A = 100, B = 250, C = 200.
+            // [/snippet:write-mask-c]
+        }
+        {
+            // [snippet:write-count-c]
+            // Address only A and B, the first two prims in query order.
+            float values[] = { 300, 400 };
+            int64_t shape[] = { 2 };
+            DLTensor tensor{};
+            tensor.data = values;
+            tensor.device = { kDLCPU, 0 };
+            tensor.ndim = 1;
+            tensor.dtype = { kDLFloat, 32, 1 };
+            tensor.shape = shape;
+            // Keep the source buffer and descriptors alive until completion.
+            ovstage_write_data_t write{};
+            write.tensors = &tensor;
+            write.tensor_count = 1;
+            write.is_array = false;
+            write.count = 2;
+            waitOp(stage, ovstage_write_attribute(stage, query, { 0, literal_to_ovx_string("heat") },
+                14, write, OVSTAGE_PRIM_MODE_UPSERT), "write heat");
+            // A = 300, B = 400, C = 200.
+            // [/snippet:write-count-c]
+        }
+        {
+            // [snippet:write-semantic-c]
+            // TOKEN_ID requires interned token identifiers, not character strings.
+            const ovx_string_t names[] = { literal_to_ovx_string("steel"),
+                literal_to_ovx_string("rubber"), literal_to_ovx_string("wood") };
+            ovx_token_t values[3]{};
+            checkOvx(dict, path_dictionary_create_tokens_from_strings(dict, names, 3, values), "intern materials");
+            int64_t shape[] = { 3 };
+            DLTensor tensor{};
+            tensor.data = values;
+            tensor.device = { kDLCPU, 0 };
+            tensor.ndim = 1;
+            tensor.dtype = { kDLUInt, 64, 1 };
+            tensor.shape = shape;
+            // Keep the source buffer and descriptors alive until completion.
+            ovstage_write_data_t write{};
+            write.tensors = &tensor;
+            write.tensor_count = 1;
+            write.is_array = false;
+            write.semantic = OVSTAGE_SEMANTIC_TOKEN_ID;
+            waitOp(stage, ovstage_write_attribute(stage, query, { 0, literal_to_ovx_string("material") },
+                15, write, OVSTAGE_PRIM_MODE_UPSERT), "write material");
+            // [/snippet:write-semantic-c]
+        }
+        {
+            // [snippet:write-watermark-c]
+            // Make heat writes through ordinal 14 available for reads.
+            const ovx_string_t name = literal_to_ovx_string("heat");
+            ovx_token_t heat = OVX_INVALID_TOKEN;
+            checkOvx(dict, path_dictionary_create_tokens_from_strings(dict, &name, 1, &heat), "intern heat");
+            ovstage_write_floor_desc_t watermark{};
+            watermark.ordinal = 14;
+            watermark.scope = OVSTAGE_SCOPE_INCLUDE;
+            watermark.attributes = &heat;
+            watermark.attribute_count = 1;
+            waitOp(stage, ovstage_advance_write_floor(stage, &watermark), "advance heat watermark");
+            // Finish all attribute writes through ordinal 15, including material.
+            watermark = {};
+            watermark.ordinal = 15;
+            watermark.scope = OVSTAGE_SCOPE_ALL;
+            waitOp(stage, ovstage_advance_write_floor(stage, &watermark), "advance all watermarks");
+            // [/snippet:write-watermark-c]
+        }
+        {
+            // [snippet:read-copy-groups-c]
+            const ovx_string_t name = literal_to_ovx_string("heat");
+            ovx_token_t attribute = OVX_INVALID_TOKEN;
+            checkOvx(dict, path_dictionary_create_tokens_from_strings(dict, &name, 1, &attribute), "intern attribute");
+            ovstage_ordinal_range_t range{};
+            range.end_ordinal = 15;
+            ovstage_read_handle_t read = OVSTAGE_INVALID_READ_HANDLE;
+            waitOp(stage, ovstage_read_attributes(stage, query, &attribute, 1, range, &read), "read attributes");
+            std::vector<float> saved;
+            for (;;)
+            {
+                ovstage_read_group_t group{};
+                const auto status = ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group);
+                if (status == OVSTAGE_ERROR_END_OF_ITERATION)
+                    break;
+                check(stage, status, "fetch group");
+                const DLTensor& tensor = group.data.tensors[0];
+                const auto* values = reinterpret_cast<const float*>(
+                    static_cast<const uint8_t*>(tensor.data) + tensor.byte_offset);
+                for (uint32_t i = 0; i < group.prims.count; ++i)
+                {
+                    const uint32_t row = group.data.index_map ? group.data.index_map[i] : i;
+                    saved.push_back(values[row]); // Copy the value before releasing its group.
+                }
+                check(stage, ovstage_release_group(stage, &group), "release group");
+            }
+            waitOp(stage, ovstage_release_read(stage, read), "release read");
+            // Copied values remain valid after both groups and the read are released.
+            std::sort(saved.begin(), saved.end());
+            std::printf("Copied heat values:");
+            for (float value : saved)
+                std::printf(" %.1f", value);
+            std::printf("\n");
+            // Copied heat values: 200.0 300.0 400.0
+            // [/snippet:read-copy-groups-c]
+        }
+        {
+            // [snippet:read-fixed-vectors-c]
+            const ovx_string_t name = literal_to_ovx_string("velocity");
+            ovx_token_t attribute = OVX_INVALID_TOKEN;
+            checkOvx(dict, path_dictionary_create_tokens_from_strings(dict, &name, 1, &attribute), "intern attribute");
+            ovstage_ordinal_range_t range{};
+            range.end_ordinal = 15;
+            ovstage_read_handle_t read = OVSTAGE_INVALID_READ_HANDLE;
+            waitOp(stage, ovstage_read_attributes(stage, query, &attribute, 1, range, &read), "read attributes");
+
+            for (;;)
+            {
+                ovstage_read_group_t group{};
+                const auto status = ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group);
+                if (status == OVSTAGE_ERROR_END_OF_ITERATION)
+                    break;
+                check(stage, status, "fetch group");
+                // Raw tensor shape is (N, 3), with scalar float32 lanes.
+                const DLTensor& tensor = group.data.tensors[0];
+                const auto* values = reinterpret_cast<const float*>(
+                    static_cast<const uint8_t*>(tensor.data) + tensor.byte_offset);
+                for (uint32_t i = 0; i < group.prims.count; ++i)
+                {
+                    const uint32_t row = group.data.index_map ? group.data.index_map[i] : i;
+                    const float* vector = values + row * 3;
+                    // Use vector[0..2] here, while the group still owns the buffer.
+                    (void)vector;
+                }
+                check(stage, ovstage_release_group(stage, &group), "release group");
+            }
+            waitOp(stage, ovstage_release_read(stage, read), "release read");
+            // [/snippet:read-fixed-vectors-c]
+        }
+        {
+            // [snippet:read-change-range-c]
+            const ovx_string_t name = literal_to_ovx_string("heat");
+            ovx_token_t attribute = OVX_INVALID_TOKEN;
+            checkOvx(dict, path_dictionary_create_tokens_from_strings(dict, &name, 1, &attribute), "intern attribute");
+            ovstage_ordinal_range_t range{};
+            // A and B changed at 14; C last changed at 12.
+            range.has_start_ordinal = true;
+            range.start_ordinal = 14;
+            range.end_ordinal = 14;
+            ovstage_read_handle_t read = OVSTAGE_INVALID_READ_HANDLE;
+            waitOp(stage, ovstage_read_attributes(stage, query, &attribute, 1, range, &read), "read attributes");
+            std::vector<float> saved;
+            for (;;)
+            {
+                ovstage_read_group_t group{};
+                const auto status = ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group);
+                if (status == OVSTAGE_ERROR_END_OF_ITERATION)
+                    break;
+                check(stage, status, "fetch group");
+                if (group.is_delete)
+                {
+                    // Deletions carry no value tensor; still release their group.
+                    check(stage, ovstage_release_group(stage, &group), "release deletion group");
+                    continue;
+                }
+                const DLTensor& tensor = group.data.tensors[0];
+                const auto* values = reinterpret_cast<const float*>(
+                    static_cast<const uint8_t*>(tensor.data) + tensor.byte_offset);
+                for (uint32_t i = 0; i < group.prims.count; ++i)
+                {
+                    const uint32_t row = group.data.index_map ? group.data.index_map[i] : i;
+                    saved.push_back(values[row]); // Copy the value before releasing its group.
+                }
+                check(stage, ovstage_release_group(stage, &group), "release group");
+            }
+            waitOp(stage, ovstage_release_read(stage, read), "release read");
+            std::sort(saved.begin(), saved.end());
+            std::printf("Heat values changed at 14:");
+            for (float value : saved)
+                std::printf(" %.1f", value);
+            std::printf("\n");
+            // Heat values changed at 14: 300.0 400.0
+            // [/snippet:read-change-range-c]
+        }
+        {
+            // [snippet:read-retained-records-c]
+            // Query the boundary before relying on exact membership of an old interval.
+            ovstage_ordinal_query_handle_t ordinalQuery{};
+            waitOp(stage, ovstage_get_oldest_preserved_ordinal(stage, &ordinalQuery), "query oldest ordinal");
+            ovstage_ordinal_t oldest = 0;
+            check(stage, ovstage_fetch_ordinal(stage, ordinalQuery, OVSTAGE_TIMEOUT_INFINITE, &oldest), "fetch ordinal");
+            waitOp(stage, ovstage_release_ordinal_query(stage, ordinalQuery), "release ordinal query");
+            const ovstage_ordinal_t requestedStart = 14;
+            if (requestedStart < oldest)
+            {
+                std::fprintf(stderr, "Change records for this interval are no longer exact\n");
+                std::exit(EXIT_FAILURE);
+            }
+            // A subsequent range read can still fail if a newer write replaced its values.
+            // [/snippet:read-retained-records-c]
+        }
+        waitOp(stage, ovstage_release_query(stage, query), "release query");
         path_dictionary_release_path_list_reference(dict, list);
     }
 

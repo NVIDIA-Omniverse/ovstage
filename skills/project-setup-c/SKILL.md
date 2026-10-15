@@ -58,9 +58,11 @@ Resolve inputs in this order: existing repository files and referenced snippets,
    (the inline wrappers) directly, as the minimal example does; `<dlpack/dlpack.h>` covers the
    tensor types.
 2. Add ovstage's `include/` to the consumer's include path and link the ovstage library.
-3. Follow the minimal example's lifecycle (see Minimal Usage) for the create → query →
+3. Select shared or static loading. For a static loader with a non-default binary root,
+   follow Instance configuration below **before any other ovstage call**.
+4. Follow the minimal example's lifecycle (see Minimal Usage) for the create → query →
    write → advance → read → release ordering.
-4. Build and run the narrow target; see the `error-handling` skill for status checking.
+5. Build and run the narrow target; see the `error-handling` skill for status checking.
 
 
 ## Output Format
@@ -127,6 +129,7 @@ To consume a manually downloaded package without the examples' fetch module, see
 | ↳ `ovstage_api/ovstage_api_utils.h` | The flat inline `ovstage_*` **wrappers you call** — `ovstage_get_path_dictionary`, `ovstage_query_from_path_list`, `ovstage_write_attribute`, `ovstage_advance_write_floor`, `ovstage_read_attributes`, `ovstage_wait_op`, `ovstage_release_op`, … (reached via `ovstage.h`; no need to include directly). |
 | ↳ `ovstage_api/ovstage_api.h` | The **vtable** those wrappers dispatch through, plus the execution-model reference. Reached via `ovstage.h`. |
 | ↳ `ovstage_api/ovstage_api_types.h` | Structs / enums — `ovstage_enqueue_result_t`, `ovstage_op_wait_result_t`, status codes, and the DLPack + path-dictionary **types**. |
+| `<ovstage/ovstage_api/experimental/ovstage_placement_extension.h>` | **Experimental; include explicitly** to write, map or read on a specific device: `ovstage_placement_t`, `OVSTAGE_PLACEMENT_INIT`, the `ovstage_*_on_device` wrappers and `ovstage_query_placement_extension()`. Not pulled in by `ovstage.h`; may change between releases, so check `ovstage_query_placement_extension()` (or a wrapper's `OVSTAGE_ERROR_NOT_FOUND`) at run time. |
 | `<ovx/path_dictionary/path_dictionary.h>` (+ `path_dictionary_utils.h`) | The path-dictionary **functions** — `path_dictionary_*` interning, path lists, and the inline wrappers. **Not** pulled in transitively by `<ovstage/ovstage.h>`; include directly to call them (as the minimal example does). |
 | `<dlpack/dlpack.h>` | `DLTensor` types for attribute data exchange (available transitively; the example includes it explicitly). |
 
@@ -157,7 +160,8 @@ is never inferred from tensor shape or count.
 An external C/C++ consumer builds against the **published ovstage package** — public headers,
 the shared loader, runtime, and a CMake config — with no ovstage source checkout.
 The config exports `ovstage::ovstage` (shared loader) and
-`ovstage::ovstage_static` (static loader).
+`ovstage::ovstage_static` (static loader). For a non-default static-loader root,
+follow [Instance configuration](#instance-configuration) before any ovstage call.
 
 ### Get the package
 
@@ -197,7 +201,41 @@ links the shared loader. Note the path-dictionary split: `<ovstage/ovstage.h>` p
 path-dictionary *types* but not the `path_dictionary_*` *functions* — include
 `<ovx/path_dictionary/path_dictionary.h>` directly to call them (see Headers above).
 
+## Instance configuration
+
+The shared loader (`ovstage::ovstage`) normally locates the runtime beside itself;
+instance creation acquires process state on demand. The static loader
+(`ovstage::ovstage_static`) defaults to the consuming module's directory. If the
+runtime is elsewhere, explicitly initialize it **before any other `ovstage_*`
+call**, including `ovstage_create_instance`, using
+`ovstage_config_entry_binary_package_root_path()` from `<ovstage/ovstage_config.h>`
+(also included by `<ovstage/ovstage.h>`).
+
+Set `binaryRoot` to the extracted package's **`bin/` directory**, not the package
+root or `lib/`. Keep the pointer and explicit byte length valid until
+`ovstage_initialize(&config)` returns, and check its status before creating an
+instance. Changing the root after the loader has loaded the runtime cannot
+redirect that load. Follow this asserted public-contract snippet:
+
+> **Source:** `tests/c/test_static_config.cpp` snippet `initialize-static-loader-c`
+
+For the CMake consumer above, select `ovstage::ovstage_static` in
+`target_link_libraries` and use this initialization before the minimal write/read
+lifecycle. Destroy instances and release their resources before balancing each
+successful explicit `ovstage_initialize` with one `ovstage_shutdown`; implicit
+initialization through instance creation needs no extra shutdown call.
+
+Other process settings, such as
+`ovstage_config_entry_runtime_default_hierarchy_computation_model()`, belong in
+the first initialization too. A later runtime setting must match the active
+process setting. The binary-root entry is ignored by the shared loader, so the
+same initialization recipe can be used for both loader targets.
+
 ## Troubleshooting
+
+- **Static loader cannot find the runtime**: configure the extracted package's
+  `bin/` with `ovstage_config_entry_binary_package_root_path()` before the first
+  ovstage call; a loader-path environment variable alone does not supply this root.
 
 - **Headers not found** (`ovstage/ovstage.h` missing): ensure the consumer's include path
   contains ovstage's `include/`; the data-plane API is reached transitively via

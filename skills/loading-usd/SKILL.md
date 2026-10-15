@@ -40,7 +40,7 @@ USD edits per tick, or confirming what landed by querying populated prims.
 For the direct write → seal → read data-plane lifecycle (no USD), use
 `application-flow` and `path-dictionary` instead.
 For the reverse path — exporting this populated runtime state back to a USD
-file or a reusable destination — use `exporting-to-usd`.
+file, reusable destination, or host-owned identifier — use `exporting-to-usd`.
 
 ## Inputs
 
@@ -49,7 +49,8 @@ Resolve inputs in this order: existing repository files and referenced snippets,
 - USD source: a file/URL path, or an inline USDA string.
 - Data domains to populate: RENDERING, PHYSICS, or ALL (bitmask). `0`
   (`DOMAIN_NONE`) authors nothing.
-- The caller-owned `ordinal` for the tick (population never opens/commits its own).
+- The caller-assigned `ordinal` for each population operation (a tick may use
+  several; population never chooses, increments, or seals one itself).
 - Whether this is a one-shot open or a running loop with live edits
   (`apply_usd_changes`) / time playback (`apply_usd_time`).
 - The shipped `ovstage_population.h` header and the referenced test snippets are the
@@ -61,16 +62,17 @@ Resolve inputs in this order: existing repository files and referenced snippets,
   population state is created lazily on first populate call and released with the
   instance.
 - Understand the async **submit/observe** model (`cpu-ahead-gpu-async`): population
-  enqueues return an op id; nothing is materialized until you wait on it.
+  enqueues return an op id; wait on it to confirm materialization and check errors.
 - **Ordinal ownership:** the caller (frame coordinator) owns the ordinal and the
   write floor; population is invoked against a caller-provided ordinal.
 
 ## Instructions
 
 1. **Open the USD into the stage.** Call `ovstage_population_open_usd_from_string`
-   (inline USDA) or `_open_usd_from_file` (path/URL), passing the tick `ordinal`, a
-   `time` in seconds, and a `domains` bitmask. This both loads the USD and populates
-   the ovstage in one op, replacing any previously loaded content.
+   (inline USDA) or `_open_usd_from_file` (path/URL), passing an explicit `ordinal`,
+   a `time` in seconds, and a `domains` bitmask. This both loads the USD and
+   populates the ovstage in one op. It replaces the USD source but removes
+   nothing already populated; see "Repopulating a Stage" in the population doc.
 2. **Await the op.** Population is asynchronous — wait via
    `ovstage_population_wait_op` (C) or the blocking `population.open_usd_from_string`
    / `Operation.wait()` (Python).
@@ -81,6 +83,10 @@ Resolve inputs in this order: existing repository files and referenced snippets,
    `remove_usd_reference` / `reset_usd` edit the USD source only — follow with
    `apply_usd_changes(ordinal)` to propagate structural edits into the ovstage;
    use `apply_usd_time(ordinal, time)` once per tick for time-sampled playback.
+   Under the strictly increasing policy, give overlapping updates newer
+   ordinals, including when both calls occur in one tick. For example, open at 1,
+   apply changes at 2, then update time at 3. Coordinate with other writers and
+   advance the write floor through the final ordinal after the updates complete.
 5. **Diagnose failures** via `ovstage_population_get_last_error` /
    `_get_last_op_error` (C) or the `OvstageError` raised by the blocking Python
    wrappers.
@@ -96,9 +102,9 @@ Resolve inputs in this order: existing repository files and referenced snippets,
 
 ovstage itself has **no USD dependency**; the population API is the bridge that reads
 USD (files or inline USDA) and mirrors it into an ovstage instance so consumers like
-ovrtx can render it. The initial `open_usd_*` is one-shot (it replaces prior USD
-content); subsequent live edits are picked up by `apply_usd_changes` (structural) and
-`apply_usd_time` (time-sampled).
+ovrtx can render it. The initial `open_usd_*` is one-shot: it replaces the USD source,
+but not what an earlier populate already wrote into the stage. Subsequent live edits are
+picked up by `apply_usd_changes` (structural) and `apply_usd_time` (time-sampled).
 
 ### Domains
 
@@ -137,7 +143,7 @@ declares, and those its schemas declare that resolve to a fallback. So an unauth
 property still counts; pair it with `IS_AUTHORED` for "carries an authored value".
 
 The common shape is "populate these schemas": `HAS_SCHEMA` over the schema names, paired
-with `DECLARED_BY_SCHEMA` over the same names to publish just what those schemas declare.
+with `DECLARED_BY_SCHEMA` over the same names to populate just what those schemas declare.
 The same list serves both halves — `HAS_SCHEMA` matches a name whether it is the prim's type
 or one of its applied API schemas, so a schema list needs no partitioning. Narrow it to a
 branch by AND-ing `IS_UNDER_PATH`.
@@ -190,11 +196,17 @@ source, and confirm a missing file fails the populate op:
 
 > **Source:** `tests/python/test_population.py` snippets `usd-reference`, `reset-usd`, `open-missing-file`
 
-`population.open_usd_from_string(stage, usda, ordinal=, time_code=, domains=)` blocks;
+`population.open_usd_from_string(stage, usda, ordinal=, time=, domains=)` blocks;
 `open_usd_from_string_async` returns an `Operation` for the CPU-ahead pattern
-(`cpu-ahead-gpu-async`). `open_usd` / `open_usd_from_file` load from a path/URL. Live
+(`cpu-ahead-gpu-async`). `open_usd` / `open_usd_async` load from a path/URL. Live
 edits: `add_usd_reference[_from_string]`, `remove_usd`, `reset_usd`,
 `apply_usd_changes`, `update_from_usd_time` (each has an `*_async` variant).
+
+`open_usd` (file/URL), `open_usd_from_string`, and
+`apply_usd_changes`, including their async variants, require an explicit
+`ordinal`, passed positionally or by keyword. Omitting it raises `TypeError`;
+the former default of 1 has been removed. The `_with_desc` and
+`update_from_usd_time` helpers already require an explicit ordinal.
 
 ## C
 
@@ -218,7 +230,7 @@ edits (`ovstage_population_add_usd_reference_from_*`, `_remove_usd_reference`,
 | Purpose | C | Python |
 |---------|---|--------|
 | Open inline USDA | `ovstage_population_open_usd_from_string` | `population.open_usd_from_string` |
-| Open file/URL | `ovstage_population_open_usd_from_file` | `population.open_usd` / `open_usd_from_file` |
+| Open file/URL | `ovstage_population_open_usd_from_file` | `population.open_usd` |
 | Open with a description | `ovstage_population_open_usd_from_{file,string}_with_desc` | `population.open_usd_with_desc` / `open_usd_from_string_with_desc` |
 | Await op | `ovstage_population_wait_op` | `Operation.wait()` (blocking wrappers auto-wait) |
 | Add reference | `ovstage_population_add_usd_reference_from_{file,string}` | `population.add_usd_reference[_from_string]` |
@@ -235,12 +247,25 @@ This skill has no scripts.
 
 - The referenced snippets are the source of truth; this skill composes them and
   describes the surrounding population API rather than introducing new code.
-- **One-shot open.** `open_usd_*` replaces previously loaded USD content; additive
-  changes go through `add_usd_reference_*` + `apply_usd_changes`.
+- **One-shot open.** `open_usd_*` replaces the previously loaded USD source but removes
+  nothing it had already populated, so re-opening merges unless you clear first; see
+  "Repopulating a Stage" in the population doc. Additive changes go through
+  `add_usd_reference_*` + `apply_usd_changes`.
+- **Adding a reference onto an existing prim republishes its whole subtree.** The next
+  `apply_usd_changes` writes every selected attribute of that prim and every prim beneath
+  it at its ordinal, unchanged values included (the root `/` republishes the whole stage).
+  Range reads report them as changed, and the written values replace any values written
+  directly into the stage since. Target a not-yet-existing prim path to republish only
+  the added content.
 - **Surviving-anchor removal (current-build implementation gap).** Removing a reference from an existing prim or a
   root sublayer may leave stale descendants; removal works when the resync root disappears.
-- **Ordinal is caller-owned.** Population never opens/commits an ordinal; pass the
-  tick ordinal in and advance the write floor yourself.
+- **Ordinals are caller-owned.** Assign each population call an ordinal above
+  applicable floors; a new stage's floor is 0, so start at 1 or higher. Under the
+  `STRICTLY_INCREASING` policy, overlapping cell or prim-lifecycle
+  changes need newer ordinals even before sealing. `NONDECREASING` permits equal
+  retained ordinals and `FLOOR_ONLY` skips retained-history admission; every
+  policy still enforces applicable floors. Disjoint effects may share an
+  ordinal. Seal completed updates yourself; no helper increments the ordinal.
 - **Latest-snapshot payloads.** Do not design a flow around historical payloads;
   bounded older change membership is available only at or above the reported
   retention frontier.

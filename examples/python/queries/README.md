@@ -31,6 +31,14 @@ populated prims (usd-prim-type):
   /World/InstanceB = XformInstance
   /World/Prototype = Xform
   /World/Prototype/Box = Cube
+/World/Anchor exists: True
+/World/Anchor has example:count: True
+Meshes below /World/Group: 2
+Direct children of /World/Group: 2
+Prims with points and faceVertexCounts: 2
+Matched paths: /World/Group/Left /World/Group/Right
+Prims with ShadowAPI: 1
+APIs on /World/Group/Right: MaterialBindingAPI MeshSubdivision ShadowAPI
 usd-prim-type IN {Mesh} -> 2 matched: /World/Group/Left /World/Group/Right
 usd-path PREFIX {/World/Group} -> 3 matched: /World/Group /World/Group/Left /World/Group/Right
 usd-parent IN {/World/Group} -> 2 matched: /World/Group/Left /World/Group/Right
@@ -42,9 +50,12 @@ query introspection (HAS example:count, scoped to two attributes):
   reported attributes: example:count usd-prim-type
   all_handle == query handle: yes
   example:count via all_handle: /World/Anchor=5 /World/Group/Left=3
-prototype roots: 1 (all prefixed /__Prototype_: yes)
-instance roots of the prototype: /World/InstanceA /World/InstanceB
-/World/InstanceA maps back to the same prototype root: yes
+prototype roots: 1
+instance roots: /World/InstanceA /World/InstanceB
+/World/OuterA/NestedLeaf
+/World/OuterSource/NestedLeaf
+True
+not an instance root
 ```
 
 - The scene is `queries.usda`, shipped next to this file; `/World/Prototype`
@@ -56,9 +67,9 @@ instance roots of the prototype: /World/InstanceA /World/InstanceB
 - `all_handle` is the same query handle echoed back into the result, so code
   holding only the `QueryResult` can still read from the matched set — the
   example reads `example:count` through it.
-- The last three lines map instancing: prototype roots, one prototype's
-  instance roots, and one instance back to its prototype. The synthesized
-  prototype name is checked by prefix and never printed.
+- The final lines map scene-graph instances to their prototypes, then load
+  `nested.usda` to show nested instance paths and a non-instance lookup.
+  Generated prototype names are discovered through the API.
 
 ## Supported predicates
 
@@ -101,14 +112,25 @@ uv run main.py
 The `[snippet:name]` markers in `main.py` fence regions referenceable from the
 ovstage skills under `../../../skills/`; keep them intact when editing.
 
-- `setup` — imports (`numpy`, `ovstage`, `Filter`/`Predicate`, `instancing`, `population`)
-- `filter-predicates` — one query per supported predicate
-- `query-introspection` — `Query.result()`: reported attributes,
-  `total_prim_count`, and reading through `all_handle`
-- `instancing-queries` — prototype roots to instance roots using Python strings
-- `filter-query` — run one filter query end to end
-- `resolve-matched-prims` — resolve a read group's prim handles back to path
-  strings
+- `setup`
+- `query-filter-imports`
+- `instancing-imports`
+- `query-prim-exists`
+- `query-attribute-exists`
+- `query-type-subtree`
+- `query-direct-children`
+- `query-required-attributes`
+- `query-matched-paths`
+- `query-applied-schema`
+- `query-list-schemas`
+- `filter-predicates`
+- `query-introspection`
+- `instancing-queries`
+- `instancing-timing`
+- `instancing-nested`
+- `instancing-not-found`
+- `filter-query`
+- `resolve-matched-prims`
 
 ## Notes
 
@@ -123,3 +145,145 @@ ovstage skills under `../../../skills/`; keep them intact when editing.
   top-level handler, which prints one line and exits nonzero. A real
   application would handle errors in place.
 
+
+## Checking existence
+
+The following checks match `/World/Anchor` exactly, then test whether it has
+`example:count`. A missing prim or attribute gives a count of zero.
+
+The imports are `Filter`, `FilterOp`, and `Predicate` from `ovstage`.
+
+### Prim exists
+
+```python
+# Match the exact path, not a prefix that could include other prims.
+prim_filter = Filter([Predicate("usd-path", FilterOp.IN, ["/World/Anchor"])])
+with stage.query(filter=prim_filter) as query:
+    query.wait()
+    prim_exists = query.result().total_prim_count != 0
+print("/World/Anchor exists:", prim_exists)
+# /World/Anchor exists: True
+```
+
+### Attribute exists on that prim
+
+```python
+# Both conditions must match: this path AND presence of this attribute.
+attribute_filter = Filter([
+    Predicate("usd-path", FilterOp.IN, ["/World/Anchor"]),
+    Predicate("example:count", FilterOp.HAS),
+])
+with stage.query(filter=attribute_filter) as query:
+    query.wait()
+    attribute_exists = query.result().total_prim_count != 0
+print("/World/Anchor has example:count:", attribute_exists)
+# /World/Anchor has example:count: True
+```
+
+## Common query patterns
+
+These examples use the same stage. The first three report match counts; the
+last reads `usd-path` and resolves the identifiers to path strings.
+`paths` is the stage's `PathDictionary`; import `OrdinalRange` from `ovstage`.
+
+### Meshes below /World/Group
+
+```python
+from ovstage import Filter, FilterOp, Predicate
+
+# Separate predicates must all match.
+mesh_filter = Filter([
+    Predicate("usd-prim-type", FilterOp.IN, ["Mesh"]),
+    Predicate("usd-path", FilterOp.PREFIX, ["/World/Group/"]),
+])
+with stage.query(filter=mesh_filter) as query:
+    query.wait()
+    mesh_count = query.result().total_prim_count
+print("Meshes below /World/Group:", mesh_count)
+# Meshes below /World/Group: 2
+```
+
+### Direct children of /World/Group
+
+```python
+# Match the parent exactly; grandchildren have a different parent.
+children_filter = Filter([
+    Predicate("usd-parent", FilterOp.IN, ["/World/Group"]),
+])
+with stage.query(filter=children_filter) as query:
+    query.wait()
+    child_count = query.result().total_prim_count
+print("Direct children of /World/Group:", child_count)
+# Direct children of /World/Group: 2
+```
+
+### Prims with points and faceVertexCounts
+
+```python
+# Require both attributes, without comparing their values.
+geometry_filter = Filter([
+    Predicate("points", FilterOp.HAS),
+    Predicate("faceVertexCounts", FilterOp.HAS),
+])
+with stage.query(filter=geometry_filter) as query:
+    query.wait()
+    geometry_count = query.result().total_prim_count
+print("Prims with points and faceVertexCounts:", geometry_count)
+# Prims with points and faceVertexCounts: 2
+```
+
+### Matched paths
+
+```python
+# Query the direct children, then read their current path identifiers.
+children_filter = Filter([
+    Predicate("usd-parent", FilterOp.IN, ["/World/Group"]),
+])
+path_attribute = paths.intern_token("usd-path")
+matched_paths = []
+with stage.query(filter=children_filter) as query:
+    query.wait()
+    with stage.read_attributes(query, [path_attribute], OrdinalRange.latest(2)) as read:
+        read.wait()
+        for group in read.groups():
+            with group:  # Release every group after resolving its identifiers.
+                path_ids = group.array(0)
+                for i in range(group.prim_count):
+                    row = group.data_row_index(i) if group.has_data_index_map else i
+                    matched_paths.append(paths.path_to_string(int(path_ids[row])))
+print("Matched paths:", " ".join(sorted(matched_paths)))
+# Matched paths: /World/Group/Left /World/Group/Right
+```
+
+### Applied API schemas
+
+Select prims with `ShadowAPI`, then list the schemas on `/World/Group/Right`.
+
+```python
+# Select prims carrying this applied API schema.
+schema_filter = Filter([Predicate("usd-schemas", FilterOp.CONTAINS, ["ShadowAPI"])])
+with stage.query(filter=schema_filter) as query:
+    query.wait()
+    schema_count = query.result().total_prim_count
+print("Prims with ShadowAPI:", schema_count)
+# Prims with ShadowAPI: 1
+```
+
+```python
+# Select one prim, then read its array of applied-schema token identifiers.
+prim_filter = Filter([Predicate("usd-path", FilterOp.IN, ["/World/Group/Right"])])
+schema_attribute = paths.intern_token("usd-schemas")
+schema_names = []
+with stage.query(filter=prim_filter) as query:
+    query.wait()
+    with stage.read_attributes(query, [schema_attribute], OrdinalRange.latest(2)) as read:
+        read.wait()
+        for group in read.groups():
+            with group:
+                # Array attributes return a separate tensor for each prim.
+                for i in range(group.prim_count):
+                    for token in group.array(i):
+                        schema_names.append(paths.token_to_string(int(token)))
+print("APIs on /World/Group/Right:", " ".join(sorted(schema_names)))
+# APIs on /World/Group/Right: MaterialBindingAPI MeshSubdivision ShadowAPI
+```

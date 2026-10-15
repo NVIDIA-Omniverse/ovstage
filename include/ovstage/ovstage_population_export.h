@@ -2,11 +2,9 @@
  *
  * ovstage population export to USD.
  *
- * Public C ABI for authoring selected ovstage runtime state into USD storage.
- * The header intentionally exposes no OpenUSD C++ types. Destinations are
- * addressed by a storage path or resolver identifier that ovstage itself opens
- * and owns; ovstage never authors a USD layer or stage that the caller already
- * has open, because USD identifiers are not portable across USD runtimes.
+ * Public C ABI for authoring selected ovstage runtime state into a USD layer or
+ * a stage opened from its root layer. The header intentionally exposes no
+ * OpenUSD C++ types. Callers identify destinations by SdfLayer identifier.
  *
  * Use this API when an application has populated or otherwise authored an
  * ovstage runtime and needs to persist a selected slice back to USD. The
@@ -14,8 +12,17 @@
  * entry points enqueue the same work on the per-instance ovpopulation FIFO and
  * retain the resolved USD destination until completion.
  *
+ * Export authors what ovstage holds, never what the original USD source authored.
+ * Each value is read from the ovstage state at the export's ordinal: as population
+ * stored it, after the conversions described in `ovstage_population.h` ("Populated
+ * value types"), or as the application wrote it since. So a schema `int[]` attribute
+ * authored as `uint[]` exports as `int[]`, a `double` value populated into a declared
+ * `float` exports with `float` precision, and a property that population did not carry
+ * over exports as ovstage holds it, or not at all. Export does not consult the source
+ * stage's opinions to restore what population changed or dropped.
+ *
  * Async export is a convenience scheduler, not a USD synchronization boundary.
- * Callers must not concurrently read or author the same destination storage,
+ * Callers must not concurrently read or author the same destination stage/layer,
  * and must fence async work before mixing it with synchronous export.
  * Every accepted async export must eventually receive an export-specific
  * terminal wait; until then its report and destination keepalive remain owned
@@ -613,6 +620,92 @@ ovstage_population_enqueue_result_t ovstage_population_export_enqueue_to_usd_fil
     ovstage_instance_t* stage, ovx_string_t usd_identifier, const ovstage_population_export_desc_t* desc);
 
 /**
+ * @brief Export to a USD layer addressed by identifier.
+ *
+ * This synchronous call authors directly in place. It bypasses the
+ * population/export FIFO, provides no rollback, and requires caller-controlled
+ * serialization of the destination. The implementation first looks for an already-open SdfLayer with this
+ * identifier, then falls back to opening it from storage. Anonymous in-memory
+ * layers are supported when they are already resident in USD's layer registry.
+ *
+ * @param stage Source ovstage instance.
+ * @param usd_layer_identifier Identifier of the destination USD layer.
+ * @param desc Export descriptor. The caller retains ownership.
+ * @param report [out, optional] Receives export diagnostic counters.
+ * @return `OVSTAGE_OK` on success or an `ovstage_api_status_t` error code.
+ */
+ovstage_api_status_t ovstage_population_export_to_usd_layer_identifier(
+    ovstage_instance_t* stage,
+    ovx_string_t usd_layer_identifier,
+    const ovstage_population_export_desc_t* desc,
+    ovstage_population_export_report_t* report);
+
+/**
+ * @brief Export to a USD stage addressed by its root-layer identifier.
+ *
+ * This synchronous call opens the stage and authors directly into that stage's
+ * default edit target. It bypasses the population/export FIFO, provides no
+ * rollback, and requires caller-controlled serialization of the destination.
+ * Caller-owned custom edit-target selection is not available through this public
+ * C API.
+ *
+ * @param stage Source ovstage instance.
+ * @param usd_stage_root_layer_identifier Root-layer identifier of the destination stage.
+ * @param desc Export descriptor. The caller retains ownership.
+ * @param report [out, optional] Receives export diagnostic counters.
+ * @return `OVSTAGE_OK` on success or an `ovstage_api_status_t` error code.
+ */
+ovstage_api_status_t ovstage_population_export_to_usd_stage_identifier(
+    ovstage_instance_t* stage,
+    ovx_string_t usd_stage_root_layer_identifier,
+    const ovstage_population_export_desc_t* desc,
+    ovstage_population_export_report_t* report);
+
+/**
+ * @brief Enqueue export to a USD layer addressed by identifier.
+ *
+ *  The descriptor and every nested array/string are copied before this function
+ *  returns. The destination layer is resolved and retained at enqueue time.
+ *  Work runs on the same per-instance FIFO used by ovpopulation operations.
+ *
+ *  The caller must not concurrently read or author the destination layer until
+ *  the operation has completed. Synchronous export is not serialized with this
+ *  queue and requires the same caller-provided synchronization.
+ *
+ *  @param stage                 ovstage instance.
+ *  @param usd_layer_identifier  Identifier of an existing USD layer.
+ *  @param desc                  Export descriptor; the complete descriptor graph
+ *                               is copied before this function returns.
+ *  @return Enqueue result (see `ovstage_population_enqueue_result_t`). A rejected
+ *          enqueue is reported in `status`; execution failures are returned by
+ *          `ovstage_population_export_wait_op` with export diagnostics available
+ *          through `ovstage_population_get_last_error`.
+ */
+ovstage_population_enqueue_result_t ovstage_population_export_enqueue_to_usd_layer_identifier(
+    ovstage_instance_t* stage,
+    ovx_string_t usd_layer_identifier,
+    const ovstage_population_export_desc_t* desc);
+
+/**
+ * @brief Enqueue export to a USD stage addressed by its root-layer identifier.
+ *
+ *  The stage is opened and retained at enqueue time. Export authors into its
+ *  default edit target. The caller must not read or author that stage or its
+ *  layers concurrently with the export.
+ *
+ *  @param stage                            ovstage instance.
+ *  @param usd_stage_root_layer_identifier  Root-layer identifier of the destination stage.
+ *  @param desc                             Export descriptor; the complete descriptor graph
+ *                                          is copied before this function returns.
+ *  @return Enqueue result. Admission failures are reported immediately; execution
+ *          failures are returned by `ovstage_population_export_wait_op`.
+ */
+ovstage_population_enqueue_result_t ovstage_population_export_enqueue_to_usd_stage_identifier(
+    ovstage_instance_t* stage,
+    ovx_string_t usd_stage_root_layer_identifier,
+    const ovstage_population_export_desc_t* desc);
+
+/**
  * @brief Wait for an asynchronous export operation and consume its stored result.
  *
  *  The wait fences every ovpopulation operation through @p op_id. A timeout
@@ -633,8 +726,12 @@ ovstage_population_enqueue_result_t ovstage_population_export_enqueue_to_usd_fil
  *                     report. Zeroed before waiting and on timeout.
  *  @return `OVSTAGE_OK` on successful completion, `OVSTAGE_ERROR_TIMEOUT` while
  *          work remains pending, the operation failure status when execution
- *          failed, or `OVSTAGE_ERROR_INVALID_ARGUMENT` for an unknown, consumed,
- *          or unrelated operation id.
+ *          failed, or `OVSTAGE_ERROR_INVALID_HANDLE` for any op id that does
+ *          not resolve to a live export/destination operation on this instance
+ *          — an id this instance's operation stream never issued (zero, issued
+ *          by a different instance, or by a stream this instance has since
+ *          replaced), one already consumed by an earlier terminal wait, or one
+ *          that never identified an export/destination operation.
  */
 ovstage_api_status_t ovstage_population_export_wait_op(
     ovstage_instance_t* stage,

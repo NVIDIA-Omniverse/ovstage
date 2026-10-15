@@ -32,7 +32,10 @@ add_custom_command(TARGET queries POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_CURRENT_LIST_DIR}/queries.usda"
         "$<TARGET_FILE_DIR:queries>/queries.usda"
-    COMMENT "Copying queries.usda to build directory"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_LIST_DIR}/nested.usda"
+        "$<TARGET_FILE_DIR:queries>/nested.usda"
+    COMMENT "Copying query scenes to build directory"
 )
 
 # Setup runtime dependencies (rpath / loader-path guidance)

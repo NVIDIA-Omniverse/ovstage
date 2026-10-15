@@ -4,9 +4,357 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-10-13
+
+### Summary
+
+- Feature release. Ordinal admission is now nondecreasing by default; reads,
+  writes and maps gain experimental CPU/CUDA placement; attribute schemas can be
+  replaced explicitly; USD population exposes richer metadata; and USD data can
+  be exported into existing layers and stages in ovstage's USD runtime.
+
+- C/C++ callers must rebuild for changed descriptor layouts. Python APIs,
+  tensor layouts and runtime behavior also have breaking changes; see the
+  **Breaking** entries below.
+
+### Added
+
+- **Data plane**
+
+  - **Experimental CPU/CUDA placement for reads, writes and maps.**
+    `ovstage_placement_t` and Python `Placement` select a device copy and
+    stream. Placed reads use a current device copy when available; writes
+    transfer to the requested device and maps expose writable staging there.
+    Caller-owned availability events support device-side synchronization; check
+    operation status separately. Map events are recorded at commit. C callers
+    explicitly include `ovstage_placement_extension.h` from the experimental
+    headers and discover placement through
+    `ovstage_query_placement_extension()`. Missing or incompatible extension
+    versions report `OVSTAGE_ERROR_NOT_FOUND`. Placement preserves the core
+    vtable ABI; its experimental API, ABI and semantics may change between
+    releases.
+  - **Inspect clone completion.** `ovstage_fetch_clone_result()` and Python
+    `CloneOperation.result()` report cloned prims, target/source counts and
+    ordinal.
+  - **Read relationship and connection columns.** Single-path relationship
+    columns support `OVSTAGE_SEMANTIC_RELATIONSHIP_PATH_ID` with
+    `is_array = false` in writes, maps, reads and USD export. CPU reads and
+    deletes support connection columns; reads return target-path and
+    target-attribute token pairs. GPU connection reads remain unsupported.
+
+- **USD population and export**
+
+  - **Read authored physics data alongside rendering output.** PHYSICS
+    population publishes `usd-metadata:typeName` on typed prims, including
+    structural ancestors. Where PHYSICS or a selector publishes a
+    PointInstancer's `prototypes`, `prototypes:usd-targets` preserves the
+    authored target order indexed by `protoIndices`. Live edits update both
+    authored-data columns, including removal of a type name or clearing
+    prototype targets.
+  - **Repopulate from the current USD source.**
+    `ovstage_population_repopulate_usd_with_desc()` and Python
+    `population.repopulate_usd_with_desc()` rewrite selected values from USD
+    while retaining source layers and references. Direct overrides of those
+    values are replaced; content outside the description is not removed. The
+    descriptions replace the scope and domains of subsequent USD updates.
+  - **Export into USD layers and stages already open in ovstage.**
+    `ovstage_population_export_to_usd_layer_identifier()` and
+    `ovstage_population_export_to_usd_stage_identifier()` have asynchronous and
+    Python equivalents. The destination must be retained in ovstage's USD
+    runtime; an unopened identifier reports `OVSTAGE_ERROR_INVALID_ARGUMENT`.
+    Export authors in memory and never saves.
+  - **Query USD type ancestry and applied schemas.** Population records known
+    type ancestry in `usd-ancestor-types` and bare multiple-apply schema names
+    alongside their instances in `usd-schemas`. Rendering population retains its
+    documented type/tag conventions; export omits bare schema names.
+  - `OVSTAGE_POPULATION_DEFAULT_TIME` / `population.DEFAULT_TIME` name USD
+    default time; test it with `ovstage_population_is_default_time()` /
+    `population.is_default_time()`, not equality, because its value is NaN.
+
+- **Runtime and tools**
+
+  - **Inspect the loaded build and configuration.** `ovstage_get_build_info()` /
+    `ovstage.get_build_info()` report build identity before initialization;
+    `ovstage_get_config()` / `Stage.config` expose captured explicit
+    configuration.
+  - Expanded documentation with a runtime overview and C/Python walkthroughs
+    for population, transforms, USD export and CUDA writes.
+  - A benchmarking guide covers the packaged benchmark executable, filtering
+    and platform setup.
+  - Python data-plane operation and handle `wait()` methods return their
+    receiver for chaining. Population-operation return values are unchanged.
+  - Python `ReadGroup.semantic` exposes the returned attribute semantic.
+
+### Changed
+
+- **Data plane**
+
+  - **Breaking: nondecreasing ordinal admission by default.** `NONDECREASING`
+    rejects mutations older than retained changes to affected attributes or prim
+    creation/deletion history. Equal ordinals remain allowed above applicable
+    write floors. Aliases share floors, admission history and overlap checks.
+    Configure `OVSTAGE_CONFIG_RUNTIME_DEFAULT_ORDINAL_ADMISSION_POLICY` in C or
+    `StageConfig.runtime_default_ordinal_admission_policy` in Python;
+    alternatives are `STRICTLY_INCREASING` and `FLOOR_ONLY`. Enqueue may succeed
+    before a history conflict is detected; `wait()` then reports
+    `OVSTAGE_ERROR_OP_FAILED`.
+  - **Breaking: snapshot reads now honor their end ordinal.** 0.2.1 returned
+    current values regardless of the snapshot end. A queried attribute/path with a
+    change above its write floor at or before the snapshot end reports
+    `OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION`. Otherwise, a retained change after
+    the end reports `OVSTAGE_ERROR_OUT_OF_RANGE`, even if unsealed. For current
+    values use `UINT64_MAX` (Python `OrdinalRange.latest((1 << 64) - 1)`). A
+    zero-initialized range requests ordinal 0. Below the
+    retained-history boundary, success cannot guarantee the earlier state.
+  - **Breaking (C ABI): replace schemas during writes/maps.**
+    `OVSTAGE_ATTRIBUTE_MODE_FORCE` replaces a conflicting schema; `REJECT`
+    remains the default. `attribute_mode` is appended to `ovstage_write_data_t`
+    and `ovstage_map_desc_t`, preserving existing field offsets.
+    `ovstage_write_data_t` and `ovstage_attribute_write_t` grow. Rebuild C/C++
+    callers and zero-initialize descriptors to preserve REJECT. FORCE maps
+    require `dtype` and replace at commit.
+  - **Breaking: read/map tensor layouts.** Raw DLTensor outputs now use scalar
+    lanes and explicit component axes: a `float3` changes from `[N]` with 3
+    lanes to `[N,3]` with 1 lane; a float64 4x4 `MATRIX` changes from `[N]` with
+    16 lanes to `[N,4,4]` with 1 lane. Outputs provide explicit compact strides.
+    **Write inputs and map-creation dtypes remain lane-based.** Use
+    `ovstage_tensor_to_write()` / `typed_tensor_to_write()` to forward
+    descriptors; the C helper requires
+    `<ovstage/ovstage_api/ovstage_tensor_utils.h>`. Python `ReadGroup.array()` and
+    `MapGroup.array()` now return shaped views instead of flat arrays; use
+    `.reshape(-1)` for flat indexing. Include all shape dimensions in counts.
+  - **Breaking: instance-owned path dictionaries.** Path lists belong to one
+    instance and cannot be shared across instances or outlive their owner.
+    Python `PathDictionary` requires a `Stage`. *Migration:* create lists in the
+    destination stage's dictionary and release them before destroying that
+    stage. Tokens and paths are guaranteed valid only for their owning instance's
+    lifetime; intern them through the instance that uses them, and do not retain
+    its dictionary pointer after its final owning handle is released.
+  - **Breaking: connection writes reject surplus pairs.** Supply exactly one
+    pair per target prim. Surplus pairs in shared input, previously ignored, now
+    fail during execution; `ovstage_wait_op()` / Python `wait()` reports
+    `OVSTAGE_ERROR_OP_FAILED`.
+  - **Breaking: single-path relationship read semantics.** These columns now
+    report `OVSTAGE_SEMANTIC_RELATIONSHIP_PATH_ID` instead of `NONE`; their
+    64-bit payload is unchanged. Update code that branches on the returned
+    semantic.
+  - Mapped prim/attribute creation, `HAS` membership and hierarchy changes
+    become visible at successful group/final unmap rather than during setup.
+    Failed commits may leave partial changes without completed change records;
+    close the failed session and repair with a new map or write.
+  - **Reduce query/read and write overhead.** Query creation/refresh,
+    unchanged-range reads, attribute lookup/discovery and dense writes avoid
+    redundant work, including writes that create prims and columns.
+  - Queries and reads can progress during OVRTX rendering of an attached stage,
+    subject to operation ordering and overlap checks.
+
+- **USD population and instancing**
+
+  - **Breaking: combined population retains rendering values.** With RENDERING
+    also populated, Imageable `purpose` and a PointInstancer's `extent` and
+    `prototypes` retain rendering values instead of authored USD values. Read
+    authored prototype targets from `prototypes:usd-targets`.
+  - **Breaking: opening USD merges into existing content.** An open overwrites
+    populated values but no longer clears unrelated prims or attributes.
+    *Migration:* explicitly delete existing content first when replacement is
+    intended. Resetting the USD source requires `apply_usd_changes` to propagate
+    the clear; use an earlier ordinal for that clear than for the new open.
+  - **Breaking: prototype-root paths are opaque.** Combined rendering and
+    physics/selector population shares one prototype root and one prototype link
+    per instance root. *Migration:* resolve roots through instancing queries
+    instead of constructing USD `/__Prototype_N` paths. The new mapping
+    preserves prototype identity across deactivate/reactivate cycles and
+    metadata edits.
+  - **Breaking: instance-root metadata uses instance types across domains.**
+    PHYSICS and selector population now report `XformInstance` or
+    `ScopeInstance` in `usd-prim-type`, add instance API tags to `usd-schemas`,
+    and use only `Xformable` in `usd-ancestor-types`. Instances below a
+    `PointInstancer` retain their authored type and applied schemas instead;
+    their prototype links remain available to instancing queries. *Migration:*
+    read the authored type from `usd-metadata:typeName`; type filters see the
+    instance type. Inferred typed export recovers the authored type only where
+    that metadata is populated, preserves schema-declared properties, omits
+    synthetic instance tags, and does not recreate instance references.
+    RENDERING alone may classify a Scope and non-Scope sharing a prototype by the
+    first instance encountered; PHYSICS and selectors classify each root
+    separately.
+  - **Breaking: selected string fields now read as UTF-8 bytes.** If your
+    selectors read render settings/products/vars, material network strings,
+    valued scalar string primvars or supported camera/sensor fields as `uint64`
+    IDs, decode UTF-8 byte arrays with `OVSTAGE_SEMANTIC_STRING` instead. String
+    arrays, legacy semantic fields and unrelated strings retain interned IDs.
+  - **Breaking: PHYSICS/selector attribute semantics.** The legacy
+    `SemanticsAPI` fields `semanticType` and `semanticData` now report
+    `OVSTAGE_SEMANTIC_TOKEN_ID` instead of `NONE`. On supported shaped lights,
+    `inputs:shaping:focusTint` reports `VECTOR` instead of `COLOR`. Payloads are
+    unchanged.
+  - **Breaking (Python): population ordinals and time keyword.** `open_usd`,
+    `open_usd_from_string`, `apply_usd_changes` and their asynchronous forms
+    require `ordinal`; none is generated. Population's `time_code` keyword is
+    renamed `time`. Values remain seconds, converted through
+    `timeCodesPerSecond`. *Migration:* pass caller-coordinated ordinals and
+    replace `time_code=` with `time=`; positional time arguments are unchanged.
+  - **Breaking: empty schema sets are now published.** Generic population
+    publishes `usd-schemas` even for prims with no applied schemas, so `HAS` now
+    selects those prims too. Use `CONTAINS` to require a specific schema.
+    RENDERING-only population retains its previous presence behavior.
+  - **Breaking: quaternion export uses `(x, y, z, w)` semantic lane order.**
+    Remove workarounds for the former `(w, x, y, z)` interpretation. Explicit
+    quaternion rules on untyped tuples keep their compatibility order.
+  - **Breaking: PHYSICS/selector schema values use their declared type.**
+    Compatible numeric shapes are converted, including float-to-integer
+    truncation and rounding to narrower floating-point types. Unconvertible
+    values are skipped with a warning, retaining prior values; 0.2.1 published
+    them in their authored type. Check for precision loss; export uses the
+    populated values. Attributes without a schema declaration retain their
+    authored numeric type.
+  - **Breaking: STRING export rejects trailing NUL terminators.** 0.2.1 stripped
+    a trailing NUL; it now makes the row unsupported, or fails export with
+    `REQUIRED`. Write length-delimited STRING rows without a C terminator.
+  - **Breaking: population/export wait errors.** Foreign or stale operation IDs
+    report `OVSTAGE_ERROR_INVALID_HANDLE` instead of `INVALID_ARGUMENT`. Update
+    error-code checks.
+
+- **Runtime and tools**
+
+  - **Breaking (Python):** `Stage.clone()` returns `CloneResult` instead of
+    `None`.
+  - **Breaking for benchmark filters:** benchmark names are renamed to public
+    terminology. *Migration:* refresh filters from the executable's benchmark
+    listing; benchmark behavior is unchanged.
+  - **Breaking: initialization rejects unknown config keys.**
+    `ovstage_initialize()` returns `OVSTAGE_ERROR_INVALID_ARGUMENT` for
+    unsupported configuration entries; remove them.
+  - **Breaking (Windows loader/Python):** the ovstage loader resolves
+    `ovstage.dll` imports from its directory, registered package/user DLL
+    directories and System32, not `PATH`, the application or current directory.
+    Register extra locations with `AddDllDirectory` / `os.add_dll_directory`.
+    Applications linking `ovstage.dll` directly are unaffected by this change.
+
+### Removed
+
+- **Breaking:** `ovstage_population_untyped_type_name()` and the synthetic
+  `__ovstage_population_untyped__` type. Typeless USD prims remain typeless.
+  *Migration:* handle absent `usd-prim-type` rather than matching the
+  sentinel.
+- **Breaking (C/C++ source):** `ovalign.h` and its unimplemented declarations
+  are removed. Remove `#include <ovstage/ovalign.h>`; no exported symbol is
+  removed.
+
+### Fixed
+
+- **Data plane**
+
+  - Unmapping no longer fails because unrelated prims gained the same attribute.
+  - **Track cloned attributes accurately.** Clones include copied type/schema
+    metadata, connection-only columns and mixed-type attributes in change
+    tracking. Clones reject duplicate or invalid target paths, overlapping
+    derived target subtrees and incompatible leftover descendants.
+  - Named deletes remove `usd-prim-type` and `usd-schemas` and record their
+    removal.
+  - Repeatedly creating and releasing queries against an unchanged stage no
+    longer accumulates query-cache memory.
+  - Paths created from components are absolute and agree with equivalent string
+    paths; an empty component sequence resolves to `/`.
+
+- **USD population, instancing and hierarchy**
+
+  - **Preserve combined rendering and physics/selector scenes.** Population
+    retains rendering purpose, point-instancer prototype geometry and bounds,
+    plus supported tags for primvars, mesh subdivision, skinned geometry,
+    material bindings, prototype geometry, skeletons and lights through USD
+    edits. It avoids removing rendered rows when a generic description stops
+    selecting them. Derived transform columns are protected from same-name USD
+    properties.
+  - **USD edits no longer remove still-referenced scene content.** Resyncs
+    retain relationship targets, live instance roots and prims retained by later
+    edits in the same batch. Whole-stage resyncs refresh affected root prims and
+    prototypes; instance ancestors are populated.
+  - Unrelated ancestor resyncs preserve unchanged material subset meshes;
+    deleting an untyped instance preserves shared prototype geometry still used
+    by surviving instances.
+  - PHYSICS/selector population follows attribute type/role changes using schema
+    replacement.
+  - Mapped transform/reset-stack edits refresh derived transforms on supported
+    computation triggers. Compute hierarchy before advancing the write floor;
+    0.2.1 documented sealing first. Hierarchy computation records rewritten
+    `omni:fabric:worldMatrix` rows at its output ordinal, making them visible to
+    change-range consumers.
+  - Concurrent ovstage instance creation, population and destruction now
+    synchronize access to the shared USD notice-handler registry.
+  - RENDERING time updates resize time-varying skeleton-animation arrays to the
+    sampled values, including the first update after default-time population.
+  - RENDERING value updates preserve the roles of scalar `float3` attributes;
+    newly introduced non-schema scalar `float3` attributes use their authored
+    USD role.
+  - RENDERING time updates reapply time-sampled values even at the same time
+    and restore default opinions when applying `DEFAULT_TIME`.
+  - RENDERING purpose inheritance honors an explicitly authored USD `default`.
+    PHYSICS/selector population now honors supported authored legacy light
+    parameters when their `inputs:*` counterpart is unauthored; RENDERING live
+    edits follow the same precedence.
+  - USD schema registration follows linked descriptor files and directories. A
+    descriptor's relative `Root`, `ResourcePath` and `Includes` resolve beside
+    the link, not its target; link the containing directory or include the
+    referenced files alongside the descriptor. Dangling links still report
+    `OVSTAGE_ERROR_NOT_FOUND`.
+
+- **USD export**
+
+  - **Preserve USD export values.** Export handles booleans, half quaternions,
+    authored empty arrays, pseudo-root metadata and empty-token schema fallbacks
+    correctly. Semantic UTF-8 strings export as strings; embedded NUL bytes are
+    reported as unsupported instead of silently truncated. Typed export maps
+    rendering's `geometry` purpose to USD `default`.
+
+- **Python and runtime**
+
+  - **Keep Python operation and map resources alive.** Python groups fetched
+    through a `Map` retain it. Accepted group unmaps and finalization through
+    that `Map` invalidate subsequent tensor/index access; raw-handle
+    finalization and previously obtained views remain caller-managed. Python
+    operation timeouts preserve pending-operation ownership and input buffers,
+    allowing another wait instead of consuming the operation prematurely.
+  - Standalone Windows assertion failures no longer leave headless processes
+    blocked behind a modal dialog.
+
+### Limitations
+
+- **Data retention and device placement**
+
+  - The default runtime retains latest payloads and bounded change metadata, not
+    historical payload snapshots. Query the oldest retained ordinal before
+    relying on earlier state.
+  - Range-read performance depends on attribute storage: mixed-type attributes
+    still scan all rows. Discovered attribute tokens live with their stage's
+    dictionary; query lookup storage remains allocated while the query is
+    retained.
+  - CUDA reads do not support array-valued attributes (including mesh `points`),
+    mixed-type columns, connections or reserved `usd-*` metadata. CUDA maps do
+    not support array-valued attributes. These cases report
+    `OVSTAGE_ERROR_NOT_SUPPORTED`. Keep borrowed write tensors alive until the
+    availability event completes.
+
+- **Population and hierarchy**
+
+  - RENDERING population does not fully enforce attribute write floors or
+    ordinal admission against other writers. Explicit hierarchy computation
+    does not enforce write floors. Coordinate both with writers and consumers.
+  - RENDERING does not perform PHYSICS/selector numeric schema conversion;
+    mismatched authored types can yield schema fallbacks or empty/zero-filled
+    arrays.
+  - USD edits that resync an existing populated prim, including adding or
+    removing a reference, can republish its selected subtree and replace direct
+    writes. PHYSICS/selector population records rewritten values at the apply
+    ordinal, including unchanged values; RENDERING rewrites are not reported
+    by the same change tracking. Use new prim paths for new content to avoid
+    resyncing existing populated subtrees.
+
 ## [0.2.1] - 2026-10-05
 
-Patch release improving Windows library compatibility, cloned-scene transforms, and CPU/CUDA attribute updates. No public C API/ABI or Python API changes from 0.2.0; existing applications do not need API migration.
+### Summary
+
+- Patch release improving Windows library compatibility, cloned-scene transforms, and CPU/CUDA attribute updates. No public C API/ABI or Python API changes from 0.2.0; existing applications do not need API migration.
 
 ### Fixed
 
@@ -21,17 +369,19 @@ Patch release improving Windows library compatibility, cloned-scene transforms, 
 
 ## [0.2.0] - 2026-09-08
 
-Feature release. Population can now be *described* by the caller rather than
-selected from a fixed set of domains, a selected slice of ovstage state can be
-exported back to USD, and physics-domain population is substantially more
-complete. How USD `asset`, `pathExpression`, `bool`, metadata and relationship
-values are represented changes — read the **Breaking** entries before upgrading.
+### Summary
 
-The C ABI gains sixteen exported entry points and loses none.
-`OVSTAGE_SEMANTIC_ASSET_STRING` is renamed `OVSTAGE_SEMANTIC_ASSET_PATH_ID`
-(value 1 unchanged), `OVSTAGE_SEMANTIC_TIME_CODE` (14) and
-`OVSTAGE_SEMANTIC_FRAME` (15) are appended, and the `static inline`
-`ovstage_population_stage_info_path()` is removed.
+- Feature release. Population can now be *described* by the caller rather than
+  selected from a fixed set of domains, a selected slice of ovstage state can be
+  exported back to USD, and physics-domain population is substantially more
+  complete. How USD `asset`, `pathExpression`, `bool`, metadata and relationship
+  values are represented changes — read the **Breaking** entries before upgrading.
+
+- The C ABI gains sixteen exported entry points and loses none.
+  `OVSTAGE_SEMANTIC_ASSET_STRING` is renamed `OVSTAGE_SEMANTIC_ASSET_PATH_ID`
+  (value 1 unchanged), `OVSTAGE_SEMANTIC_TIME_CODE` (14) and
+  `OVSTAGE_SEMANTIC_FRAME` (15) are appended, and the `static inline`
+  `ovstage_population_stage_info_path()` is removed.
 
 ### Added
 
@@ -104,7 +454,7 @@ The C ABI gains sixteen exported entry points and loses none.
   Python), and `asset[]` the same with `is_array = true` and one pair per
   element; token id 0 means no path, so an asset authored as `@@` is the zero
   pair rather than being skipped. Every domain now lands this one
-  representation, where `OVSTAGE_POPULATION_DOMAIN_PHYSICS` published a single
+  representation, where `OVSTAGE_POPULATION_DOMAIN_PHYSICS` populated a single
   authored-path token, so a prim populated under `DOMAIN_ALL` used to fail on
   the type conflict. *Migration:* decode the two ids with
   `path_dictionary_get_strings_from_tokens` instead of `authored\0resolved` byte
@@ -127,7 +477,7 @@ The C ABI gains sixteen exported entry points and loses none.
   but consumers asserting the former `uint8` dtype must be updated.
 
 - **Breaking:** an attribute authored as the empty token or the empty string
-  publishes as token id 0, where it was previously skipped with a serialization
+  is populated as token id 0, where it was previously skipped with a serialization
   warning — so a consumer that read absence as "authored empty" now sees the
   column present. In an array an empty element is id 0 and keeps its place;
   previously one empty element dropped the *entire* array.
@@ -202,7 +552,7 @@ The C ABI gains sixteen exported entry points and loses none.
   attribute's representation no longer depends on which domains were requested.
   Eleven properties move, each gated on the schema named:
 
-  - `extent` on a `UsdGeomImageable` prim publishes one `{kDLFloat, 64, 6}`
+  - `extent` on a `UsdGeomImageable` prim provides one `{kDLFloat, 64, 6}`
     value per prim packing USD's two `(min, max)` points as six doubles, rather
     than a two-element `float3[]`. A non-imageable prim's `extent` keeps its USD
     type, and a value that is not the two-point form is skipped with a warning.
@@ -301,7 +651,7 @@ The C ABI gains sixteen exported entry points and loses none.
 
 - `OVSTAGE_POPULATION_DOMAIN_PHYSICS` delivered an incomplete scene: data a
   physics consumer needs was reachable only by also populating `RENDERING`, or
-  not at all. Now published under `PHYSICS` alone:
+  not at all. Now populated under `PHYSICS` alone:
 
   - Native scene-graph instancing tags, so the `ovstage_instancing_*` queries
     resolve without `RENDERING`.
@@ -362,13 +712,13 @@ The C ABI gains sixteen exported entry points and loses none.
   `ovstage_compute_hierarchy` on the GPU now honors it whether the column holds
   `bool` or an 8-bit integer.
 
-- An authored relationship with no targets publishes as an empty column rather
+- An authored relationship with no targets is populated as an empty column rather
   than being omitted, so it is distinguishable from one never authored.
 
 - A populated `usd-metadata:` column is deleted when its USD source is removed,
   for prim and property metadata alike.
 
-- An unauthored per-axis `physxJointAxis:<instance>:maxJointVelocity` publishes
+- An unauthored per-axis `physxJointAxis:<instance>:maxJointVelocity` uses
   the runtime default `FLT_MAX` rather than `1000000`, which silently capped an
   axis intended to be unlimited.
 
@@ -380,7 +730,7 @@ The C ABI gains sixteen exported entry points and loses none.
   time-varying prim is removed or redefined at the same path.
 
 - `ovstage_population_apply_usd_changes` no longer leaves stale rows or columns
-  where a fresh populate would not: a column the prim stops publishing is
+  where a fresh populate would not: a column no longer selected for the prim is
   deleted, a prim that loses its physics schemas is dropped along with
   containers left empty, instancing tags are reconciled per prototype across
   every instance edit, `UsdGeomSubset` rows track their mesh, and resolved
@@ -456,39 +806,42 @@ The C ABI gains sixteen exported entry points and loses none.
 
 ### Limitations
 
-The 0.1.x limitations still apply, except where superseded above. New in 0.2.0:
+- The 0.1.x limitations still apply, except where superseded above.
+- **New in 0.2.0**
 
-- Asynchronous export is a convenience scheduler, not a USD synchronization
-  boundary: do not concurrently read or author the same destination storage, and
-  fence asynchronous work before mixing it with synchronous export. Every
-  accepted asynchronous export must eventually receive a terminal wait.
-- Export cannot author into a USD layer or stage the calling application already
-  has open; state crosses back only through saved storage. A reusable
-  destination is bound to its source ovstage instance, which must outlive it,
-  and only one active destination may own a canonical identifier per process. In
-  Python, dropping a live `ExportDestination` queues a best-effort no-save
-  release and emits a `ResourceWarning` — use `with` or call `close()`.
-- `ovstage_population_register_usd_schemas()` validates the paths it is given,
-  not their contents: a malformed descriptor, or an `Includes` pattern matching
-  nothing, contributes no plugins and still returns `OVSTAGE_OK`. A family
-  registered after ovstage itself has read schema definitions contributes
-  nothing, reports `OVSTAGE_ERROR_OP_FAILED` and cannot be taken back; only when
-  another USD consumer in the process read schemas first is the late
-  registration undetectable, and reported as success.
+  - Asynchronous export is a convenience scheduler, not a USD synchronization
+    boundary: do not concurrently read or author the same destination storage, and
+    fence asynchronous work before mixing it with synchronous export. Every
+    accepted asynchronous export must eventually receive a terminal wait.
+  - Export cannot author into a USD layer or stage the calling application already
+    has open; state crosses back only through saved storage. A reusable
+    destination is bound to its source ovstage instance, which must outlive it,
+    and only one active destination may own a canonical identifier per process. In
+    Python, dropping a live `ExportDestination` queues a best-effort no-save
+    release and emits a `ResourceWarning` — use `with` or call `close()`.
+  - `ovstage_population_register_usd_schemas()` validates the paths it is given,
+    not their contents: a malformed descriptor, or an `Includes` pattern matching
+    nothing, contributes no plugins and still returns `OVSTAGE_OK`. A family
+    registered after ovstage itself has read schema definitions contributes
+    nothing, reports `OVSTAGE_ERROR_OP_FAILED` and cannot be taken back; only when
+    another USD consumer in the process read schemas first is the late
+    registration undetectable, and reported as success.
 
 ## [0.1.1] - 2026-08-04
 
-Patch release. The C ABI is unchanged apart from one enumerator value: no
-exported symbol was added, removed, or renamed, and no vtable slot or struct
-layout moved, but the `ovstage_config_uint64_t` count sentinel advances from
-`0` to `1` now that the enum has a key. The headers add
-`OVSTAGE_ERROR_OUT_OF_RANGE`, the runtime-default hierarchy computation model
-selector, its configuration key, and two `static inline` configuration-entry
-helpers; Python adds `StageConfig`, `ErrorCode.OUT_OF_RANGE`, and
-`HierarchyComputationModel.RUNTIME_DEFAULT`. Some read and write validations
-became stricter, others became less restrictive, and several now report a
-different code and message, so callers that branch on status codes should read
-the notes below.
+### Summary
+
+- Patch release. The C ABI is unchanged apart from one enumerator value: no
+  exported symbol was added, removed, or renamed, and no vtable slot or struct
+  layout moved, but the `ovstage_config_uint64_t` count sentinel advances from
+  `0` to `1` now that the enum has a key. The headers add
+  `OVSTAGE_ERROR_OUT_OF_RANGE`, the runtime-default hierarchy computation model
+  selector, its configuration key, and two `static inline` configuration-entry
+  helpers; Python adds `StageConfig`, `ErrorCode.OUT_OF_RANGE`, and
+  `HierarchyComputationModel.RUNTIME_DEFAULT`. Some read and write validations
+  became stricter, others became less restrictive, and several now report a
+  different code and message, so callers that branch on status codes should read
+  the notes below.
 
 ### Added
 
@@ -553,13 +906,12 @@ the notes below.
   into lanes and is no longer echoed back on read. A fixed-size write without
   `index_map` must now have `shape[0]` equal to the logical element count; a
   flat `(N * L,)` one-lane tensor is not inferred as `N` rows of width `L`.
-- Python: a `ManagedDLTensor` releases what it retains when the capsule is
-  destroyed, not when the consumer releases the tensor — for a consumed capsule,
-  as soon as the consumer takes ownership, which is generally earlier.
-  `np.from_dlpack(group.dlpack(0))` remains valid while the owning read/map
-  operation is alive; only a custom producer whose `manager_ctx` solely owns the
-  backing memory must keep the `ManagedDLTensor` alive as long as the consumer's
-  view is used.
+- Python: DLPack consumer views do not keep their group alive: retain the group
+  or its `ManagedDLTensor` producer while using the view. Do not access the
+  producer or its views after releasing the read group or an accepted group or
+  final unmap submission. Keeping the owning operation alive is insufficient.
+  A custom producer whose `manager_ctx` solely owns the backing memory must
+  likewise keep the `ManagedDLTensor` alive while the consumer's view is used.
 - The headers and guides now specify the `mask` buffer contract (element `i` is
   bit `i % 64` of word `i / 64`; a non-NULL mask must address at least
   `ceil(count / 64)` `uint64_t` words, because exactly that many are read), the
@@ -675,37 +1027,39 @@ the notes below.
 
 ### Limitations
 
-The 0.1.0 limitations still apply, except where superseded above.
+- The 0.1.0 limitations still apply, except where superseded above.
 
-#### New in 0.1.1
+- **New in 0.1.1**
 
-- An ordinal-range read that selects a key with a retained change after the
-  range's end returns `OVSTAGE_ERROR_OUT_OF_RANGE`: the payload for that
-  interval cannot be materialized, so the read yields neither change membership
-  nor data.
+  - An ordinal-range read that selects a key with a retained change after the
+    range's end returns `OVSTAGE_ERROR_OUT_OF_RANGE`: the payload for that
+    interval cannot be materialized, so the read yields neither change membership
+    nor data.
 
-#### Not new — pre-existing in 0.1.0, documented here for the first time
+- **Not new — pre-existing in 0.1.0, documented here for the first time**
 
-- A latest-snapshot read returns the current committed value rather than the
-  value as of the requested `end_ordinal`, so it can return a payload written at
-  a higher ordinal, and nothing in the result marks that this happened.
-- Python: `dltensor_to_numpy` sizes its view from the tensor's own `shape` and
-  `dtype.lanes`, and can check that against the real buffer only for a tensor
-  `make_dltensor` wrapped around a numpy array. For any other producer (a
-  non-numpy DLPack export, or a hand-built `DLTensor`), a descriptor that
-  overstates its payload yields a view extending past the buffer, and reading
-  it is out of bounds. Attribute data ovstage itself stores cannot carry an
-  out-of-range lane count, since the write path caps lanes at 255.
-- Writing to a USD-populated scalar `asset` attribute is not supported:
-  `OVSTAGE_SEMANTIC_ASSET_STRING` byte-row payloads are rejected with a type
-  mismatch, and raw token-pair writes are not validated end-to-end.
-- `asset[]` attributes are not populated by generic authored-attribute
-  population and are not readable.
+  - A latest-snapshot read returns the current committed value rather than the
+    value as of the requested `end_ordinal`, so it can return a payload written at
+    a higher ordinal, and nothing in the result marks that this happened.
+  - Python: `dltensor_to_numpy` sizes its view from the tensor's own `shape` and
+    `dtype.lanes`, and can check that against the real buffer only for a tensor
+    `make_dltensor` wrapped around a numpy array. For any other producer (a
+    non-numpy DLPack export, or a hand-built `DLTensor`), a descriptor that
+    overstates its payload yields a view extending past the buffer, and reading
+    it is out of bounds. Attribute data ovstage itself stores cannot carry an
+    out-of-range lane count, since the write path caps lanes at 255.
+  - Writing to a USD-populated scalar `asset` attribute is not supported:
+    `OVSTAGE_SEMANTIC_ASSET_STRING` byte-row payloads are rejected with a type
+    mismatch, and raw token-pair writes are not validated end-to-end.
+  - `asset[]` attributes are not populated by generic authored-attribute
+    population and are not readable.
 
 ## [0.1.0] - 2026-07-16
 
-Initial pre-release of ovstage (builds published as `0.1.0.<build>`). API,
-behavior, and packaging may change before GA.
+### Summary
+
+- Initial pre-release of ovstage (builds published as `0.1.0.<build>`). API,
+  behavior, and packaging may change before GA.
 
 ### Added
 
@@ -745,3 +1099,9 @@ behavior, and packaging may change before GA.
   `omni:xform` local-transform columns remain readable.
 - Python writes do not expose `managed_tensors` ownership transfer; callers must
   keep client-managed source tensors alive until the operation completes.
+
+[0.3.0]: https://github.com/NVIDIA-Omniverse/ovstage/compare/v0.2.1...v0.3.0
+[0.2.1]: https://github.com/NVIDIA-Omniverse/ovstage/compare/v0.2.0...v0.2.1
+[0.2.0]: https://github.com/NVIDIA-Omniverse/ovstage/compare/v0.1.1...v0.2.0
+[0.1.1]: https://github.com/NVIDIA-Omniverse/ovstage/compare/v0.1.0...v0.1.1
+[0.1.0]: https://github.com/NVIDIA-Omniverse/ovstage/releases/tag/v0.1.0

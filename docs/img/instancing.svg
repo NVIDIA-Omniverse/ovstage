@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="230" viewBox="0 0 760 230" role="img" aria-label="Two instance roots share a prototype subtree">
+<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8" fill="#536471"/></marker></defs>
+<rect width="760" height="230" rx="10" fill="#f7f9fb"/>
+<g font-family="sans-serif" font-size="16" fill="#23313f">
+<text x="30" y="30" font-weight="bold">Instance roots</text><text x="470" y="30" font-weight="bold">Shared prototype subtree</text>
+<g fill="#e4f4c5" stroke="#648c16"><rect x="30" y="55" width="245" height="55" rx="7"/><rect x="30" y="145" width="245" height="55" rx="7"/></g>
+<text x="48" y="88">/World/InstanceA</text><text x="48" y="178">/World/InstanceB</text>
+<rect x="460" y="55" width="270" height="145" rx="7" fill="#fff" stroke="#536471"/>
+<text x="480" y="86">Prototype root</text><text x="480" y="109" font-size="13">(generated path)</text>
+<rect x="490" y="135" width="210" height="42" rx="5" fill="#e9eef3"/><text x="510" y="162">Box</text>
+<g fill="none" stroke="#536471" stroke-width="2" marker-end="url(#arrow)"><path d="M275 82 L450 82"/><path d="M275 172 L365 172 L365 102 L450 102"/></g>
+</g></svg>

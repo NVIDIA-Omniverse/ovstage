@@ -9,8 +9,7 @@
 
 /**
  * @file ovstage.h
- * @brief OVStage instance lifecycle — creation and destruction of the
- *        ovstage data-plane backend.
+ * @brief OVStage instance lifecycle — creation and destruction.
  *
  * @details
  * The OVStage data-plane API (types, handles, operations, diagnostics) is
@@ -18,13 +17,13 @@
  * to callers through inline wrappers in `ovstage_api/ovstage_api_utils.h`
  * (transitively included from `ovstage_api.h`) and sibling extension APIs.
  *
- * This header adds the pieces specific to the ovstage backend: an instance
- * descriptor, create/destroy entry points, and backend-owned helpers. Once an
+ * This header adds the pieces specific to ovstage: an instance descriptor,
+ * create/destroy entry points, and instance helpers. Once an
  * `ovstage_instance_t*` has been produced by `ovstage_create_instance`,
  * call the generic `ovstage_*` wrappers declared in `ovstage_api.h` and the
- * backend-specific entry points declared here to drive it.
+ * ovstage-specific entry points declared here to drive it.
  *
- * @version 0.2.1
+ * @version 0.3.0
  * @date 2026-05-27
  */
 
@@ -38,6 +37,25 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * Build Information
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * @brief Return the build information embedded in the OVStage API implementation.
+ *
+ * This call is safe before ovstage_initialize() and does not initialize the
+ * OVStage runtime. The shared and static loaders report the loader build. A
+ * directly linked runtime library reports the runtime build. Loader/runtime
+ * pairs from one package are built from the same generated information, but a
+ * separately selected runtime package can report different values through its
+ * callback log and crash metadata.
+ *
+ * @return A non-NULL pointer owned by the code providing this API. The pointer
+ *         and all borrowed string fields remain valid for that code's lifetime.
+ */
+const ovstage_build_info_t* ovstage_get_build_info(void);
 
 /* ═══════════════════════════════════════════════════════════════════════════════
  * Process Lifecycle
@@ -68,13 +86,39 @@ extern "C" {
  *               OVSTAGE_CONFIG_RUNTIME_DEFAULT_HIERARCHY_COMPUTATION_MODEL is
  *               consumed by the runtime and controls automatic hierarchy
  *               updates and the RUNTIME_DEFAULT selector for new instances.
- *               A runtime setting supplied after a process reference already
- *               exists must match the active setting.
+ *               OVSTAGE_CONFIG_RUNTIME_DEFAULT_ORDINAL_ADMISSION_POLICY
+ *               selects mutation admission, defaulting to NONDECREASING.
+ *               Omitted settings and their DEFAULT selectors inherit active
+ *               process settings, or select defaults on the first reference.
+ *               Later concrete settings must match the active settings. All
+ *               settings are validated together: a rejected call changes none
+ *               of them and acquires no reference. A policy can change only
+ *               after all initialization and instance references are released,
+ *               including retained instance handles and attachments.
  * @return OVSTAGE_OK on success; OVSTAGE_ERROR_INVALID_ARGUMENT for malformed,
  *         duplicate, unknown, or conflicting runtime configuration.
  * @post Balance every successful call with one ovstage_shutdown().
  */
 ovstage_api_status_t ovstage_initialize(const ovstage_config_t* config);
+
+/**
+ * @brief Read back the process configuration captured by an ovstage instance.
+ *
+ * The returned config contains the explicit entries accepted when the active
+ * process state was first initialized, in their original order. It does not add
+ * omitted defaults or expose internal settings derived from those entries.
+ *
+ * The entry array and any string or blob payloads are owned by @p instance and
+ * remain valid until ovstage_destroy_instance() is called. The caller must not
+ * free or modify them. The caller owns only the outer ovstage_config_t value
+ * written to @p out_config.
+ *
+ * @param instance Initialized ovstage instance.
+ * @param[out] out_config Borrowed view of the instance's process config.
+ * @return OVSTAGE_OK on success; OVSTAGE_ERROR_INVALID_ARGUMENT if either
+ *         argument is NULL.
+ */
+ovstage_api_status_t ovstage_get_config(const ovstage_instance_t* instance, ovstage_config_t* out_config);
 
 /**
  * @brief Release one reference acquired by ovstage_initialize().
@@ -172,14 +216,18 @@ ovstage_api_status_t ovstage_create_instance(
     ovstage_instance_t**           out_instance);
 
 /**
- * @brief Destroy an ovstage instance and release all resources.
- * @param instance Instance to destroy. May be NULL (no-op).
- * @pre All operations, handles, and result payloads from this instance must be
- *      released first.
+ * @brief Release an ovstage instance handle.
+ * @param instance Instance handle to release. May be NULL (no-op).
+ * @pre If this is the final handle retaining the stage, all operations, handles,
+ *      and result payloads associated with the stage must be released first.
  * @pre No other thread may invoke any `ovstage_*` wrapper, vtable slot, or
  *      internal accessor on this `instance` while or after destroy runs. The
- *      bundle and its context are deallocated before this call returns; any
- *      concurrent or post-destroy use is a use-after-free.
+ *      supplied bundle is deallocated before this call returns; any concurrent
+ *      or post-destroy use of that handle is a use-after-free.
+ * @details Another component may retain a distinct handle to the same stage.
+ *          In that case the shared stage state and resources remain alive until
+ *          the final retained handle is released. In-flight work remains valid
+ *          and must be completed and released through a surviving handle.
  */
 ovstage_api_status_t ovstage_destroy_instance(ovstage_instance_t* instance);
 
@@ -213,40 +261,107 @@ ovstage_api_status_t ovstage_get_usd_stage_id(
  * `OVSTAGE_ERROR_NOT_FOUND` (surfaced through `wait_op`). The target paths must not
  * already exist; a target that does is rejected with `OVSTAGE_ERROR_PRIM_NOT_FOUND`
  * (the create-only convention shared with INSERT-mode writes), before any prim is
- * created, so a batch mixing fresh and existing targets clones nothing.
+ * created, so a batch mixing fresh and existing targets clones nothing. A prim that
+ * already exists below an absent target root is merged into, unless it holds a cloned
+ * attribute with a different type, carries a prim type other than that of its typed
+ * source prim, or lacks a cloned attribute connection that has no value column, which
+ * fails the clone with `OVSTAGE_ERROR_OP_FAILED` before any prim is created. The per-op
+ * error string (`ovstage_get_last_op_error`) names the missing source or the targets
+ * that already exist, e.g. `ovstage_clone: target prim already exists at
+ * '/World/Tile3'`, so a large batch can be corrected in one round-trip.
  *
  * Data-plane peer of ovrtx's `ovrtx_clone_usd` (the `_usd` postfix is dropped),
  * but — like `write_attribute` / `delete_attributes` — clone is an ordinal-keyed
  * write: it carries an @p ordinal and is rejected with
- * `OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION` (surfaced through `wait_op`) when
- * @p ordinal is at or below the effective seal of any attribute it would touch, so
- * it can never mutate sealed ordinals. The call returns immediately with an
+ * `OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION` when
+ * @p ordinal is at or below an applicable seal or conflicts with retained target
+ * cell/lifecycle history under the configured ordinal admission policy. Each
+ * copied attribute records a change at @p ordinal. The STRICTLY_INCREASING
+ * policy requires a newer ordinal for later customization even before sealing;
+ * NONDECREASING allows customization at the same unsealed ordinal but rejects
+ * older intersecting history. FLOOR_ONLY skips retained-history and separate prim-lifecycle
+ * admission. Every policy preserves the applicable global, source and destination
+ * attribute floors. Disjoint target cells may share an ordinal.
+ * The call returns immediately with an
  * `ovstage_enqueue_result_t` (status + `op_index`); await completion through the vtable
  * `wait_op` (and release it with `release_op`) like any other data-plane operation.
+ * An asynchronous failure makes `wait_op` return `OVSTAGE_ERROR_OP_FAILED`;
+ * `fetch_clone_result` returns the underlying error, and `get_last_op_error`
+ * describes it. A synchronous rejection is returned in the enqueue status.
+ * The clone's completion report includes the targets' scene hierarchy subtree
+ * sizes after cloning, summed over all targets (see `ovstage_clone_result_t`).
+ * It is available through ovstage_fetch_clone_result from completion until `release_op`.
  *
  * Path-bearing values that target the source subtree are rebased to the corresponding
  * target subtree. This includes relationship targets (e.g. `material:binding`,
  * `skel:skeleton`), scalar/array path values, and USD attribute connections.
  * Paths outside the source subtree are copied unchanged, so clones can continue to
- * reference shared materials and other shared resources. Cloned attribute values,
- * including relationship targets, are ordinal-change-tracked. Attribute connections and
- * scene hierarchy changes, such as the source/target parents' child lists, are not.
+ * reference shared materials and other shared resources. Every cloned column is
+ * ordinal-change-tracked: attribute values, relationship targets, an attribute
+ * connection that has no value column, prim type / applied schema / ancestor type
+ * metadata, and each typed identity of an attribute name that has different types on
+ * different source prims. Scene hierarchy changes, such as the source/target parents'
+ * child lists, are not.
  *
  * @param instance         The ovstage instance.
  * @param source_path      Path to the source subtree to clone.
  * @param target_paths     Array of target paths to clone to.
  * @param num_target_paths Number of target paths to clone to.
- * @param ordinal          Ordinal for this clone. Must be greater than the effective
- *                         seal of every attribute the clone reproduces (admission is
- *                         per-attribute over the source subtree, like
- *                         `write_attribute`), evaluated at execution time.
+ * @param ordinal          Ordinal for this clone. Must exceed the global write floor
+ *                         and the effective seals of the source subtree's attributes.
+ *                         For nonempty targets, it must also exceed the effective
+ *                         seals of all reproduced destination attributes, including
+ *                         copied prim type, applied schema and ancestor type metadata.
+ *                         Independently, the configured history policy checks retained
+ *                         destination-cell changes and every derived target prim's
+ *                         lifecycle, including the effective `usd-path` floor.
+ *                         FLOOR_ONLY skips retained-history and separate lifecycle
+ *                         admission. All checks run at execution time. With no targets,
+ *                         only the global and source-attribute floor checks apply.
  * @return Enqueue result with status + op_index.
  * - **status == OVSTAGE_OK** if the operation was enqueued successfully.
+ * - `OVSTAGE_ERROR_INVALID_ARGUMENT` if a target path is empty or is not a valid path,
+ *   or appears more than once in @p target_paths (rejected at enqueue; the offending
+ *   path is reported through `ovstage_get_last_error`).
  * - a non-OK status if the enqueue was rejected (e.g. invalid arguments, or the
  *   required runtime capability is unavailable). Per-op execution errors — including
  *   `OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION`, `OVSTAGE_ERROR_NOT_FOUND` (missing
- *   source), and `OVSTAGE_ERROR_PRIM_NOT_FOUND` (a target already exists) — are
- *   surfaced through `wait_op`.
+ *   source), `OVSTAGE_ERROR_PRIM_NOT_FOUND` (a target already exists), and
+ *   `OVSTAGE_ERROR_OP_FAILED` (a merge conflict) — are
+ *   surfaced through `wait_op` (as `OVSTAGE_ERROR_OP_FAILED` plus the message) and
+ *   with their own code through ovstage_fetch_clone_result.
+ *
+ * @remark Target paths are expected to be disjoint and outside the source subtree.
+ *         A target nested under another target of the same batch is not rejected
+ *         today; its prims are counted as enumerated in the completion report. A
+ *         target that is also a prim the clone creates under another target (e.g.
+ *         `/World/T` and `/World/T/Inner` for a source with a child `Inner`) fails
+ *         with `OVSTAGE_ERROR_OP_FAILED` and clones nothing. A target path with a
+ *         property part (e.g. `/World/T.attr`) cannot hold the source's child prims;
+ *         if the source has any, the clone fails with `OVSTAGE_ERROR_OP_FAILED` and
+ *         clones nothing.
+ *
+ * @remark Merging into a prim that already exists below an absent target root is
+ *         partial. The existing prim keeps the attributes it has that the source prim
+ *         lacks, its applied schemas and ancestor types become the union of its own and
+ *         the source prim's, and if the source prim has no prim type it keeps its own.
+ *         For an attribute name that the source prim holds both as a value and as a
+ *         connection, the value is merged, but the connection is copied (and rebased)
+ *         only when the existing prim already has a connection under that name;
+ *         otherwise it is not cloned and the clone still succeeds. A newly created
+ *         target receives both. Either way such a name is change-tracked under its
+ *         value type only, and an existing prim that holds only the connection under
+ *         that name fails the clone with `OVSTAGE_ERROR_OP_FAILED`. Delete such a prim
+ *         before cloning onto it to get an exact copy.
+ *
+ * @remark Before its merge and ordinal checks on the target prims, a clone interns
+ *         the path of every prim it would create or merge into (each source subtree
+ *         prim under each target root). Interned paths are not released individually,
+ *         so a clone that fails after that point keeps them: each such clone that uses
+ *         new target names keeps memory proportional to source prims times target roots.
+ *         Reusing the same names avoids new path entries, but repeated registration
+ *         can extend their lifetime. Interned paths can stay allocated after the
+ *         instance is destroyed.
  */
 ovstage_enqueue_result_t ovstage_clone(
     ovstage_instance_t* instance,
@@ -256,20 +371,59 @@ ovstage_enqueue_result_t ovstage_clone(
     ovstage_ordinal_t   ordinal);
 
 /**
- * @brief Enqueue a backend hierarchy lookup for a batch of prims.
+ * @brief Fetch the completion report of a clone operation.
+ *
+ * Waits up to @p timeout (`0` polls, `OVSTAGE_TIMEOUT_INFINITE` blocks — the
+ * `ovstage_fetch_*` convention) for the clone identified by @p op_id (the
+ * `op_index` returned by ovstage_clone) to complete, then copies its report.
+ * The report is per-op completion state like the op's error string: available
+ * from completion until `release_op`. Fetching does not release the op; call
+ * `release_op` afterwards as for any other operation.
+ *
+ * @param instance   The ovstage instance.
+ * @param op_id      The clone's op id.
+ * @param timeout    Maximum time to wait for completion, in nanoseconds.
+ * @param[out] out_result Receives the report on `OVSTAGE_OK`; zeroed otherwise.
+ * @return OVSTAGE_OK and the report on success.
+ * @return OVSTAGE_ERROR_INVALID_ARGUMENT if @p instance or @p out_result is NULL.
+ * @return OVSTAGE_ERROR_INVALID_HANDLE if @p op_id is not a live clone operation
+ *         of this instance: `OVSTAGE_INVALID_OP_ID`, an id of another kind of
+ *         operation, or a clone whose op has already been released.
+ * @return OVSTAGE_ERROR_TIMEOUT if the clone has not completed within @p timeout;
+ *         the op stays waitable.
+ * @return the clone's own failure status — `OVSTAGE_ERROR_NOT_FOUND` (missing
+ *         source), `OVSTAGE_ERROR_PRIM_NOT_FOUND` (a target already existed),
+ *         `OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION`, `OVSTAGE_ERROR_OUT_OF_MEMORY` or
+ *         `OVSTAGE_ERROR_INTERNAL` (an internal failure, which can also be reported
+ *         after the clone was applied, so the targets may exist),
+ *         otherwise `OVSTAGE_ERROR_OP_FAILED` — if the clone ran and failed, with the
+ *         message available through `ovstage_get_last_op_error(op_id)`.
+ *
+ * @remark Like `wait_op`, an infinite-timeout fetch may execute the still-pending
+ *         clone inline on the calling thread.
+ */
+ovstage_api_status_t ovstage_fetch_clone_result(
+    ovstage_instance_t*     instance,
+    ovstage_op_id_t         op_id,
+    ovstage_timeout_ns_t    timeout,
+    ovstage_clone_result_t* out_result);
+
+/**
+ * @brief Enqueue a hierarchy lookup for a batch of prims.
  *
  * `prim_paths` is an immutable ordered `ovx_primpath_list_t`. The list is
  * copied during enqueue; callers may destroy their user-owned list after this
- * call returns OVSTAGE_OK. The ovstage backend answers parent/children/sibling
- * hierarchy lookups from its tracked prim-parent hierarchy. Fetch the per-input
- * results with ovstage_fetch_hierarchy_result.
+ * call returns OVSTAGE_OK. The operation returns parent, child or sibling
+ * relations for each input prim. Fetch the per-input results with
+ * ovstage_fetch_hierarchy_result.
  *
- * Hierarchy lookups observe the latest sealed stage state. Returned relation
- * information is resolved from attribute data at the latest sealed ordinal(s).
+ * Hierarchy lookups read the current committed hierarchy when the
+ * operation executes. They do not select a historical snapshot.
  *
  * @param instance The ovstage instance.
  * @param prim_paths Ordered prim path list to inspect.
- * @param ordinal Stage ordinal requested by this lookup.
+ * @param ordinal Echoed as a caller-supplied tag; it does not select a
+ *                historical hierarchy snapshot.
  * @param relation Hierarchy direction to return for each input prim.
  * @param[out] out_hierarchy_handle Receives the lookup handle.
  * @return Enqueue result with status + op_index. Per-op execution failures are
@@ -320,7 +474,7 @@ ovstage_enqueue_result_t ovstage_release_hierarchy(
     ovstage_hierarchy_handle_t   handle);
 
 /**
- * @brief Return the hierarchy computation models supported by this backend.
+ * @brief Return the hierarchy computation models supported by this runtime.
  *
  * The descriptor array lists the ovstage_hierarchy_computation_model_id_t
  * concrete values and selectors supported by this instance. Names and
@@ -340,18 +494,32 @@ ovstage_api_status_t ovstage_get_hierarchy_computation_models(
 /**
  * @brief Enqueue hierarchy computation using a runtime computation model.
  *
- * This computes hierarchy-derived stage data such as local/world transforms,
- * visibility, and other derived bounds/state managed by the selected runtime
- * model.
+ * This computes hierarchy-derived world transforms with the selected runtime
+ * model. It does not update derived visibility.
  *
- * The caller supplies the input ordinal to compute from and the output ordinal
- * assigned to hierarchy-derived results.
+ * The caller supplies the output ordinal assigned to hierarchy-derived
+ * results. The computation records an `omni:fabric:worldMatrix` change at
+ * `output_ordinal` for every world-matrix row it rewrote. The write floor of
+ * that column does not limit `output_ordinal`: a record can land at a sealed
+ * ordinal. A consumer that read that ordinal before the computation does not
+ * see those rows. Compute before you seal the ordinal when consumers need a
+ * complete snapshot at it. A write-floor advance that covers the column runs
+ * the runtime default model when the hierarchy is dirty, and records the
+ * rewritten rows at the advance ordinal, before the floor moves. Only rows a
+ * computation rewrote are recorded this way. A direct write to the column is
+ * recorded by the write itself. Ordinal-range reads of the column select the
+ * recorded prims.
+ *
+ * @remark The current implementation ignores `input_ordinal` and computes
+ * from the latest committed inputs. Inputs committed after `input_ordinal`
+ * are part of the computation.
  *
  * @param instance The ovstage instance.
  * @param computation_model_id Public model enum value: a concrete model, a
  *        DEFAULT_* alias, or RUNTIME_DEFAULT to use the process default
  *        captured when the instance was created.
- * @param input_ordinal Ordinal of hierarchy inputs to compute from.
+ * @param input_ordinal Ordinal of the hierarchy inputs. See the remark above
+ *        on how the current implementation handles it.
  * @param output_ordinal Ordinal assigned to hierarchy-derived outputs.
  * @return Enqueue result with status + op_index. Per-op execution failures are
  *         surfaced through ovstage_wait_op + ovstage_get_last_op_error.

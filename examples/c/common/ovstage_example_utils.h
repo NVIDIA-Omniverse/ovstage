@@ -139,10 +139,9 @@ inline ovstage_write_data_t writeData(DLTensor* tensor, ovstage_attribute_semant
 }
 
 // Read one fixed-size float32 column as a latest read at `endOrdinal` and
-// copy it into `dst`. The query must resolve to exactly one group of `count`
-// elements with `lanes` lanes each.
+// copy it into `dst`. Scalars have shape [count], vectors [count, components].
 inline void readColumn(ovstage_instance_t* stage, ovstage_query_handle_t query, ovx_token_t attribute,
-                       ovstage_ordinal_t endOrdinal, float* dst, int64_t count, uint8_t lanes)
+                       ovstage_ordinal_t endOrdinal, float* dst, int64_t count, uint8_t components)
 {
     ovstage_ordinal_range_t range{};
     range.end_ordinal = endOrdinal;
@@ -153,14 +152,22 @@ inline void readColumn(ovstage_instance_t* stage, ovstage_query_handle_t query, 
 
     ovstage_read_group_t group{};
     check(stage, ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group), "fetch_read_next");
-    const DLTensor* tensor = group.data.tensor_count == 1 ? &group.data.tensors[0] : nullptr;
-    if (!tensor || !tensor->data || tensor->ndim != 1 || tensor->shape[0] != count || tensor->dtype.lanes != lanes)
+    const DLTensor* tensor = group.data.tensor_count == 1 && group.data.tensors ? &group.data.tensors[0] : nullptr;
+    const int rank = components == 1 ? 1 : 2;
+    if (!tensor || !tensor->data || !tensor->shape || group.is_array || tensor->ndim != rank ||
+        tensor->shape[0] != count || (rank == 2 && tensor->shape[1] != components) ||
+        tensor->device.device_type != kDLCPU || tensor->dtype.code != kDLFloat ||
+        tensor->dtype.bits != 32 || tensor->dtype.lanes != 1 ||
+        (tensor->strides && (tensor->strides[0] < components || (rank == 2 && tensor->strides[1] != 1))))
     {
-        std::fprintf(stderr, "unexpected column layout (want one 1-D tensor of %lld elements, lanes=%u)\n",
-                     (long long)count, lanes);
+        std::fprintf(stderr, "unexpected column layout (want %lld float32 rows with %u components)\n",
+                     (long long)count, components);
         std::exit(EXIT_FAILURE);
     }
-    std::memcpy(dst, tensor->data, (size_t)count * lanes * sizeof(float));
+    const auto* bytes = static_cast<const uint8_t*>(tensor->data) + tensor->byte_offset;
+    const size_t rowStride = tensor->strides ? (size_t)tensor->strides[0] : components;
+    for (int64_t row = 0; row < count; ++row)
+        std::memcpy(dst + row * components, bytes + row * rowStride * sizeof(float), components * sizeof(float));
     ovstage_release_group(stage, &group);
     waitOp(stage, ovstage_release_read(stage, read), "release_read");
 }

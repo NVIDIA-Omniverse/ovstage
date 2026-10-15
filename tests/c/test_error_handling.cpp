@@ -138,13 +138,15 @@ TEST_F(ErrorHandlingTest, CloneToExistingTargetFails)
     // [snippet:clone-target-exists-error-c]
     // Clone targets are create-only. The first clone to a fresh path succeeds; a
     // second clone onto the now-existing target fails. The op-level failure
-    // collapses to a failed op whose error string names the reason.
+    // collapses to a failed op whose error string names the reason and the
+    // colliding target path.
     const ovx_string_t target[] = { str("/World/Target") };
     ASSERT_TRUE(waitOp(stage_, ovstage_clone(stage_, str("/World/Source"), target, 1, 2), "clone"));
 
     std::string cloneError;
     EXPECT_TRUE(opFailed(stage_, ovstage_clone(stage_, str("/World/Source"), target, 1, 3), cloneError));
     EXPECT_NE(cloneError.find("already exists"), std::string::npos) << "reason: " << cloneError;
+    EXPECT_NE(cloneError.find("/World/Target"), std::string::npos) << "reason: " << cloneError;
     // [/snippet:clone-target-exists-error-c]
 }
 

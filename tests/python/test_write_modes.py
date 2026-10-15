@@ -98,6 +98,71 @@ def test_write_below_floor_rejected(stage):
             paths.destroy_path_list(plist)
 
 
+@pytest.mark.parametrize("policy_name, admit_equal, admit_older", [
+    ("STRICTLY_INCREASING", False, False),
+    ("NONDECREASING", True, False),
+    ("FLOOR_ONLY", True, True),
+])
+def test_committed_cells_apply_policy_without_sealing(ovstage_mod, policy_name, admit_equal, admit_older):
+    config = ovstage_mod.StageConfig(
+        runtime_default_ordinal_admission_policy=getattr(ovstage_mod.OrdinalAdmissionPolicy, policy_name)
+    )
+    with ovstage_mod.Stage("test.ovstage.write-mode-policy", config=config) as stage:
+        _check_committed_cells(stage, admit_equal, admit_older)
+
+
+def _check_committed_cells(stage, admit_equal, admit_older):
+    with PathDictionary(stage) as paths:
+        order = ["/World/Ordinal/A", "/World/Ordinal/B"]
+        with paths.create_path_list_from_strings(order) as plist:
+            query = stage.query_from_path_list(plist)
+            try:
+                score = paths.intern_token("score")
+                values = np.array([10.0, 20.0], np.float32)
+                stage.write_attribute(
+                    query, score, ordinal=5, tensors=values,
+                    is_array=False, mask=[0b01], count=2,
+                ).wait()
+
+                # Retained history orders A independently of the current floor.
+                expected_a = 10.0
+                for ordinal, admitted, value in ((5, admit_equal, 99.0), (4, admit_older, 88.0)):
+                    op = stage.write_attribute(
+                        query, score, ordinal=ordinal,
+                        tensors=np.array([value, value], np.float32),
+                        is_array=False, mask=[0b01], count=2,
+                    )
+                    if admitted:
+                        op.wait()
+                        expected_a = value
+                    else:
+                        with pytest.raises(OvstageError, match="ordinal") as exc:
+                            op.wait()
+                        assert exc.value.code == ErrorCode.OP_FAILED
+
+                # B is a different cell and can use the same ordinal.
+                stage.write_attribute(
+                    query, score, ordinal=5, tensors=values,
+                    is_array=False, mask=[0b10], count=2,
+                ).wait()
+                stage.advance_write_floor(ordinal=5).wait()
+                assert _scalar_values(stage, query, score, 5, order) == [expected_a, 20.0]
+                with pytest.raises(OvstageError) as exc:
+                    stage.write_attribute(
+                        query, score, ordinal=5, tensors=values,
+                        is_array=False, mask=[0b01], count=2,
+                    ).wait()
+                assert exc.value.code == ErrorCode.WRITE_FLOOR_VIOLATION
+                stage.write_attribute(
+                    query, score, ordinal=6, tensors=np.array([77.0, 20.0], np.float32),
+                    is_array=False, mask=[0b01], count=2,
+                ).wait()
+                stage.advance_write_floor(ordinal=6).wait()
+                assert _scalar_values(stage, query, score, 6, order) == [77.0, 20.0]
+            finally:
+                stage.release_query(query).wait()
+
+
 def test_write_rejects_fractional_ordinal_and_token(stage):
     """Integer-only fields reject a float instead of truncating it.
 

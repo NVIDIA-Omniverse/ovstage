@@ -64,6 +64,8 @@ PY_EXAMPLES_DIR = PUBLIC_DIR / "examples" / "python"
 C_EXAMPLES = [
     ("minimal", False),
     ("runtime-loop", False),
+    ("population", False),
+    ("transforms", False),
     ("time-and-ordinals", False),
     ("write-flavors", False),
     ("authoring-hierarchy", True),
@@ -76,6 +78,8 @@ C_EXAMPLES = [
 PY_EXAMPLES = [
     ("minimal", False, ()),
     ("runtime-loop", False, ()),
+    ("population", False, ()),
+    ("transforms", False, ()),
     ("time-and-ordinals", False, ()),
     ("write-flavors", False, ()),
     ("authoring-hierarchy", True, ()),
@@ -253,6 +257,33 @@ def _runtime_env(root: Path) -> dict:
     return env
 
 
+def _cmake_cache_value(build: Path, key: str) -> str:
+    """Return ``key``'s value from build/CMakeCache.txt, or "" if it is not cached.
+
+    Cache lines are ``<key>:<type>=<value>``; matching on ``<key>:`` keeps a key
+    from matching its own prefix-siblings (CMAKE_GENERATOR vs CMAKE_GENERATOR_*).
+    """
+    for line in (build / "CMakeCache.txt").read_text(encoding="utf-8").splitlines():
+        if line.startswith(f"{key}:"):
+            return line.split("=", 1)[1].strip()
+    return ""
+
+
+def _is_multi_config(build: Path) -> bool:
+    """True if the configured generator emits per-config output subdirectories.
+
+    The binary layout follows the GENERATOR, not the OS. Multi-config generators
+    (Visual Studio, Xcode, Ninja Multi-Config) place a target under
+    build/<target>/<config>/ and record CMAKE_CONFIGURATION_TYPES in the build
+    cache; single-config generators (Ninja, Makefiles, NMake) place it directly
+    under build/<target>/ and leave that entry unset. A Windows toolchain
+    configured with CMAKE_GENERATOR=Ninja is single-config, and a Linux one with
+    Ninja Multi-Config is multi-config, so neither layout can be assumed from
+    the platform.
+    """
+    return bool(_cmake_cache_value(build, "CMAKE_CONFIGURATION_TYPES"))
+
+
 def _assert_ovstage_dir_under(build: Path, root: Path) -> None:
     """Hard-fail unless configure resolved ovstage inside the package under test.
 
@@ -262,14 +293,10 @@ def _assert_ovstage_dir_under(build: Path, root: Path) -> None:
     configure, or the pinned release ovstage_fetch() downloads when
     find_package() misses — and the run would validate the wrong artifact.
     """
-    cache = build / "CMakeCache.txt"
-    ovstage_dir = ""
-    for line in cache.read_text(encoding="utf-8").splitlines():
-        if line.startswith("ovstage_DIR:"):
-            ovstage_dir = line.split("=", 1)[1].strip()
-            break
+    ovstage_dir = _cmake_cache_value(build, "ovstage_DIR")
     if not ovstage_dir or ovstage_dir.endswith("-NOTFOUND"):
-        raise SystemExit(f"configure did not resolve ovstage (no ovstage_DIR in {cache})")
+        raise SystemExit(
+            f"configure did not resolve ovstage (no ovstage_DIR in {build / 'CMakeCache.txt'})")
     try:
         Path(ovstage_dir).resolve().relative_to(root.resolve())
     except ValueError:
@@ -340,6 +367,12 @@ def _run_c_examples(root: Path, config: str) -> None:
     # makes them consume the produced package locally instead of downloading.
     # The examples/c CMakeLists aggregates every example into one build.
     _cmake_build(C_EXAMPLES_DIR, build, root, config)
+    # Decide the binary layout once per build from the generator that configured
+    # it (see _is_multi_config). _cmake_build wiped the build dir, so the
+    # config-specific path cannot pick up a stale binary from another config.
+    multi_config = _is_multi_config(build)
+    _log(f"generator: {_cmake_cache_value(build, 'CMAKE_GENERATOR') or 'unknown'} "
+         f"({'multi' if multi_config else 'single'}-config layout)")
     absent: list[str] = []
     for name, needs_gpu in C_EXAMPLES:
         if not (C_EXAMPLES_DIR / name / "CMakeLists.txt").is_file():
@@ -349,16 +382,22 @@ def _run_c_examples(root: Path, config: str) -> None:
         if needs_gpu and not _gpu_gate(f"C {name}"):
             continue
         _log(f"=== C example: {name} ===")
-        # Pick the config-specific artifact, not the first glob hit (multi-config
-        # generators — Windows/VS — emit build/<name>/<config>/exe; single-config —
-        # Linux — emit build/<name>/exe), so a stale binary from another config is
-        # never run. Run from the binary's directory: examples that ship a scene
+        # Resolve the one artifact this build produced — build/<name>/<config>/ on
+        # a multi-config generator, build/<name>/ on a single-config one — rather
+        # than the first glob hit, so nothing but this build's binary is ever run.
+        # Run from the binary's directory: examples that ship a scene
         # (runtime-loop, queries) have it copied next to the binary by their
         # CMakeLists and load it relative to the working directory.
         exe_name = f"{name}.exe" if IS_WINDOWS else name
-        exe = (build / name / config / exe_name) if IS_WINDOWS else (build / name / exe_name)
+        exe_dir = (build / name / config) if multi_config else (build / name)
+        exe = exe_dir / exe_name
         if not exe.is_file():
-            raise SystemExit(f"built example {exe_name} not found at {exe}")
+            found = sorted(str(p.relative_to(build)) for p in (build / name).rglob(exe_name))
+            raise SystemExit(
+                f"built example {exe_name} not found at {exe} "
+                f"(expected the {'multi' if multi_config else 'single'}-config layout of "
+                f"generator {_cmake_cache_value(build, 'CMAKE_GENERATOR') or 'unknown'}; "
+                f"matching files under {build / name}: {found or 'none'})")
         _run_scanned([exe], env=_runtime_env(root), cwd=exe.parent)
         if name == "producer-consumer":
             # Also cover the concurrent mode (--threads): producer and consumer
@@ -459,6 +498,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--skip-c", action="store_true", help="skip the C tests + example")
     parser.add_argument("--skip-python", action="store_true", help="skip the Python tests + example")
     args = parser.parse_args(argv)
+
+    # Run publication-tool tests when they are included in the checkout.
+    snippet_tests = PUBLIC_DIR / "tools" / "ci" / "test_inline_skill_snippets.py"
+    if snippet_tests.is_file():
+        _run([sys.executable, snippet_tests])
 
     _check_example_inventory()
 

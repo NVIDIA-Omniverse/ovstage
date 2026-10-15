@@ -88,11 +88,9 @@ def main() -> int:
         sphere_query = stage.query_from_path_list(sphere_paths)
 
         # [snippet:time-to-ordinal-table]
-        # ovstage stores no time; its ordering key is an opaque uint64 ordinal.
-        # The app owns the mapping, and because dt varies it is a TABLE, not a
-        # formula: time_of_ordinal[ordinal] is the simulation time whose state
-        # that ordinal holds. Ordinal 1 holds the t = 0 state; tick N lands at
-        # N + 1.
+        # The application maps ordinals to simulation time in seconds.
+        # Values written at ordinal 1 represent time 0. Each later ordinal
+        # represents the time after one step, whose duration can vary.
         time_of_ordinal = [0.0] * (TICKS + 3)
         for tick in range(1, TICKS + 1):
             time_of_ordinal[tick + 1] = time_of_ordinal[tick] + DT_OF_TICK[tick - 1]
@@ -105,7 +103,7 @@ def main() -> int:
         # write the spheres' t=0 state at the same ordinal: both sources share
         # the one ordinal axis from the start. Sealing ordinal 1 makes it
         # readable.
-        population.open_usd_from_string(stage, CLIP_USDA, ordinal=1, time_code=0.0,
+        population.open_usd_from_string(stage, CLIP_USDA, ordinal=1, time=0.0,
                                         domains=PopulationDomain.ALL)
 
         # [snippet:float3-attribute-write]
@@ -138,7 +136,7 @@ def main() -> int:
             stage.write_attribute(sphere_query, position, ordinal=ordinal,
                                   tensors=_float3_tensor(sim_pos), is_array=False,
                                   semantic=AttributeSemantic.POINT).wait()
-            population.update_from_usd_time(stage, ordinal=ordinal, time_code=t)
+            population.update_from_usd_time(stage, ordinal=ordinal, time=t)
             stage.advance_write_floor(ordinal=ordinal, scope=Scope.ALL).wait()
             print(f"tick {tick} (dt = {dt:.4f} s) -> t = {t:.4f} s"
                   f" = timecode {t * TIMECODES_PER_SECOND:2.0f} -> ordinal {ordinal}:"
@@ -151,7 +149,7 @@ def main() -> int:
         # (ordinal 8) but the clip is pointed BACK to usd t = 0.125 s.
         time_of_ordinal[TICKS + 2] = time_of_ordinal[TICKS + 1] + 0.125
         rewind_ordinal = TICKS + 2
-        population.update_from_usd_time(stage, ordinal=rewind_ordinal, time_code=REWIND_USD_TIME)
+        population.update_from_usd_time(stage, ordinal=rewind_ordinal, time=REWIND_USD_TIME)
         stage.advance_write_floor(ordinal=rewind_ordinal, scope=Scope.ALL).wait()
 
         print(f"rewind: sim t = {time_of_ordinal[rewind_ordinal]:.4f} s (ordinal {rewind_ordinal})"

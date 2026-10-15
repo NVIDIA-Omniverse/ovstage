@@ -104,9 +104,10 @@ def run_producer_tick(stage, sensor_queries, temperature, tick):
 # [snippet:producer-tick]
 def producer_value_tick(stage, sensor_queries, temperature, tick):
     """Write this tick's subset at ordinal ``tick`` (several writes may share
-    one ordinal), then seal the tick by advancing the GLOBAL write floor -- the
-    producer's publish signal: data at ordinals <= floor never changes. The
-    application owns the ordinal counter; the store never mints ordinals."""
+    one ordinal), then seal the tick by advancing the GLOBAL write floor. This
+    tells the consumer which ordinals are sealed against further writes; values
+    may still change at newer ordinals. The application owns the ordinal counter;
+    the store never mints ordinals."""
     written = []
     for sensor in TICK_SUBSETS[tick]:
         value = 10.0 * tick + sensor
@@ -249,10 +250,10 @@ def run_threaded(stage, paths, query, sensor_queries, temperature) -> bool:
 
 # [snippet:poll-write-floor]
 def poll_write_floor(stage) -> int:
-    """Fetch the GLOBAL write floor (attribute=None), the producer's publish
-    cursor for range membership. Payload storage is latest-only, so a later
-    change to the same selected (attribute, path) can make the fixed-range read
-    raise OUT_OF_RANGE."""
+    """Fetch the GLOBAL write floor (attribute=None), which tells the consumer
+    which ordinals are sealed for change-range queries. Payload storage is
+    latest-only, so a later change to the same selected (attribute, path) can make
+    the fixed-range read raise OUT_OF_RANGE."""
     with stage.get_attribute_write_floor(None) as floor_query:
         return floor_query.fetch()
 # [/snippet:poll-write-floor]

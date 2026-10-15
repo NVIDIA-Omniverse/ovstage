@@ -42,7 +42,9 @@ def test_scalar_and_fixed_lane_shapes(stage):
             stage.write_attribute(
                 query, velocity, ordinal=1,
                 tensors=make_dltensor(
-                    np.array([1, 0, 0, 0, 1, 0, 0, 0, 1], np.float32), dtype=FLOAT3, shape=[3]
+                    np.array([1, 0, 0, 0, 1, 0, 0, 0, 1], np.float32),
+                    dtype=DLDataType(code=DLDataTypeCode.kDLFloat, bits=32, lanes=3),
+                    shape=[3]
                 ),
                 is_array=False,
             ).wait()
@@ -61,7 +63,8 @@ def test_scalar_and_fixed_lane_shapes(stage):
             assert group is not None
             # A 3-lane column reads back as a flat view of prim_count * 3 values.
             vec = np.asarray(group.array(0)).reshape(-1)
-            assert group.tensor(0).dtype.lanes == 3
+            assert group.tensor(0).dtype.lanes == 1
+            assert group.tensor(0).shape_tuple == (3, 3)
             assert vec.shape[0] == 9
             assert bool(np.allclose(vec, [1, 0, 0, 0, 1, 0, 0, 0, 1]))
             stage.release_group(group)

@@ -63,6 +63,10 @@ Resolve inputs in this order: existing repository files and referenced snippets,
    below are the inline wrappers from `path_dictionary_utils.h` and take that instance.
 3. Intern strings with `path_dictionary_create_tokens_from_strings` (tokens) and
    `path_dictionary_create_paths_from_strings` / `..._create_paths_from_tokens` (prim paths).
+   Component tokens name an absolute path: omit separators from the tokens,
+   and expect the same handle as the equivalent absolute string.
+   Zero components identify `/`; still supply a non-null token array even when all
+   per-path counts are zero.
    Resolve tokens back with `path_dictionary_get_strings_from_tokens`; decompose a prim path
    into its tokens with `path_dictionary_get_tokens_from_paths`, then resolve those tokens.
 4. Build path lists with `path_dictionary_create_path_list_from_paths` (from interned paths) or
@@ -180,8 +184,14 @@ raise `ovstage.OvxError`.
 
 Resolve a path list back to strings with `paths.get_path_strings(list)`.
 
-Construct standalone (`PathDictionary()`) or bind to a stage's shared dictionary with
-`PathDictionary(stage)` for zero-conversion sharing. Same ownership rule as C: release
+Use `PathDictionary.intern_path` to construct an individual path from a string;
+there is no public Python `create_paths_from_tokens` method. Absolute strings
+share handle identity with equivalent C component-token paths in the same
+dictionary. The root string `/` corresponds to zero component tokens in C.
+
+Construct `PathDictionary(stage)` with the Stage that will use the lists.
+Each Stage owns its dictionary; recreate lists in a destination Stage's dictionary
+when transferring a selection. List references do not extend Stage lifetime. Same ownership rule as C: release
 **caller-created** lists; do not release lists handed back by an ovstage read result.
 
 ### Path-list ownership in Python

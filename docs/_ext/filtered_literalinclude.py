@@ -10,7 +10,12 @@
 
 """Sphinx extension: filtered-literalinclude directive.
 
-Extends ``literalinclude`` with two filtering options:
+Extends ``literalinclude`` with named snippet selection and filtering:
+
+``:snippets:``
+    Comma-separated snippet names from one source file. Extracts each marked
+    region, dedents it independently, and joins the regions with a blank line.
+    Cannot be combined with literalinclude's line selection or dedent options.
 
 ``:exclude-pattern:``
     Strips lines matching a regular expression.  The primary use-case is
@@ -27,6 +32,9 @@ Extends ``literalinclude`` with two filtering options:
 """
 
 import re
+import textwrap
+
+from docutils import nodes as docutils_nodes
 
 from sphinx.directives.code import LiteralInclude
 
@@ -36,6 +44,7 @@ class FilteredLiteralInclude(LiteralInclude):
 
     option_spec = {
         **LiteralInclude.option_spec,
+        "snippets": str,
         "exclude-pattern": str,
         "omit-markers": lambda x: True,  # flag option, no value
     }
@@ -72,22 +81,51 @@ class FilteredLiteralInclude(LiteralInclude):
         return "\n".join(lines)
 
     def run(self):
-        nodes = super().run()
+        """Select named regions before filtering, preserving Sphinx file tracking."""
+        snippet_names = self.options.get("snippets")
+        if snippet_names is not None:
+            # These options would alter the source before marker extraction.
+            incompatible = {"lines", "start-at", "start-after", "end-at", "end-before",
+                            "pyobject", "diff", "dedent", "prepend", "append",
+                            "lineno-match"}.intersection(self.options)
+            if incompatible:
+                return [self.state_machine.reporter.warning(
+                    ":snippets: cannot be combined with " + ", ".join(sorted(incompatible)),
+                    line=self.lineno)]
 
-        has_filters = self.options.get("exclude-pattern") or "omit-markers" in self.options
-        if not has_filters:
-            return nodes
+        result = super().run()
+        if not (snippet_names is not None or self.options.get("exclude-pattern")
+                or "omit-markers" in self.options):
+            return result
 
-        for node in nodes:
-            if node.rawsource or hasattr(node, "astext"):
-                filtered = self._apply_filters(node.astext())
-                # Update both rawsource (used by Pygments for highlighting)
-                # and the child Text node (used for plain-text output)
+        # Captions wrap the literal block; leave warnings and wrapper text alone.
+        for root in result:
+            for node in root.findall(docutils_nodes.literal_block):
+                text = node.astext()
+                if snippet_names is not None:
+                    parts = []
+                    for name in snippet_names.split(","):
+                        name = name.strip()
+                        marker = re.escape(name)
+                        opening = list(re.finditer(
+                            rf"(?m)^[ \t]*(?:#|//)[ \t]*\[snippet:{marker}\][ \t]*$", text))
+                        closing = list(re.finditer(
+                            rf"(?m)^[ \t]*(?:#|//)[ \t]*\[/snippet:{marker}\][ \t]*$", text))
+                        if (not name or len(opening) != 1 or len(closing) != 1
+                                or opening[0].end() >= closing[0].start()):
+                            return [self.state_machine.reporter.warning(
+                                f"Invalid or missing snippet marker pair: {name!r}",
+                                line=self.lineno)]
+                        body = text[opening[0].end():closing[0].start()]
+                        body = re.sub(
+                            r"(?m)^[ \t]*(?:#|//)[ \t]*\[/?snippet:[A-Za-z0-9_.:-]+\][ \t]*\n?",
+                            "", body)
+                        parts.append(textwrap.dedent(body).strip("\n"))
+                    text = "\n\n".join(parts)
+                filtered = self._apply_filters(text)
                 node.rawsource = filtered
-                if getattr(node, "children", None):
-                    node.children[0] = node.children[0].__class__(filtered)
-
-        return nodes
+                node.children[:] = [docutils_nodes.Text(filtered)]
+        return result
 
 
 def setup(app):

@@ -79,8 +79,8 @@ ovstage skills under `../../../skills/`; keep them intact when editing.
 - The example supplies `omni:xform` in its canonical form: **one 16-lane
   element per prim** (`dtype.lanes = 16`, `shape = [1]`, via
   `make_dltensor`). A convenience input shaped `(N, 4, 4)` with `lanes = 1`
-  is also accepted, but its trailing shape is not preserved: raw reads/maps
-  return `(N,)` with 16 lanes and Python DLPack export produces `(N, 16)`.
+  is also accepted. Its exact input shape is not stored: raw reads reconstruct
+  `(N, 4, 4)` with scalar lanes for both reads and maps.
 - The inline `add_usd_reference` USDA must be multi-line; a single-line
   layer-metadata + prim body does not parse through the anonymous-layer path.
 

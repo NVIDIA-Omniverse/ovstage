@@ -150,17 +150,11 @@ def _drop_read_group(stage, query, attr):
 
 
 def _drop_map(stage, query, attr):
-    """Drop an unmapped Map session.
-
-    Returns the session's own ordinal for the probe write: Map.__del__ enqueues
-    the unmap without waiting, and only *same-ordinal* ops are ordered against
-    each other. Probing at a different ordinal would race the pending unmap and
-    fail intermittently.
-    """
+    """Drop a map at 7; the caller waits for its unmap before probing at 8."""
     session = stage.map_attribute(query, attr, ordinal=7)
     session.wait()
     del session
-    return 7
+    return 8
 
 
 @pytest.mark.parametrize("drop", [_drop_read_group, _drop_map], ids=["read_group", "map"])
@@ -178,6 +172,10 @@ def test_release_still_happens_when_resourcewarning_is_an_error(scene, drop):
         warnings.simplefilter("error", ResourceWarning)
         probe_ordinal = drop(stage, query, attr)
         gc.collect()
+    if drop is _drop_map:
+        # Sealing waits for the finalizer's queued unmap at 7. The probe needs
+        # a newer ordinal because that unmap may have committed the same cells.
+        stage.advance_write_floor(ordinal=7).wait()
     # Raises if the escalated warning skipped the release and left the pin.
     _write(stage, query, attr, probe_ordinal)
 

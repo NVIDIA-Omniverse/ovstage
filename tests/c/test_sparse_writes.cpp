@@ -159,12 +159,8 @@ TEST_F(SparseWriteTest, IndexMapAndMask)
     EXPECT_FLOAT_EQ(values[3], 40.0f);
 
     // [snippet:sparse-index-map-and-mask-c]
-    // index_map is a GATHER: count selects how many of the query's prims are
-    // targeted (the first `count`, in query order) and index_map[i] picks the
-    // SOURCE tensor row for target i. A non-involutory 3-cycle proves the direction:
-    // gather reads source[index_map[i]] into target i (scatter would give a different
-    // result). mask is a bitmask over the `count` target rows: only set bits are
-    // written. Untouched prims keep their earlier value.
+    // index_map chooses source rows; mask chooses target prims.
+    // These are separate writes because the two options cannot be combined.
     float gathered[] = { 111.0f, 222.0f, 333.0f };
     const uint32_t indexMap[] = { 1, 2, 0 }; // A<-row1(222), B<-row2(333), C<-row0(111)
     DLTensor gatheredTensor = tensor(gathered, three);

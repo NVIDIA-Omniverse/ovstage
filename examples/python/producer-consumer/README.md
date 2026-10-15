@@ -3,7 +3,7 @@
 A small, headless Python program that shows the ovstage **producer/consumer**
 pattern. The producer stamps every write with an **ordinal** (a version number
 the application picks; one per tick here) and seals each tick by advancing the
-**write floor** (which publishes everything up to that ordinal as sealed); a
+**write floor** (which seals data at or below that ordinal); a
 pull-based consumer polls the floor and reads only the **delta**
 — "what changed since ordinal N" — with `OrdinalRange.between`. It is the
 Python sibling of `../../c/producer-consumer/main.cpp` (same flow,
@@ -18,7 +18,7 @@ byte-identical default-mode output).
 5. Consumer catches up again: the delta is bigger (it lagged three ticks) and includes the delete as a tombstone.
 6. The same flow runs concurrently with --threads: producer and consumer on one shared stage.
 
-The write floor is the producer's publish signal to the consumer:
+The write floor tells the consumer which ordinals the producer has sealed:
 
 ```text
 producer                        ovstage                      consumer

@@ -28,10 +28,12 @@ endif()
 foreach(_ovstage_example
     authoring-hierarchy
     minimal
+    population
     producer-consumer
     queries
     runtime-loop
     time-and-ordinals
+    transforms
     usd-export
     write-flavors)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_ovstage_example}/CMakeLists.txt")

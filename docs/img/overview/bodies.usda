@@ -1,0 +1,17 @@
+#usda 1.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+
+def "World"
+{
+    def "BodyA"
+    {
+        custom float mass = 2.0
+        custom vector3f[] velocities = [(1, 0, 0)]
+    }
+    def "BodyB"
+    {
+        custom float mass = 3.0
+        custom vector3f[] velocities = [(0, 1, 0)]
+    }
+}

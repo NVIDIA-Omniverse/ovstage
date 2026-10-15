@@ -25,18 +25,20 @@ from typing import Any, Dict, FrozenSet, List, Optional, Sequence, Tuple, Type, 
 
 from . import bindings as _b
 from .bindings import check_timeout  # defined there to avoid an import cycle with flush_log
-from .dlpack import DLTensor, ManagedDLTensor, dltensor_to_numpy
+from .dlpack import DLDevice, DLDeviceType, DLTensor, ManagedDLTensor, dltensor_to_numpy
 
 __all__ = [
     "ErrorCode",
     "OvstageError",
     "FilterOp",
     "PrimMode",
+    "AttributeMode",
     "Scope",
     "PopulationDomain",
     "PrimPredicateKind",
     "PropertyPredicateKind",
     "AttributeSemantic",
+    "Placement",
     "HierarchyRelation",
     "HierarchyComputationModel",
     "StageConfig",
@@ -44,10 +46,12 @@ __all__ = [
     "Predicate",
     "Filter",
     "Operation",
+    "CloneOperation",
     "AttributeMeta",
     "ReadGroup",
     "MapGroup",
     "QueryResult",
+    "CloneResult",
     "HierarchyItem",
     "HierarchyResult",
     "HierarchyComputationModelDesc",
@@ -206,6 +210,23 @@ def check_int64(value: int, name: str) -> int:
     minimum, maximum = -(1 << 63), (1 << 63) - 1
     if not (minimum <= result <= maximum):
         raise ValueError(f"{name} must fit in int64, got {value}")
+    return result
+
+
+def check_int32(value: int, name: str) -> int:
+    """Validate an integer for a generic ``int32_t`` field.
+
+    ``DLDevice.device_id`` is signed, so a negative is representable and will not
+    wrap -- but it names no device, and the native side would report it as an
+    out-of-range id rather than as the nonsense it is. Reject it here.
+    """
+    try:
+        result = operator.index(value)
+    except TypeError:
+        raise TypeError(f"{name} must be an int, got {type(value).__name__}") from None
+    minimum, maximum = -(1 << 31), (1 << 31) - 1
+    if not (minimum <= result <= maximum):
+        raise ValueError(f"{name} must fit in int32, got {value}")
     return result
 
 
@@ -424,6 +445,21 @@ class PrimMode(IntEnum):
     INSERT = 1
 
 
+class AttributeMode(IntEnum):
+    """What a write or map does when a target prim already has the attribute with a
+    different schema (storage or a different non-NONE semantic).
+
+    - ``REJECT`` → the write or map fails (default).
+    - ``FORCE`` → the target prim's schema is replaced by the written one.
+
+    See :meth:`Stage.write_attribute` and :meth:`Stage.map_attribute` for how a
+    replacement is applied.
+    """
+
+    REJECT = 0
+    FORCE = 1
+
+
 class Scope(IntEnum):
     """Write-floor advance scope (see :meth:`Stage.advance_write_floor`).
 
@@ -513,7 +549,8 @@ class AttributeSemantic(IntEnum):
     - ``TOKEN_ID`` → ``dtype = (kDLUInt, 64, 1)`` carrying one 64-bit token id
       per row; id 0 is the empty token.
     - ``RELATIONSHIP_PATH_ID`` → ``dtype = (kDLUInt, 64, 1)`` carrying one
-      64-bit path id per row.
+      64-bit path id per element. ``is_array = True`` is a relationship's
+      target list; ``is_array = False`` holds exactly one path per row.
     - ``CONNECTION_PATH_ID`` → ``dtype = (kDLUInt, 64, 2)`` carrying one
       ``(path_id, token_id)`` pair per row (one 16-byte element per row).
     - ``ASSET_PATH_ID`` → ``dtype = (kDLUInt, 64, 2)`` carrying one
@@ -573,6 +610,266 @@ class HierarchyComputationModel(IntEnum):
     DEFAULT_GPU = _b.OVSTAGE_HIERARCHY_COMPUTATION_MODEL_DEFAULT_GPU
 
 
+class OrdinalAdmissionPolicy(IntEnum):
+    """Admission of mutations relative to committed changes in affected cells.
+
+    Every policy enforces applicable explicit floors. ``NONDECREASING`` additionally
+    rejects older ordinals; ``STRICTLY_INCREASING`` also rejects equal ordinals.
+    History comparisons apply to affected cells and prim lifecycles; disjoint
+    cells may share an ordinal.
+    ``DEFAULT`` inherits an active process policy, or selects
+    ``NONDECREASING`` when acquiring the first process reference.
+
+    ``NONDECREASING`` remains the default. ``STRICTLY_INCREASING`` is experimental
+    and represents the intended direction for a future default; ``FLOOR_ONLY``
+    is retained for backward compatibility.
+    """
+
+    DEFAULT = _b.OVSTAGE_ORDINAL_ADMISSION_DEFAULT
+    FLOOR_ONLY = _b.OVSTAGE_ORDINAL_ADMISSION_FLOOR_ONLY
+    NONDECREASING = _b.OVSTAGE_ORDINAL_ADMISSION_NONDECREASING
+    STRICTLY_INCREASING = _b.OVSTAGE_ORDINAL_ADMISSION_STRICTLY_INCREASING
+
+
+#: device_type values ovstage accepts: unspecified, CPU, CUDA, CUDA managed.
+#: Used by Placement, which is the only public surface that names a device.
+ACCEPTED_DEVICE_TYPES = (0, DLDeviceType.kDLCPU, DLDeviceType.kDLCUDA, DLDeviceType.kDLCUDAManaged)
+
+
+def check_device_type(value: int, name: str = "device_type") -> int:
+    """Validate a DLPack device type against the set ovstage serves.
+
+    DLDeviceType is a ``ctypes.c_int`` subclass rather than an ``IntEnum``, so
+    :func:`check_enum_member` does not apply. Membership matters as much as
+    width: an in-range non-member such as ``7`` would otherwise reach the C side
+    as a device kind no build can serve.
+    """
+    result = check_int32(value, name)
+    if result not in ACCEPTED_DEVICE_TYPES:
+        accepted = ", ".join(str(entry) for entry in ACCEPTED_DEVICE_TYPES)
+        raise ValueError(f"{name} must be one of ({accepted}), got {value}")
+    return result
+
+
+@dataclass(frozen=True)
+class Placement:
+    """Which device's copy of an attribute a write should produce.
+
+    .. warning::
+       Experimental, like the C ``"ovstage.placement"`` extension it maps to:
+       its API and semantics may change between releases. A library without the
+       extension rejects a placed call with ``ErrorCode.NOT_FOUND``.
+
+    Destination residency, as opposed to ``cuda_stream``/``cuda_event``, which
+    describe the *source* handoff. A producer may hand over a tensor on one
+    device while asking that the write land on another. ``availability_event`` is
+    the one field pointing the other way: the source handoff is something ovstage
+    *waits* on, that event is something ovstage *signals*. A write may use both --
+    wait for the producer, signal the consumer.
+
+    Placement selects a *mirror*; it does not pin a column to one device for its
+    lifetime. Stage storage keeps CPU and per-device copies and tracks which are
+    current, so writing the same attribute later with a different placement is an
+    ordinary mirror update, not a conflict.
+
+    What placement buys is on the read side: after a write placed on device *D*,
+    a read of that attribute on *D* is served from the copy already current there
+    and performs no migration.
+
+    One placement applies to a whole write call, not to individual attributes --
+    the destination device and the stream carrying the op's device work have to
+    travel at the same granularity. Placing two attributes on two devices takes
+    two calls.
+
+    Leaving ``device_type`` at ``0`` (or passing ``placement=None``) is
+    "unspecified": the write follows the source tensor's device.
+
+    .. note::
+       A payload whose placement differs from its source device is staged onto
+       the target, so a column produced on the CPU becomes current on the GPU and
+       a later device read of it needs no transfer. Host to CUDA, CUDA to another
+       CUDA device, and CUDA back to the host are all handled. Staging costs a
+       full device synchronization today, because the scatter runs on the default
+       stream.
+
+       Ragged (``is_array=True``) payloads are staged too: each row is its own
+       tensor, so staging moves every row into one allocation and preserves the
+       row structure. A strided host row is packed by its strides, as an
+       unplaced write reads it; a row with a negative or zero (broadcast) stride
+       is rejected as not supported.
+
+       A staged write waits on the write's ``cuda_event`` / ``cuda_stream``
+       handoff before it first reads the payload, on the source tensor's device.
+
+    .. note::
+       ``stream`` carries the op's device work for a fixed-size placed write:
+       the scatter is launched on it. The write executes after the call returns,
+       so work enqueued on ``stream`` is ordered behind it only once ``wait()``
+       has returned -- a host-side handshake, not a wait for the GPU; see the
+       sequences below. A write that has to *stage* -- its placement names a
+       device other than the source's -- drains that stream before releasing the
+       staging buffer, so it is synchronous despite naming a stream; a placed
+       write whose source already lives on the target stages nothing and runs
+       fully asynchronously. ``stream`` is ignored for ragged writes.
+
+    .. note::
+       ``availability_event`` is how a caller learns the data an operation makes
+       available is safe to touch without the host waiting for the device work.
+       It does not replace ``wait()`` (or a read's successful fetch), which is
+       still the point after which the event has been recorded.
+       It is a ``cudaEvent_t`` address the **caller** creates and owns; ovstage
+       records into it and never creates, destroys or hands back a CUDA object,
+       exactly as for ``stream`` and ``cuda_event``. Pass the raw ``cudaEvent_t``
+       as an int, the same way ``cuda_event`` takes one.
+
+       It marks *availability*, not this operation's completion. On a read the
+       two deliberately differ: the read op completes first, and the event fires
+       once the memory the groups point at may be dereferenced -- which can mean
+       waiting on device work the caller never issued, such as an earlier write
+       still in flight. That is what makes one name fit all three placed
+       operations: a write makes its data available on the target device, a map
+       commit makes the values it committed available, a read makes the column
+       available.
+
+       It is recorded **exactly once for every accepted operation**, on
+       ``stream``, after the device work is launched -- and also when the
+       operation turns out to need no device work at all (host payload, host
+       placement, nothing to scatter) and when it fails while executing. So
+       waiting on it is always safe -- but because a failed operation records it
+       too, the event firing means *stop waiting*, not *the data is good*:
+       whether the operation succeeded is what ``wait()`` reports. An enqueue
+       rejected outright owes no record and leaves the event untouched, unless
+       it was rejected for lack of memory; the call reports the rejection. A
+       placed *map* records it on each commit -- every ``unmap_group`` and
+       ``unmap_attribute`` -- once that commit has run, and on setup only if
+       the setup is cancelled before it runs: it covers committed values, not
+       the staging buffers :meth:`Map.fetch_next` hands back.
+
+       **Wait on it only after the submission boundary.** The record is issued
+       when the operation executes, after the call has returned; a wait issued
+       earlier, on the event or on ``stream``, observes an old or
+       never-recorded event and orders nothing against this operation. The
+       safe sequences, neither of which waits on the host for the GPU:
+
+       - write or map commit: enqueue; ``wait()`` returns (it raises on
+         failure); then wait on the event, or enqueue downstream work on
+         ``stream``.
+       - read: enqueue; :meth:`Read.fetch_next` returns a group, which happens
+         only after the record was issued; then make the consumer wait on the
+         event, or enqueue it on ``stream``.
+
+       The event firing does not replace that status check. A default
+       ``stream`` is the default stream of the device the record ran on;
+       ``stream=2`` is the per-thread stream of the thread that ran the
+       operation, not necessarily yours, so there only the event orders your
+       work.
+
+       It must belong to the device the record runs on: ``stream``'s device; for
+       a default stream (0, 1 or 2), the CUDA ``device`` when one is named; for
+       a write that leaves ``device_type`` at 0 and has CUDA sources, their
+       device; otherwise, a host placement included, the device current on the
+       calling thread at enqueue. A write that leaves ``device_type`` at 0 and
+       has CUDA sources on more than one device is rejected with
+       ``INVALID_ARGUMENT`` when the stream is a default one.
+
+       A record CUDA refuses leaves the event untouched and fails an otherwise
+       successful operation with ``OP_FAILED`` after its effects -- a write
+       stays committed at its ordinal, a map commit stays recorded -- and a
+       read fails instead of returning its payload. An operation that completes
+       during the enqueue, such as a read of a ready query, is then rejected
+       outright after it ran. Nothing drains a write's device work on that
+       path, and the untouched event does not cover it (see the last note).
+
+       **The event must outlive the call.** The ``Placement`` itself does not --
+       everything in it is copied out during the enqueue -- but the event is
+       recorded when the operation *executes*, which is after the enqueue
+       returns, so destroying it before the record is issued is a
+       use-after-free. The record has been issued, or refused, once ``wait()``
+       has returned or raised a failure (not a timeout) for the operation, or a
+       read's ``fetch_next`` has returned a group. A wait on the event or on
+       ``stream`` before then establishes nothing.
+
+       Supplying one makes the operation genuinely asynchronous, which changes
+       what ``wait()`` means: without an event ovstage drains the device work
+       before reporting the op complete, so ``wait()`` implies the data landed;
+       with one it no longer does for the cases ovstage can leave running --
+       wait on the event instead. The exceptions are the ones above: a write that
+       must stage drains its call-scoped buffer anyway, and a ragged write runs
+       on the default stream, so for those the event is already signalled by the
+       time the op completes. The event is correct in every case; it only buys
+       asynchrony in some.
+
+       One Python-side consequence: :meth:`Operation.wait` releases the
+       references pinning the write's source tensors, and with an availability
+       event the device may still be reading them. Keep your own reference to those
+       tensors until you have waited on the event. If the event could not be
+       recorded, keep them until, after ``wait()`` raised, you have synchronized
+       ``stream`` if it is a specific stream, or else the device the record was
+       due to run on (for example ``cudaDeviceSynchronize`` with that device
+       current).
+    """
+
+    device_type: int = 0
+    device_id: int = 0
+    stream: int = 0
+    availability_event: int = 0
+
+    def __post_init__(self) -> None:
+        # DLDeviceType is a ctypes.c_int subclass rather than an IntEnum, so
+        # check_enum_member does not apply; spell the accepted set out instead.
+        # Membership matters as much as width here: an in-range non-member such
+        # as 7 would otherwise reach the C side and be rejected there, or worse,
+        # name a device kind this build cannot serve.
+        object.__setattr__(self, "device_type", check_device_type(self.device_type))
+
+        device_id = check_int32(self.device_id, "device_id")
+        if device_id < 0:
+            raise ValueError(f"device_id must not be negative, got {self.device_id}")
+        object.__setattr__(self, "device_id", device_id)
+
+        # Both carry a native handle (a cudaStream_t / cudaEvent_t address) into a
+        # uintptr_t field, so both need the same width guard: ctypes would wrap an
+        # out-of-range value into some other live handle rather than raise.
+        object.__setattr__(self, "stream", check_uint64(self.stream, "stream"))
+        object.__setattr__(self, "availability_event", check_uint64(self.availability_event, "availability_event"))
+
+    @classmethod
+    def from_dlpack_device(cls, obj: Any, *, stream: int = 0, availability_event: int = 0) -> "Placement":
+        """Build a placement naming the device an existing tensor already lives on.
+
+        ``obj`` is anything exposing ``__dlpack_device__()`` -- a torch or warp
+        array, or the ``(device_type, device_id)`` tuple itself. This is the
+        common case: put stage storage where the caller's tensors already are.
+
+        ``stream`` and ``availability_event`` are forwarded unchanged: the device
+        comes from the tensor, the synchronization is still the caller's to name.
+        """
+        if isinstance(obj, tuple):
+            device = obj
+        else:
+            dlpack_device = getattr(obj, "__dlpack_device__", None)
+            if dlpack_device is None:
+                raise TypeError(
+                    f"object of type {type(obj).__name__} does not support __dlpack_device__; "
+                    "pass a (device_type, device_id) tuple instead"
+                )
+            device = dlpack_device()
+        try:
+            device_type, device_id = device
+        except (TypeError, ValueError):
+            raise TypeError("__dlpack_device__ must yield a (device_type, device_id) pair") from None
+        return cls(
+            device_type=device_type,
+            device_id=device_id,
+            stream=stream,
+            availability_event=availability_event,
+        )
+
+    def _to_c(self) -> "_b.ovstage_placement_t":
+        """Materialize the C struct the ``*_on_device`` slots take by pointer."""
+        return _b.make_placement(self.device_type, self.device_id, self.stream, self.availability_event)
+
+
 @dataclass
 class StageConfig:
     """Process configuration applied when creating a :class:`~ovstage.Stage`.
@@ -590,6 +887,20 @@ class StageConfig:
     override the active process default. A fresh process defaults to
     :attr:`HierarchyComputationModel.CPU_INCREMENTAL`; ``RUNTIME_DEFAULT`` is
     sent as an entry that the native runtime intentionally ignores.
+    """
+
+    runtime_default_ordinal_admission_policy: Optional[OrdinalAdmissionPolicy] = None
+    """Policy captured by each stage for writes, map publication, clone, and delete.
+
+    ``None`` and :attr:`OrdinalAdmissionPolicy.DEFAULT` inherit the active process
+    policy. The first initialization or stage selects
+    :attr:`OrdinalAdmissionPolicy.NONDECREASING` when no concrete policy
+    is given. A conflicting concrete policy raises :class:`OvstageError` until
+    every initialization and stage reference has been released.
+
+    :attr:`~ovstage.Stage.config` returns the original process configuration entries:
+    an omitted entry remains ``None`` and explicit ``DEFAULT`` remains
+    ``DEFAULT``, rather than reporting the resolved policy.
     """
 
 
@@ -634,6 +945,26 @@ class HierarchyResult:
         return self.items[index].paths
 
 
+@dataclass(frozen=True)
+class CloneResult:
+    """Completion report of a clone (``ovstage_clone_result_t``), copied out by value.
+
+    ``prims_cloned`` sums the sizes of the targets' scene hierarchy subtrees after
+    cloning, including each target root. It counts prims created or merged into and
+    any prims already attached beneath them. A prim whose path lies beneath a target
+    but remains detached from its scene hierarchy is not counted. For disjoint
+    targets that merge into no existing prims, it equals
+    ``source_prim_count * target_count``. A zero-target clone reports
+    ``prims_cloned == 0``. Failure is not a field: a failed clone raises
+    :class:`OvstageError` from :meth:`CloneOperation.wait` / :meth:`CloneOperation.result`.
+    """
+
+    prims_cloned: int
+    target_count: int
+    source_prim_count: int
+    ordinal: int
+
+
 @dataclass
 class WriteDesc:
     """Python-facing form of one native ``ovstage_attribute_write_t``.
@@ -644,8 +975,8 @@ class WriteDesc:
     ``is_array`` is required and explicitly declares the logical attribute
     kind; it is never inferred from ``tensors``. ``tensors`` accepts the same
     numpy/DLTensor forms as :meth:`Stage.write_attribute`. Sparsity and CUDA
-    synchronization are write-local, as is ``semantic``; the ordinal and
-    prim mode are shared by the batch. Fixed-size convenience shapes are
+    synchronization are write-local, as are ``semantic`` and ``attribute_mode``;
+    the ordinal and prim mode are shared by the batch. Fixed-size convenience shapes are
     normalized to one source-data-row dimension with the tuple width in
     ``dtype.lanes``; their trailing dimensions are not preserved.
 
@@ -662,19 +993,55 @@ class WriteDesc:
     cuda_event: Optional[int] = None
     cuda_stream: Optional[int] = None
     semantic: AttributeSemantic = AttributeSemantic.NONE
+    attribute_mode: AttributeMode = AttributeMode.REJECT
 
 
 @dataclass
 class OrdinalRange:
     """Ordinal range for reads.
 
-    - ``OrdinalRange.latest(N)`` → latest snapshot request; recorded columns
-      return current committed payload rather than historical payload <= N.
-    - ``OrdinalRange.between(start, end)`` → select the keys that changed
-      in inclusive [start, end]. An unsealed selected change raises
-      ``WRITE_FLOOR_VIOLATION``. If a selected key also changed after ``end``,
-      latest-only storage raises ``OUT_OF_RANGE`` because the payload for that
-      fixed range is no longer available.
+    - ``OrdinalRange.latest(N)`` requests a snapshot at N for all queried paths.
+      The name is historical: N bounds the snapshot, so ``latest(N)`` does not
+      return values written after N.
+    - ``OrdinalRange.between(start, end)`` selects queried attribute/path pairs
+      with recorded changes in [start, end], including both ends.
+
+    This build stores only the current values. For each attribute, an unsealed
+    selected change at or before the end raises ``WRITE_FLOOR_VIOLATION``.
+    Otherwise, a recorded change after the end on a selected path raises
+    ``OUT_OF_RANGE``, whether that later change is sealed or not. Reads stop at
+    the first attribute that fails either check.
+
+    Use ``(1 << 64) - 1`` as the end to request current values. That skips the
+    later-change check, but a selected unsealed change still raises
+    ``WRITE_FLOOR_VIOLATION``. These checks use recorded change history.
+    Snapshot reads of values without such history, including derived attributes
+    such as ``usd-path``, return current state.
+    Queries select current paths, not the paths present at an earlier ordinal.
+
+    While the end is above the attribute's write floor
+    (``Stage.get_attribute_write_floor()``), changes between the floor and the
+    end can still be admitted and, once sealed, change what the same request
+    returns. Once the end is at or below the floor, later writes, deletes and
+    maps cannot change the recorded values that a successful read of the same
+    request returns for paths the query still selects. This does not cover
+    derived attributes or query membership, which reflect current state, changes
+    that ``compute_hierarchy`` records at or below the floor, or history below
+    the retention frontier. Because a later change after the end makes a bounded
+    read raise ``OUT_OF_RANGE``, a bounded read is not a replay point.
+
+    Under ``OrdinalAdmissionPolicy.FLOOR_ONLY``, a write or delete above the
+    applicable floors can be admitted even when the same attribute and path
+    already has a change at a higher ordinal. ``STRICTLY_INCREASING`` and the
+    default ``NONDECREASING`` policy reject such older changes against retained
+    history. Under ``FLOOR_ONLY``, reads return the most recently applied change,
+    and a read whose end covers both changes can succeed with it.
+
+    Query the retention frontier with ``Stage.get_oldest_preserved_ordinal()``
+    before relying on an old snapshot or interval. Below that frontier, history
+    may have been discarded, so success does not guarantee the earlier state.
+    For example, a snapshot from before an attribute deletion may return no row
+    for that attribute once its deletion history has been discarded.
     """
 
     end_ordinal: int
@@ -703,6 +1070,12 @@ class OrdinalRange:
 
     @classmethod
     def latest(cls, end_ordinal: int) -> "OrdinalRange":
+        """Snapshot at ``end_ordinal`` for all queried paths.
+
+        Despite the name, this does not return values written after
+        ``end_ordinal``; pass ``(1 << 64) - 1`` for current values. See
+        :class:`OrdinalRange`.
+        """
         check_ordinal(end_ordinal)
         return cls(end_ordinal=end_ordinal)
 
@@ -786,9 +1159,16 @@ class Operation:
 
     ``status`` is the enqueue status (``OVSTAGE_OK`` = accepted); ``op_id`` is
     the per-op identifier. Call :meth:`wait` to block until the op (and its
-    ordinal-keyed dependencies) completes, raising :class:`OvstageError` if it
-    failed.
+    ordinal-keyed dependencies) completes; it returns the operation itself on
+    success and raises :class:`OvstageError` if it failed. This is the data-plane
+    operation; ``ovstage.population.Operation`` is a separate class whose
+    ``wait()`` returns the operation's payload.
     """
+
+    # Subclasses may set a bound method here; ``Stage._wait_and_release`` calls it
+    # after the op completed successfully and before the op is released, which is
+    # the only window in which per-op completion state can still be fetched.
+    _on_complete = None
 
     def __init__(self, stage, status: int, op_id: int, keepalive=None):
         # Normally both come straight from an enqueue result, but Operation is
@@ -816,20 +1196,30 @@ class Operation:
             return self._enqueue_error
         return self._stage._last_op_error(self.op_id)
 
-    def wait(self, timeout: int = TIMEOUT_INFINITE) -> None:
-        """Wait for completion and release the op. Raises on failure.
+    def wait(self, timeout: int = TIMEOUT_INFINITE) -> "Operation":
+        """Wait for completion and release the op; returns ``self``. Raises on failure.
 
         Mirrors the C++ ``waitOk`` helper: if the enqueue was rejected, or the
         op or its dependencies failed, raises :class:`OvstageError`.
 
+        On success the operation itself is returned so a wait can be chained
+        into its follow-on call; the op is consumed, and a second ``wait()``
+        raises ``INVALID_HANDLE``. A finite ``timeout`` that elapses raises
+        :class:`OvstageError` with ``ErrorCode.TIMEOUT`` and leaves the op
+        waitable, keeping the references that pin its input buffers.
+
         :param timeout: max nanoseconds to wait; ``TIMEOUT_INFINITE`` (default)
             blocks, ``0`` polls.
+        :returns: this operation (consumed).
         :raises TypeError: if ``timeout`` is not an integer (e.g. ``None``).
         :raises ValueError: if ``timeout`` is negative or does not fit in uint64.
+        :raises OvstageError: if the enqueue was rejected, the op was already
+            waited, the op (or a dependency) failed, or ``timeout`` elapsed.
         """
         # Validate before the try: a rejected timeout must not consume the op
         # or drop the keepalives of inputs the pending op may still read.
         timeout = check_timeout(timeout)
+        timed_out = False
         try:
             if self.status != _b.OVSTAGE_OK:
                 raise OvstageError(self.status, self.error_message())
@@ -849,9 +1239,72 @@ class Operation:
                     "operation cannot be waited after its Stage was destroyed",
                 )
             self._consumed = True
-            self._stage._wait_and_release(self.op_id, timeout)
+            try:
+                self._stage._wait_and_release(self.op_id, timeout, self._on_complete)
+            except OvstageError as err:
+                if err.code == _b.OVSTAGE_ERROR_TIMEOUT:
+                    # Not ready is not a terminal result: the op is still pending
+                    # (and may still read its inputs), so it stays waitable.
+                    timed_out = True
+                    self._consumed = False
+                raise
         finally:
-            self._keepalive = None
+            if not timed_out:
+                self._keepalive = None
+        return self
+
+
+class CloneOperation(Operation):
+    """The :class:`Operation` returned by :meth:`Stage.clone_async`, plus its completion report.
+
+    ``wait()`` behaves exactly like :meth:`Operation.wait` (and returns this
+    operation); it additionally captures the clone's completion report before the
+    op is released, so :meth:`result` can return it afterwards::
+
+        report = stage.clone_async(src, targets, ordinal).wait().result()
+        print(report.prims_cloned)
+    """
+
+    def __init__(self, stage, status: int, op_id: int, keepalive=None):
+        super().__init__(stage, status, op_id, keepalive)
+        self._pending_report: Optional[CloneResult] = None
+        self._result: Optional[CloneResult] = None
+        self._error: Optional[OvstageError] = None
+
+    def _on_complete(self) -> None:
+        # The op has completed and is not yet released: the report is still live.
+        self._pending_report = self._stage.fetch_clone_result(self.op_id, 0)
+
+    def wait(self, timeout: int = TIMEOUT_INFINITE) -> "CloneOperation":
+        was_consumed = self._consumed
+        try:
+            super().wait(timeout)
+        except OvstageError as err:
+            # Remember the clone's own failure for result(); guard errors (a
+            # repeated wait, a bad timeout) and timeouts never poison it.
+            if not was_consumed and self._consumed and err.code != _b.OVSTAGE_ERROR_TIMEOUT:
+                self._error = err
+            raise
+        self._result, self._pending_report = self._pending_report, None
+        return self
+
+    def result(self, timeout: int = TIMEOUT_INFINITE) -> CloneResult:
+        """Return the clone's completion report, waiting for the clone if needed.
+
+        :param timeout: max nanoseconds to wait when the clone is still pending;
+            ``TIMEOUT_INFINITE`` (default) blocks, ``0`` polls. Ignored once the
+            report is cached.
+        :raises OvstageError: with ``ErrorCode.TIMEOUT`` if the clone has not
+            completed in time (it stays waitable), or with the failure the clone
+            reported — the same error :meth:`wait` raised, raised again.
+        """
+        if self._result is not None:
+            return self._result
+        if self._error is not None:
+            raise self._error
+        self.wait(timeout)
+        assert self._result is not None
+        return self._result
 
 
 class AttributeMeta:
@@ -963,11 +1416,10 @@ class _GroupBase:
     def tensor(self, index: int) -> DLTensor:
         """Raw :class:`DLTensor` at ``index`` (for shape/dtype/device checks).
 
-        A fixed-size read/map tensor is lane-canonical: ``ndim=1``, the leading
-        dimension is the transported data-row count, and ``dtype.lanes`` is the
-        complete tuple width. Use :meth:`data_row_index` to resolve a logical
-        group element through any data index map. Convenience write dimensions
-        are not reconstructed.
+        Read and map tensors have scalar lanes and type-aware trailing dimensions. Use :meth:`data_row_index` to
+        resolve a logical group element through any data index map.
+        The descriptor and data are borrowed; do not access them after releasing
+        the group or an accepted group or final unmap submission.
         """
         self._check_live()
         index = check_int(index, "index")
@@ -977,11 +1429,13 @@ class _GroupBase:
         return self.raw.data.tensors[index]
 
     def array(self, index: int):
-        """Zero-copy flat numpy view of tensor ``index`` (CPU only).
+        """Zero-copy shaped, writable numpy view of tensor ``index`` (CPU only).
 
-        Tuple lanes are folded into this one-dimensional base-element view.
+        Use ``view.reshape(-1)`` when scalar buffer indexing is needed.
+        The view borrows map storage until accepted group or final unmap.
         """
-        return dltensor_to_numpy(self.tensor(index))
+        tensor = self.tensor(index)
+        return dltensor_to_numpy(tensor).reshape(tensor.shape_tuple)
 
     def dlpack(self, index: int, *, readonly: bool = True) -> ManagedDLTensor:
         """DLPack-protocol view of tensor ``index`` for zero-copy exchange with
@@ -991,12 +1445,14 @@ class _GroupBase:
         tensors. The data is borrowed from ovstage and valid only until the owning
         group/result is released — copy it if it must outlive the read. The returned
         :class:`~ovstage.ManagedDLTensor` retains the group, but a consumer view does
-        not. A direct ``np.from_dlpack(group.dlpack(i))`` remains valid while the
-        owning read/map operation is alive; custom producers whose manager context
-        owns the backing allocation have stricter lifetime requirements (see
-        :class:`~ovstage.ManagedDLTensor`). A multi-lane raw dtype
-        exports with exactly one trailing lane axis, so a fixed matrix is
-        ``(N, 16)``, not ``(N, 4, 4)``.
+        not. Keep the group or returned producer alive while using a consumer
+        view. Do not access either the producer or its views after releasing the
+        group or an accepted group or final unmap submission; retaining the
+        producer does not extend storage validity beyond those operations.
+        Custom producers whose manager context owns the backing allocation have
+        the same keepalive requirement (see
+        :class:`~ovstage.ManagedDLTensor`). Read and map shapes are exported as returned
+        by the native API, including ``(N, 4, 4)`` for matrix4d.
         """
         return ManagedDLTensor(self.tensor(index), manager_ctx=self, deleter_callback=None, readonly=readonly)
 
@@ -1009,7 +1465,7 @@ class ReadGroup(_GroupBase):
     """A read result group (``ovstage_read_group_t``).
 
     Valid until released via :meth:`Stage.release_group`. Exposes the attribute
-    token, ordinal, delete flag, prim grouping, and tensor data.
+    token, semantic, ordinal, delete flag, prim grouping, and tensor data.
 
     A group's pinned storage is an independent resource: it is reclaimed **only**
     by ``release_group``. Releasing the owning :class:`Read` does not reclaim it,
@@ -1124,9 +1580,7 @@ class ReadGroup(_GroupBase):
         )
 
     def array(self, index: int):
-        """Zero-copy flat read-only numpy view of tensor ``index`` (CPU only).
-
-        Tuple lanes are folded into this one-dimensional base-element view.
+        """Zero-copy shaped, read-only numpy view of tensor ``index`` (CPU only).
 
         The view **borrows** this group's storage and does not keep the group
         alive: it is valid only while the group is, and the group is released by
@@ -1135,14 +1589,34 @@ class ReadGroup(_GroupBase):
         read through the view, and copy out (``np.array(...)``) anything that must
         outlive it.
         """
-        return dltensor_to_numpy(self.tensor(index), readonly=True)
+        tensor = self.tensor(index)
+        return dltensor_to_numpy(tensor, readonly=True).reshape(tensor.shape_tuple)
 
     @property
     def attribute(self) -> int:
         return int(self.raw.attribute)
 
     @property
+    def semantic(self) -> Union[AttributeSemantic, int]:
+        """Authored interpretation of this attribute column's bytes.
+
+        Known values are returned as :class:`AttributeSemantic`. A value added
+        by a newer native library is returned as its raw integer so callers can
+        preserve it even when the installed Python enum does not yet name it.
+        """
+        value = int(self.raw.semantic)
+        try:
+            return AttributeSemantic(value)
+        except ValueError:
+            return value
+
+    @property
     def ordinal(self) -> int:
+        """Informational ordinal of this group.
+
+        It may be above or below the requested end and does not, by itself,
+        prove which state the payload represents. See :class:`OrdinalRange`.
+        """
         return int(self.raw.ordinal)
 
     @property
@@ -1159,16 +1633,48 @@ class MapGroup(_GroupBase):
     """A writable map group (``ovstage_map_group_t``).
 
     Fill ``array(i)`` then commit via :meth:`Stage.unmap_group` (or finalize the
-    whole session with :meth:`Stage.unmap_attribute`).
+    whole session with :meth:`Stage.unmap_attribute`). The buffers borrow storage
+    owned by the map session. A group fetched through a :class:`Map` retains that
+    session. Array and DLPack consumer views borrow the group: keep the group or
+    its :class:`ManagedDLTensor` alive while using them. After an accepted group
+    or final unmap submission, do not access any previously obtained producer,
+    raw tensor, or view; they do not check whether the storage is still valid.
+    A synchronously rejected submission leaves the group usable. Filling a
+    group alone does not change the stage.
     """
+
+    def __init__(self, raw, mapping=None):
+        super().__init__(raw)
+        self._mapping = mapping
+        self._unmapped = False
+
+    def _check_live(self) -> None:
+        if self._unmapped:
+            raise OvstageError(
+                _b.OVSTAGE_ERROR_INVALID_HANDLE,
+                "MapGroup has been unmapped; its writable storage is no longer valid",
+            )
+        if self._mapping is not None:
+            self._mapping._ensure_active()
+
+    def _claim_unmap(self) -> None:
+        self._check_live()
+        self._unmapped = True
+
+    def _rollback_unmap(self) -> None:
+        self._unmapped = False
 
     def dlpack(self, index: int, *, readonly: bool = False) -> ManagedDLTensor:
         """Writable DLPack view of tensor ``index`` (a map group is writable).
 
-        Fill it in place — ``wp.from_dlpack(group.dlpack(i))`` for a GPU kernel, or
-        ``np.from_dlpack(group.dlpack(i))[:] = ...`` on CPU (numpy >= 2.1 honors the
-        writable flag) — then commit via :meth:`Stage.unmap_group` /
-        :meth:`Stage.unmap_attribute`.
+        Fill it in place — ``np.from_dlpack(group.dlpack(i))[:] = ...`` (numpy >= 2.1
+        honors the writable flag) — then commit via :meth:`Stage.unmap_group` /
+        :meth:`Stage.unmap_attribute`. Unplaced maps return CPU buffers; the
+        experimental ``placement`` argument can select CUDA buffers. Inspect the
+        tensor's device and use a compatible DLPack consumer. Finish device writes
+        and provide the source handoff before committing; stop using the buffer
+        once unmap submission is accepted. See :class:`Placement` for commit
+        availability events and buffer lifetimes.
         """
         return super().dlpack(index, readonly=readonly)
 

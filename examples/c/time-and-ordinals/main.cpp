@@ -106,10 +106,9 @@ int main()
     check(stage, status, "query_from_path_list");
 
     // [snippet:time-to-ordinal-table]
-    // ovstage stores no time; its ordering key is an opaque uint64 ordinal.
-    // The app owns the mapping, and because dt varies it is a TABLE, not a
-    // formula: timeOfOrdinal[ordinal] is the simulation time whose state that
-    // ordinal holds. Ordinal 1 holds the t = 0 state; tick N lands at N + 1.
+    // The application maps ordinals to simulation time in seconds.
+    // Values written at ordinal 1 represent time 0. Each later ordinal
+    // represents the time after one step, whose duration can vary.
     double timeOfOrdinal[kTicks + 3] = {};
     timeOfOrdinal[1] = 0.0;
     for (int tick = 1; tick <= kTicks; ++tick)

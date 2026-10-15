@@ -54,8 +54,9 @@ Resolve inputs in this order: existing repository files and referenced snippets,
   attributes it sets/gets, what it deletes, and what it wraps in `Sdf.ChangeBlock`.
 - The prim set each authored attribute covers — this becomes the ovstage query (path list or
   filter) that one vectorized write targets.
-- The caller-owned **ordinals**: one per migrated step, advanced monotonically and sealed with
-  `advance_write_floor`.
+- The caller-owned **ordinals**: under strict admission, use newer
+  ordinals for repeated cell changes; disjoint producers may share one. Seal
+  completed work with `advance_write_floor`.
 - Whether any USD feature in the source has **no ovstage counterpart** (timeSamples,
   composition/layers) — call those out instead of silently dropping them.
 - The shipped headers and the referenced example snippets are the authoritative contract.
@@ -66,8 +67,11 @@ Resolve inputs in this order: existing repository files and referenced snippets,
 - Understand the async **submit/observe** model (`cpu-ahead-gpu-async`): writes are enqueues;
   nothing is visible to reads until the op completes and the **write floor** is advanced to its
   ordinal. There is no USD-style immediate read-after-write.
-- The **application owns the ordinal lifecycle** — pick an ordinal per step, keep them
-  monotonic, seal each with `advance_write_floor`.
+- The **application owns the ordinal lifecycle** — clear applicable floors and
+  satisfy the configured admission policy for affected cells and prim lifecycle,
+  then seal completed work with `advance_write_floor`. See
+  [Ordinal Admission Policies](../../docs/scene/writing_attributes.rst) for options;
+  the referenced examples also satisfy strict admission.
 - Attribute names and prim paths are interned through the path dictionary (`path-dictionary` /
   `string-handling`); reserved `usd-prim-type` payloads are **interned token ids** (uint64,
   `is_array=False`, semantic NONE), not strings.
@@ -87,9 +91,13 @@ Resolve inputs in this order: existing repository files and referenced snippets,
    batched op (one `WriteDesc` per column, sharing the ordinal). Note the semantic upgrade:
    ChangeBlock coalesces only change *notification* around per-prim `Set` calls; the ovstage
    batch is genuinely one op — but a grouping, not an atomic transaction.
-5. **Seal, then read whole columns.** `advance_write_floor` to the write ordinal, then replace
+5. **Observe writes, seal, then read whole columns.** Call `wait()` on each write
+   operation and on `advance_write_floor` at the write ordinal, then replace
    per-prim `Get()` calls with one `read_attributes` over the query
-   (`OrdinalRange.latest(ordinal)`), placing rows via `prim_index` / data `index_map`.
+   (`OrdinalRange.latest(ordinal)`, a snapshot at that sealed ordinal), placing rows via
+   `prim_index` / data `index_map`.
+   `Operation.ok` checks enqueue acceptance only. Use a read context manager and
+   its wait/fetch calls; finalizers and discarded operations are not error checks.
 6. **Flag the not-equivalent features** (below) present in the source code instead of inventing
    mappings for them.
 
@@ -99,9 +107,15 @@ Resolve inputs in this order: existing repository files and referenced snippets,
 |-----------|--------------------|------|
 | `stage.DefinePrim(path, type)` | INSERT-mode `Stage.write_attribute(query, "usd-prim-type", ordinal, tokens, is_array=False, prim_mode=PrimMode.INSERT)` | No create-prim call — prims come into existence via any attribute write; INSERT is create-only (fails on existing prims), and the reserved `usd-prim-type` column stamps one interned token id per prim (uint64, semantic NONE) |
 | `prim.CreateAttribute(name, type).Set(value)` | `Stage.write_attribute(query, attr, ordinal, tensors, is_array=...)` | One call authors the whole column: one tensor row per prim in the query, at a caller-owned ordinal; the write creates the column (and, in UPSERT mode, any absent prims) |
-| `attr.Get()` | `Stage.read_attributes(query, [attr], OrdinalRange.latest(N))` | One read op returns the current latest committed column; `N` is not a historical upper bound. Recorded payloads must be covered by the write floor. |
+| `attr.Get()` | `Stage.read_attributes(query, [attr], OrdinalRange.latest((1 << 64) - 1))` | One read op returns the current committed column. An `N` below `(1 << 64) - 1` requests the snapshot at `N` and returns `OUT_OF_RANGE` if a queried path changed after `N`. Recorded payloads must be covered by the write floor. |
 | `stage.RemovePrim(path)` | `Stage.delete_attributes(query, [], ordinal)` | An **empty attribute list** deletes the prims entirely; a non-empty list removes just those attributes; ordinal-keyed like any write, surfaced to range readers as an `is_delete` tombstone group |
 | `Sdf.ChangeBlock()` around N edits | `Stage.write_attributes(query, [WriteDesc, ...], ordinal)` | ChangeBlock batches only change *notification* — still one `Set` call per attribute per prim; `write_attributes` lands several columns in ONE op (a grouping, not an atomic transaction) |
+
+The mutation calls in this table return operations. Retain and `wait()` on them
+to surface enqueue and execution errors; returning from the method or reading
+`Operation.ok` does not confirm that the data changed. In C, check enqueue status
+and then use `ovstage_wait_op` with its error ids/diagnostics, or the operation's
+documented fetch path.
 
 ## The Vectorization Shift
 
@@ -188,6 +202,13 @@ This skill has no scripts.
 - `write_attributes` is a grouping, not a transaction — entries may apply incrementally; one op
   id groups completion. Do not port code that relies on all-or-nothing `SdfChangeBlock`-free
   semantics onto it without checking.
+- Retry a possibly partially successful whole batch at a newer ordinal: the strictly increasing
+  policy rejects replaying completed cells at their recorded ordinal. Reserved
+  metadata entries can complete before ordinary attribute entries during execution
+  and remain committed if a later entry fails. Same-ordinal retries depend
+  on the selected policy, actual targets, current floors, and stage state; see the
+  `error-handling` skill. A prim left by a failed write remains an existing target
+  for INSERT; UPSERT can repair it.
 - Typed attribute *definitions* do not migrate: ovstage columns get a storage dtype (and an
   optional `AttributeSemantic`) from the first write, not an `Sdf.ValueTypeName` schema.
 - Reserved metadata contract: `usd-prim-type` requires `is_array=False`; `usd-schemas` requires
@@ -200,8 +221,10 @@ This skill has no scripts.
 - **Read fails with `OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION` after a write** — advance the write floor
   to the write ordinal first; reads only see sealed data at/below the floor (there is no USD-style
   immediate read-after-write).
-- **`OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION`** — a write used an ordinal at/below the floor. Keep
-  ordinals monotonic across migrated steps.
+- **`OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION`** — the ordinal conflicts with a floor or
+  the configured admission policy for affected cells or prim lifecycle. Under the
+  strict policy, a repeated modification of a cell needs a newer ordinal; disjoint
+  cells may share one above the applicable floors.
 - **Type stamp did not land / garbage type names** — `usd-prim-type` takes interned token ids
   (uint64) via the path dictionary, not strings; resolve reads back through `token_to_string`.
 - **Values come back in the wrong prim order** — place rows via `group.prim_index(local)` (and

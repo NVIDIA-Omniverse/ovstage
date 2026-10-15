@@ -202,9 +202,12 @@ int main(int argc, char** argv)
     ovstage_read_group_t group{};
     status = ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group);
     check(stage, status, "fetch_read_next");
-    // Single-path query -> exactly one 16-lane matrix element.
-    if (group.data.tensor_count != 1 || !group.data.tensors[0].data || group.data.tensors[0].ndim != 1 ||
-        group.data.tensors[0].shape[0] != 1 || group.data.tensors[0].dtype.lanes != 16)
+    // Single-path query -> one scalar-lane 4x4 matrix row.
+    if (group.data.tensor_count != 1 || !group.data.tensors[0].data || group.data.tensors[0].ndim != 3 ||
+        !group.data.tensors[0].shape || group.data.tensors[0].shape[0] != 1 ||
+        group.data.tensors[0].shape[1] != 4 || group.data.tensors[0].shape[2] != 4 ||
+        group.data.tensors[0].dtype.code != kDLFloat || group.data.tensors[0].dtype.bits != 64 ||
+        group.data.tensors[0].dtype.lanes != 1)
     {
         std::fprintf(stderr, "unexpected omni:xform read layout\n");
         return EXIT_FAILURE;

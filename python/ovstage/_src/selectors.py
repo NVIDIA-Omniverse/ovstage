@@ -304,7 +304,7 @@ class PrimPredicate(_Predicate):
 
 
 class PropertyPredicate(_Predicate):
-    """Which of an in-scope prim's properties a selector publishes."""
+    """Which of an in-scope prim's properties a selector includes in population."""
 
     _KIND_ENUM = PropertyPredicateKind
     _KIND_SLOTS = {

@@ -10,7 +10,9 @@
 
 Thin wrappers over the ``ovstage_population_*`` C entry points (the USD ->
 ovstage bridge in ``ovstage_population.h``). The application owns the ordinal
-lifecycle and passes the current ordinal to the calls that carry one.
+lifecycle and must pass an explicit ordinal to every call that carries one.
+Under the strict admission policy, overlapping writes need successively
+newer ordinals; the wrappers do not allocate or advance ordinals automatically.
 
 The surface follows the ovrtx Python conventions: every mutating entry point
 comes as a blocking ``foo(...)`` that returns once the work has completed, plus
@@ -22,7 +24,6 @@ released automatically when the stage is destroyed (no manual detach).
 import ctypes
 import math
 import os
-from typing import Optional
 
 from . import bindings as _b
 from .population_export import (
@@ -73,8 +74,14 @@ from .population_export import (
     export_to_destination_async,
     export_to_usd_file,
     export_to_usd_file_async,
+    export_to_usd_layer,
+    export_to_usd_layer_async,
+    export_to_usd_stage,
+    export_to_usd_stage_async,
     export_typed_hierarchy_to_usd_file,
     export_typed_hierarchy_to_usd_file_async,
+    export_typed_hierarchy_to_usd_layer,
+    export_typed_hierarchy_to_usd_layer_async,
 )
 from .selectors import Desc, PrimPredicate, PropertyPredicate, Selector, build_descs
 from .types import (
@@ -112,6 +119,8 @@ __all__ = [
     "open_usd_with_desc_async",
     "open_usd_from_string_with_desc",
     "open_usd_from_string_with_desc_async",
+    "repopulate_usd_with_desc",
+    "repopulate_usd_with_desc_async",
     "add_usd_reference",
     "add_usd_reference_async",
     "add_usd_reference_from_string",
@@ -125,6 +134,8 @@ __all__ = [
     "apply_usd_changes",
     "apply_usd_changes_async",
     "register_usd_schemas",
+    "DEFAULT_TIME",
+    "is_default_time",
     "last_error",
     "available",
     "export_available",
@@ -134,8 +145,14 @@ __all__ = [
     "export_to_destination_async",
     "export_to_usd_file",
     "export_to_usd_file_async",
+    "export_to_usd_layer",
+    "export_to_usd_layer_async",
+    "export_to_usd_stage",
+    "export_to_usd_stage_async",
     "export_typed_hierarchy_to_usd_file",
     "export_typed_hierarchy_to_usd_file_async",
+    "export_typed_hierarchy_to_usd_layer",
+    "export_typed_hierarchy_to_usd_layer_async",
     "OVSTAGE_POPULATION_EXPORT_SELECTION_EXPLICIT_PREDICATE",
     "OVSTAGE_POPULATION_EXPORT_SELECTION_CHANGED_PROPERTIES_SINCE_ORDINAL",
     "OVSTAGE_POPULATION_EXPORT_LAYER_MODE_OVER",
@@ -198,6 +215,25 @@ def descs_available() -> bool:
         return all(hasattr(lib, name) for name in _b.POPULATION_DESC_ENTRY_POINTS)
     except Exception:  # noqa: BLE001 — library not loadable in this environment
         return False
+
+
+#: The ``time`` value selecting USD's default time code rather than a numeric
+#: one, and the default for every ``time`` parameter that has one. The value
+#: is a NaN, the same as the C ``OVSTAGE_POPULATION_DEFAULT_TIME``.
+#:
+#: **Never compare with** ``==`` -- a NaN is not equal to itself, so
+#: ``t == DEFAULT_TIME`` is false even for the default time. Use
+#: :func:`is_default_time`.
+DEFAULT_TIME = math.nan
+
+
+def is_default_time(time: float) -> bool:
+    """True when ``time`` selects USD's default time code.
+
+    Use this rather than ``time == DEFAULT_TIME``, which is false even for the
+    default time. Mirrors the C ``ovstage_population_is_default_time``.
+    """
+    return math.isnan(time)
 
 
 def _require(stage):
@@ -280,49 +316,64 @@ def _enqueue(stage, name: str, result, *, value=True, keepalive=None) -> Operati
 
 # ── open (load + populate) ───────────────────────────────────────────────────
 def open_usd(
-    stage, path: str, ordinal: int = 1, time_code: float = math.nan, domains: int = PopulationDomain.RENDERING
+    stage, path: str, ordinal: int, time: float = DEFAULT_TIME, domains: int = PopulationDomain.RENDERING
 ) -> None:
     """Open a USD file and populate the stage (blocking).
 
-    ``time_code`` is in **seconds** (converted via the stage's
-    ``timeCodesPerSecond``, like the C ``time`` parameter); ``math.nan`` (the
-    default) evaluates at USD's Default time code. Wraps the C entry point
+    ``ordinal`` is required and chosen by the caller. Under the strict
+    admission policy, use a newer ordinal when this writes attributes already
+    written by an earlier operation.
+
+    ``time`` is in **seconds** (converted via the stage's
+    ``timeCodesPerSecond``, like the C ``time`` parameter). The default,
+    :data:`DEFAULT_TIME`,
+    evaluates at USD's default time code. Wraps the C entry point
     ``ovstage_population_open_usd_from_file``.
+
+    An open writes over what the stage already holds and removes nothing an
+    earlier one left, so opening different content on a populated stage merges
+    the two. To replace, clear first at a lower ordinal -- :func:`reset_usd`
+    followed by :func:`apply_usd_changes`, or a whole-prim delete over an
+    unfiltered query. See *Repopulating a Stage* in the population guide.
     """
-    open_usd_async(stage, path, ordinal, time_code, domains).wait()
+    open_usd_async(stage, path, ordinal, time, domains).wait()
 
 
 def open_usd_async(
-    stage, path: str, ordinal: int = 1, time_code: float = math.nan, domains: int = PopulationDomain.RENDERING
+    stage, path: str, ordinal: int, time: float = DEFAULT_TIME, domains: int = PopulationDomain.RENDERING
 ) -> Operation:
     """Open a USD file and populate the stage (asynchronous). See :func:`open_usd`."""
     lib, inst = _require(stage)
     path_s = _b.ovx_string_t(path)
     res = lib.ovstage_population_open_usd_from_file(
-        inst, path_s, check_ordinal(ordinal), float(time_code), check_domains(domains)
+        inst, path_s, check_ordinal(ordinal), float(time), check_domains(domains)
     )
     return _enqueue(stage, "open_usd", res, keepalive=[path_s])
 
 
 def open_usd_from_string(
-    stage, usda: str, ordinal: int = 1, time_code: float = math.nan, domains: int = PopulationDomain.RENDERING
+    stage, usda: str, ordinal: int, time: float = DEFAULT_TIME, domains: int = PopulationDomain.RENDERING
 ) -> None:
     """Open inline USDA content and populate the stage (blocking).
 
-    ``time_code`` follows the same contract as :func:`open_usd`: seconds, with
-    ``math.nan`` (the default) evaluating at USD's Default time code.
+    ``ordinal`` is required, with the same admission contract as :func:`open_usd`.
+
+    ``time`` follows the same contract as :func:`open_usd`: seconds, with
+    :data:`DEFAULT_TIME` (the default) evaluating at USD's default
+    time code. Like :func:`open_usd`, it merges into whatever the stage already
+    holds; clear first to replace.
     """
-    open_usd_from_string_async(stage, usda, ordinal, time_code, domains).wait()
+    open_usd_from_string_async(stage, usda, ordinal, time, domains).wait()
 
 
 def open_usd_from_string_async(
-    stage, usda: str, ordinal: int = 1, time_code: float = math.nan, domains: int = PopulationDomain.RENDERING
+    stage, usda: str, ordinal: int, time: float = DEFAULT_TIME, domains: int = PopulationDomain.RENDERING
 ) -> Operation:
     """Open inline USDA content and populate the stage (asynchronous). See :func:`open_usd_from_string`."""
     lib, inst = _require(stage)
     usda_s = _b.ovx_string_t(usda)
     res = lib.ovstage_population_open_usd_from_string(
-        inst, usda_s, check_ordinal(ordinal), float(time_code), check_domains(domains)
+        inst, usda_s, check_ordinal(ordinal), float(time), check_domains(domains)
     )
     return _enqueue(stage, "open_usd_from_string", res, keepalive=[usda_s])
 
@@ -344,46 +395,73 @@ def _build_descs(descs):
     return build_descs(resolved)
 
 
-def open_usd_with_desc(stage, path: str, ordinal: int, time_code: float, descs) -> None:
+def open_usd_with_desc(stage, path: str, ordinal: int, time: float, descs) -> None:
     """Open a USD file and populate the stage through a description (blocking).
 
     ``descs`` is a :class:`Desc` or a sequence of them, mirroring the C entry point:
     each contributor supplies one, their ``domains`` are OR-ed and their selectors and
     stage metadata paths combined. A description carrying only ``domains`` is exactly
-    :func:`open_usd`. An empty sequence selects nothing. ``time_code`` follows the same
-    contract as :func:`open_usd`.
+    :func:`open_usd`. An empty sequence selects nothing. ``time`` follows the same
+    contract as :func:`open_usd`, including :data:`DEFAULT_TIME`; it is
+    required here rather than defaulted, matching the C entry point.
     """
-    open_usd_with_desc_async(stage, path, ordinal, time_code, descs).wait()
+    open_usd_with_desc_async(stage, path, ordinal, time, descs).wait()
 
 
-def open_usd_with_desc_async(stage, path: str, ordinal: int, time_code: float, descs) -> Operation:
+def open_usd_with_desc_async(stage, path: str, ordinal: int, time: float, descs) -> Operation:
     """Open a USD file through a description (asynchronous). See :func:`open_usd_with_desc`."""
     lib, inst = _require_descs(stage)
     path_s = _b.ovx_string_t(path)
     array, count, keepalive = _build_descs(descs)
     res = lib.ovstage_population_open_usd_from_file_with_desc(
-        inst, path_s, check_ordinal(ordinal), float(time_code), array, count
+        inst, path_s, check_ordinal(ordinal), float(time), array, count
     )
     return _enqueue(stage, "open_usd_with_desc", res, keepalive=[path_s, keepalive])
 
 
-def open_usd_from_string_with_desc(stage, usda: str, ordinal: int, time_code: float, descs) -> None:
+def open_usd_from_string_with_desc(stage, usda: str, ordinal: int, time: float, descs) -> None:
     """Open inline USDA and populate the stage through a description (blocking).
 
     See :func:`open_usd_with_desc`.
     """
-    open_usd_from_string_with_desc_async(stage, usda, ordinal, time_code, descs).wait()
+    open_usd_from_string_with_desc_async(stage, usda, ordinal, time, descs).wait()
 
 
-def open_usd_from_string_with_desc_async(stage, usda: str, ordinal: int, time_code: float, descs) -> Operation:
+def open_usd_from_string_with_desc_async(stage, usda: str, ordinal: int, time: float, descs) -> Operation:
     """Open inline USDA through a description (asynchronous). See :func:`open_usd_with_desc`."""
     lib, inst = _require_descs(stage)
     usda_s = _b.ovx_string_t(usda)
     array, count, keepalive = _build_descs(descs)
     res = lib.ovstage_population_open_usd_from_string_with_desc(
-        inst, usda_s, check_ordinal(ordinal), float(time_code), array, count
+        inst, usda_s, check_ordinal(ordinal), float(time), array, count
     )
     return _enqueue(stage, "open_usd_from_string_with_desc", res, keepalive=[usda_s, keepalive])
+
+
+def repopulate_usd_with_desc(stage, ordinal: int, time: float, descs) -> None:
+    """Populate the stage again from its current USD source (blocking).
+
+    Preserves the USD stage, authored root/session edits, composition and reference
+    handles. Every attribute ``descs`` selects is rewritten from USD, replacing
+    direct data-plane overrides; like an open, it removes nothing ``descs`` does not
+    populate, including prims/columns absent from USD. ``descs`` replaces the
+    population scope; ``time`` is in seconds or :data:`DEFAULT_TIME`, as for
+    :func:`open_usd_with_desc`.
+
+    Raises :class:`OvstageError` with NOT_SUPPORTED on an older runtime.
+    """
+    repopulate_usd_with_desc_async(stage, ordinal, time, descs).wait()
+
+
+def repopulate_usd_with_desc_async(stage, ordinal: int, time: float, descs) -> Operation:
+    """Rebuild from the retained USD source asynchronously; see :func:`repopulate_usd_with_desc`."""
+    lib, inst = _require(stage)
+    name = "ovstage_population_repopulate_usd_with_desc"
+    if not hasattr(lib, name):
+        raise OvstageError(_b.OVSTAGE_ERROR_NOT_SUPPORTED, "runtime does not support repopulating the current USD source")
+    array, count, keepalive = _build_descs(descs)
+    res = getattr(lib, name)(inst, check_ordinal(ordinal), float(time), array, count)
+    return _enqueue(stage, "repopulate_usd_with_desc", res, keepalive=[array, keepalive])
 
 
 # ── add / remove USD references (USD-source edits; no ordinal) ────────────────
@@ -442,42 +520,67 @@ def remove_usd_async(stage, handle: int) -> Operation:
 
 
 def reset_usd(stage) -> None:
-    """Clear all USD source content from the stage (blocking)."""
+    """Clear all USD source content from the stage (blocking).
+
+    This edits only the USD source. What was populated from it stays until
+    :func:`apply_usd_changes` propagates the clear, and a later open merges into
+    it rather than replacing it.
+    """
     reset_usd_async(stage).wait()
 
 
 def reset_usd_async(stage) -> Operation:
-    """Clear all USD source content from the stage (asynchronous)."""
+    """Clear all USD source content from the stage (asynchronous).
+
+    Edits only the USD source; see :func:`reset_usd`.
+    """
     lib, inst = _require(stage)
     res = lib.ovstage_population_reset_usd(inst)
     return _enqueue(stage, "reset_usd", res)
 
 
 # ── propagate USD edits / time into the stage (carry an ordinal) ──────────────
-def update_from_usd_time(stage, ordinal: int, time_code: float) -> None:
+def update_from_usd_time(stage, ordinal: int, time: float) -> None:
     """Advance time and propagate time-sampled attribute changes (blocking).
 
-    ``time_code`` is in **seconds** (converted via the stage's
-    ``timeCodesPerSecond``, like the C ``time`` parameter). Wraps the C entry
-    point ``ovstage_population_apply_usd_time``.
+    ``time`` is in **seconds** (converted via the stage's
+    ``timeCodesPerSecond``, like the C ``time`` parameter);
+    :data:`DEFAULT_TIME` advances to
+    USD's default time code. Wraps the C entry point
+    ``ovstage_population_apply_usd_time``.
+
+    Every in-scope time-sampled property is overwritten, whether or not
+    ``time`` differs from the previous call — re-applying the same time is
+    not a no-op. This holds for every domain, and equally when ``time`` is
+    :data:`DEFAULT_TIME`.
+
+    Under the strict admission policy, use a newer ``ordinal`` than
+    earlier overlapping writes, including :func:`apply_usd_changes` on the same
+    stage. Equal ordinals require the writes to be disjoint.
     """
-    update_from_usd_time_async(stage, ordinal, time_code).wait()
+    update_from_usd_time_async(stage, ordinal, time).wait()
 
 
-def update_from_usd_time_async(stage, ordinal: int, time_code: float) -> Operation:
+def update_from_usd_time_async(stage, ordinal: int, time: float) -> Operation:
     """Advance time and propagate time-sampled changes (asynchronous). See :func:`update_from_usd_time`."""
     lib, inst = _require(stage)
-    res = lib.ovstage_population_apply_usd_time(inst, check_ordinal(ordinal), float(time_code))
+    res = lib.ovstage_population_apply_usd_time(inst, check_ordinal(ordinal), float(time))
     return _enqueue(stage, "update_from_usd_time", res)
 
 
-def apply_usd_changes(stage, ordinal: int = 1) -> None:
-    """Propagate USD edits accumulated since the last call into the stage (blocking)."""
+def apply_usd_changes(stage, ordinal: int) -> None:
+    """Propagate USD edits accumulated since the last call into the stage (blocking).
+
+    ``ordinal`` is required and chosen by the caller. Under the strict
+    admission policy, use a newer ordinal than earlier overlapping writes,
+    including the initial open and :func:`update_from_usd_time` on the same
+    stage. Equal ordinals require the writes to be disjoint.
+    """
     apply_usd_changes_async(stage, ordinal).wait()
 
 
-def apply_usd_changes_async(stage, ordinal: int = 1) -> Operation:
-    """Propagate USD edits accumulated since the last call into the stage (asynchronous)."""
+def apply_usd_changes_async(stage, ordinal: int) -> Operation:
+    """Propagate accumulated USD edits asynchronously. See :func:`apply_usd_changes`."""
     lib, inst = _require(stage)
     res = lib.ovstage_population_apply_usd_changes(inst, check_ordinal(ordinal))
     return _enqueue(stage, "apply_usd_changes", res)
@@ -509,7 +612,12 @@ def register_usd_schemas(paths) -> None:
     :param paths: one path, or an iterable of paths. Each is either a USD plugin
         descriptor (``plugInfo.json``) or a directory containing one. A
         descriptor's ``Includes`` are followed, so a single entry can bring in a
-        whole tree of schema families.
+        whole tree of schema families. Symbolic links (and directory junctions
+        on Windows) are followed, but a linked descriptor's relative ``Root``,
+        ``ResourcePath`` and ``Includes`` resolve beside the link, not beside
+        its target. Link the directory holding a descriptor, or link the
+        descriptor together with the files it refers to; otherwise the call
+        returns normally but the definitions those paths lead to never resolve.
     :raises OvstageError: if a path names no readable descriptor, or the call
         came too late to take effect.
 

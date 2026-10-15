@@ -22,7 +22,13 @@ import pathlib
 import numpy as np
 
 import ovstage
-from ovstage import Filter, FilterOp, OrdinalRange, OvstageError, PopulationDomain, Predicate, instancing, population
+# [snippet:query-filter-imports]
+from ovstage import Filter, FilterOp, Predicate
+# [/snippet:query-filter-imports]
+from ovstage import OrdinalRange
+# [snippet:instancing-imports]
+from ovstage import ErrorCode, OvstageError, PopulationDomain, instancing, population
+# [/snippet:instancing-imports]
 # [/snippet:setup]
 
 # A small scene shipped next to this file: /World/Group with two meshes (the
@@ -83,6 +89,117 @@ def main() -> int:
                                   tensors=np.array([5, 3], dtype=np.int32), is_array=False).wait()
         stage.advance_write_floor(ordinal=2).wait()
 
+        # [snippet:query-prim-exists]
+        # Match the exact path, not a prefix that could include other prims.
+        prim_filter = Filter([Predicate("usd-path", FilterOp.IN, ["/World/Anchor"])])
+        with stage.query(filter=prim_filter) as query:
+            query.wait()
+            prim_exists = query.result().total_prim_count != 0
+        print("/World/Anchor exists:", prim_exists)
+        # /World/Anchor exists: True
+        # [/snippet:query-prim-exists]
+
+        # [snippet:query-attribute-exists]
+        # Both conditions must match: this path AND presence of this attribute.
+        attribute_filter = Filter([
+            Predicate("usd-path", FilterOp.IN, ["/World/Anchor"]),
+            Predicate("example:count", FilterOp.HAS),
+        ])
+        with stage.query(filter=attribute_filter) as query:
+            query.wait()
+            attribute_exists = query.result().total_prim_count != 0
+        print("/World/Anchor has example:count:", attribute_exists)
+        # /World/Anchor has example:count: True
+        # [/snippet:query-attribute-exists]
+
+        # [snippet:query-type-subtree]
+        # Separate predicates must all match.
+        mesh_filter = Filter([
+            Predicate("usd-prim-type", FilterOp.IN, ["Mesh"]),
+            Predicate("usd-path", FilterOp.PREFIX, ["/World/Group/"]),
+        ])
+        with stage.query(filter=mesh_filter) as query:
+            query.wait()
+            mesh_count = query.result().total_prim_count
+        print("Meshes below /World/Group:", mesh_count)
+        # Meshes below /World/Group: 2
+        # [/snippet:query-type-subtree]
+
+        # [snippet:query-direct-children]
+        # Match the parent exactly; grandchildren have a different parent.
+        children_filter = Filter([
+            Predicate("usd-parent", FilterOp.IN, ["/World/Group"]),
+        ])
+        with stage.query(filter=children_filter) as query:
+            query.wait()
+            child_count = query.result().total_prim_count
+        print("Direct children of /World/Group:", child_count)
+        # Direct children of /World/Group: 2
+        # [/snippet:query-direct-children]
+
+        # [snippet:query-required-attributes]
+        # Require both attributes, without comparing their values.
+        geometry_filter = Filter([
+            Predicate("points", FilterOp.HAS),
+            Predicate("faceVertexCounts", FilterOp.HAS),
+        ])
+        with stage.query(filter=geometry_filter) as query:
+            query.wait()
+            geometry_count = query.result().total_prim_count
+        print("Prims with points and faceVertexCounts:", geometry_count)
+        # Prims with points and faceVertexCounts: 2
+        # [/snippet:query-required-attributes]
+
+        # [snippet:query-matched-paths]
+        # Query the direct children, then read their current path identifiers.
+        children_filter = Filter([
+            Predicate("usd-parent", FilterOp.IN, ["/World/Group"]),
+        ])
+        path_attribute = paths.intern_token("usd-path")
+        matched_paths = []
+        with stage.query(filter=children_filter) as query:
+            query.wait()
+            with stage.read_attributes(query, [path_attribute], OrdinalRange.latest(2)) as read:
+                read.wait()
+                for group in read.groups():
+                    with group:  # Release every group after resolving its identifiers.
+                        path_ids = group.array(0)
+                        for i in range(group.prim_count):
+                            row = group.data_row_index(i) if group.has_data_index_map else i
+                            matched_paths.append(paths.path_to_string(int(path_ids[row])))
+        print("Matched paths:", " ".join(sorted(matched_paths)))
+        # Matched paths: /World/Group/Left /World/Group/Right
+        # [/snippet:query-matched-paths]
+
+        # [snippet:query-applied-schema]
+        # Select prims carrying this applied API schema.
+        schema_filter = Filter([Predicate("usd-schemas", FilterOp.CONTAINS, ["ShadowAPI"])])
+        with stage.query(filter=schema_filter) as query:
+            query.wait()
+            schema_count = query.result().total_prim_count
+        print("Prims with ShadowAPI:", schema_count)
+        # Prims with ShadowAPI: 1
+        # [/snippet:query-applied-schema]
+
+        # [snippet:query-list-schemas]
+        # Select one prim, then read its array of applied-schema token identifiers.
+        prim_filter = Filter([Predicate("usd-path", FilterOp.IN, ["/World/Group/Right"])])
+        schema_attribute = paths.intern_token("usd-schemas")
+        schema_names = []
+        with stage.query(filter=prim_filter) as query:
+            query.wait()
+            with stage.read_attributes(query, [schema_attribute], OrdinalRange.latest(2)) as read:
+                read.wait()
+                for group in read.groups():
+                    with group:
+                        # Array attributes return a separate tensor for each prim.
+                        for i in range(group.prim_count):
+                            for token in group.array(i):
+                                schema_names.append(paths.token_to_string(int(token)))
+        print("APIs on /World/Group/Right:", " ".join(sorted(schema_names)))
+        # APIs on /World/Group/Right: MaterialBindingAPI MeshSubdivision ShadowAPI
+        # [/snippet:query-list-schemas]
+
         # ---- 3. one filter query per supported predicate ----
         # [snippet:filter-predicates]
         # The support matrix is narrow: HAS works on any attribute; the value
@@ -139,28 +256,45 @@ def main() -> int:
 
         # ---- 5. map scene-graph instancing ----
         # [snippet:instancing-queries]
-        # Prototype-root names are synthesized by the runtime
-        # (/__Prototype_<id>), so enumerate them instead of hardcoding a name.
-        # The wrapper returns ordinary strings and releases the native
-        # refcounted path lists before returning.
         prototype_roots = instancing.get_prototype_roots(stage)
-        if not prototype_roots:
-            print("expected at least one prototype root")
-            return 1
-        all_prefixed = all(path.startswith("/__Prototype_") for path in prototype_roots)
-        prefix_status = "yes" if all_prefixed else "no"
-        print(f"prototype roots: {len(prototype_roots)} (all prefixed /__Prototype_: {prefix_status})")
+        print("prototype roots:", len(prototype_roots))
+        # prototype roots: 1
 
-        prototype_root = prototype_roots[0]
+        # Discover the generated prototype path from a known instance.
+        prototype_root = instancing.get_prototype_root(stage, "/World/InstanceA")
         instance_roots = sorted(instancing.get_instance_roots(stage, prototype_root))
-        print("instance roots of the prototype:", " ".join(instance_roots))
-
-        back_to_prototype = instancing.get_prototype_root(stage, "/World/InstanceA")
-        print(
-            "/World/InstanceA maps back to the same prototype root:",
-            "yes" if back_to_prototype == prototype_root else "no",
-        )
+        print("instance roots:", " ".join(instance_roots))
+        # instance roots: /World/InstanceA /World/InstanceB
         # [/snippet:instancing-queries]
+
+    # Use a separate scene to demonstrate instances inside other instances.
+    with ovstage.Stage("example.nested-instancing") as stage:
+        # [snippet:instancing-timing]
+        population.open_usd(stage, str(SCENE.with_name("nested.usda")),
+                            ordinal=1, domains=PopulationDomain.PHYSICS)
+        # open_usd() waits by default. Make its changes available for reads.
+        stage.advance_write_floor(ordinal=1).wait()
+        # [/snippet:instancing-timing]
+
+        # [snippet:instancing-nested]
+        leaf = instancing.get_prototype_root(stage, "/World/OuterSource/NestedLeaf")
+        print("\n".join(sorted(instancing.get_instance_roots(stage, leaf))))
+        # /World/OuterA/NestedLeaf
+        # /World/OuterSource/NestedLeaf
+        print(instancing.get_prototype_root(stage, "/World/OuterA/NestedLeaf") == leaf)
+        # True
+        # [/snippet:instancing-nested]
+
+        # [snippet:instancing-not-found]
+        try:
+            instancing.get_prototype_root(stage, "/World/LeafSource")
+        except OvstageError as error:
+            # LeafSource is an ordinary prim, even though instances reference it.
+            if error.code != ErrorCode.NOT_FOUND:
+                raise
+            print("not an instance root")
+            # not an instance root
+        # [/snippet:instancing-not-found]
 
     return 0
 
@@ -172,7 +306,7 @@ def _run_filter_query(stage, paths, predicate, prim_type, end_ordinal, label):
     No path list is supplied -- the stage finds the prims, evaluating against
     the latest committed state at execution time, and the matched prims are
     enumerated by reading the reserved usd-prim-type column over the query
-    (every populated prim carries it). The `with` block releases the query
+    (the typed prims in this example carry it). The `with` block releases the query
     handle.
     """
     with stage.query(filter=Filter([predicate])) as query:

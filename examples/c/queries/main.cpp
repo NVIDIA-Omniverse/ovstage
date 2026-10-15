@@ -121,7 +121,7 @@ static std::vector<std::string> groupPaths(path_dictionary_instance_t* dict, con
 }
 // [/snippet:resolve-matched-prims]
 
-// Read one column over a query as a latest read at endOrdinal and return the result as-is:
+// Read one column over a query as a snapshot at endOrdinal and return the result as-is:
 // each matched prim's path and its raw column cell. The tensor row for logical prim i honors
 // data.index_map when present (gather/reorder/dedup) and is the identity otherwise, in which
 // case one tensor row backs each covered prim.
@@ -310,6 +310,291 @@ int main(int argc, char** argv)
     enq = ovstage_advance_write_floor(stage, &floor2);
     waitOp(stage, enq, "advance_write_floor");
 
+    {
+        // [snippet:query-prim-exists-c]
+        // Match the exact path, not a prefix that could include other prims.
+        const ovx_string_t path = literal_to_ovx_string("/World/Anchor");
+        ovstage_predicate_t predicate{};
+        predicate.attribute.string = literal_to_ovx_string("usd-path");
+        predicate.op = OVSTAGE_FILTER_OP_IN;
+        predicate.values = &path;
+        predicate.value_count = 1;
+        ovstage_filter_t filter{};
+        filter.predicates = &predicate;
+        filter.count = 1;
+
+        // Wait for the query before inspecting its result.
+        ovstage_query_handle_t query = OVSTAGE_INVALID_QUERY_HANDLE;
+        waitOp(stage, ovstage_query(stage, &filter, nullptr, 0, &query), "query prim existence");
+        ovstage_query_result_t result{};
+        check(stage, ovstage_fetch_query_result(stage, query, OVSTAGE_TIMEOUT_INFINITE, &result),
+              "fetch_query_result");
+        const bool primExists = result.total_prim_count != 0;
+        std::printf("/World/Anchor exists: %s\n", primExists ? "True" : "False");
+        // /World/Anchor exists: True
+
+        // The result and query handle have separate lifetimes; release both.
+        check(stage, ovstage_release_query_result(stage, &result), "release_query_result");
+        waitOp(stage, ovstage_release_query(stage, query), "release_query");
+        // [/snippet:query-prim-exists-c]
+    }
+
+    {
+        // [snippet:query-attribute-exists-c]
+        // Both conditions must match: this path AND presence of this attribute.
+        const ovx_string_t path = literal_to_ovx_string("/World/Anchor");
+        ovstage_predicate_t predicates[2]{};
+        predicates[0].attribute.string = literal_to_ovx_string("usd-path");
+        predicates[0].op = OVSTAGE_FILTER_OP_IN;
+        predicates[0].values = &path;
+        predicates[0].value_count = 1;
+        predicates[1].attribute.string = literal_to_ovx_string("example:count");
+        predicates[1].op = OVSTAGE_FILTER_OP_HAS; // No comparison value is needed.
+        ovstage_filter_t filter{};
+        filter.predicates = predicates;
+        filter.count = 2;
+
+        ovstage_query_handle_t query = OVSTAGE_INVALID_QUERY_HANDLE;
+        waitOp(stage, ovstage_query(stage, &filter, nullptr, 0, &query), "query attribute existence");
+        ovstage_query_result_t result{};
+        check(stage, ovstage_fetch_query_result(stage, query, OVSTAGE_TIMEOUT_INFINITE, &result),
+              "fetch_query_result");
+        const bool attributeExists = result.total_prim_count != 0;
+        std::printf("/World/Anchor has example:count: %s\n", attributeExists ? "True" : "False");
+        // /World/Anchor has example:count: True
+
+        // Release the result and query even when no prim matched.
+        check(stage, ovstage_release_query_result(stage, &result), "release_query_result");
+        waitOp(stage, ovstage_release_query(stage, query), "release_query");
+        // [/snippet:query-attribute-exists-c]
+    }
+
+    {
+        // [snippet:query-type-subtree-c]
+        // Match Mesh prims below /World/Group; the trailing slash excludes the root.
+        const ovx_string_t type = literal_to_ovx_string("Mesh");
+        const ovx_string_t prefix = literal_to_ovx_string("/World/Group/");
+        ovstage_predicate_t predicates[2]{};
+        predicates[0].attribute.string = literal_to_ovx_string("usd-prim-type");
+        predicates[0].op = OVSTAGE_FILTER_OP_IN;
+        predicates[0].values = &type;
+        predicates[0].value_count = 1;
+        predicates[1].attribute.string = literal_to_ovx_string("usd-path");
+        predicates[1].op = OVSTAGE_FILTER_OP_PREFIX;
+        predicates[1].values = &prefix;
+        predicates[1].value_count = 1;
+        ovstage_filter_t filter{};
+        filter.predicates = predicates;
+        filter.count = 2;
+
+        // Wait, inspect the match count, and release the result and query.
+        ovstage_query_handle_t query = OVSTAGE_INVALID_QUERY_HANDLE;
+        waitOp(stage, ovstage_query(stage, &filter, nullptr, 0, &query), "query");
+        ovstage_query_result_t result{};
+        check(stage, ovstage_fetch_query_result(stage, query, OVSTAGE_TIMEOUT_INFINITE, &result),
+              "fetch_query_result");
+        std::printf("Meshes below /World/Group: %llu\n", static_cast<unsigned long long>(result.total_prim_count));
+        // Meshes below /World/Group: 2
+        check(stage, ovstage_release_query_result(stage, &result), "release_query_result");
+        waitOp(stage, ovstage_release_query(stage, query), "release_query");
+        // [/snippet:query-type-subtree-c]
+    }
+
+    {
+        // [snippet:query-direct-children-c]
+        // Match the parent exactly; grandchildren have a different parent.
+        const ovx_string_t parent = literal_to_ovx_string("/World/Group");
+        ovstage_predicate_t predicate{};
+        predicate.attribute.string = literal_to_ovx_string("usd-parent");
+        predicate.op = OVSTAGE_FILTER_OP_IN;
+        predicate.values = &parent;
+        predicate.value_count = 1;
+        ovstage_filter_t filter{};
+        filter.predicates = &predicate;
+        filter.count = 1;
+
+        // Wait, inspect the match count, and release the result and query.
+        ovstage_query_handle_t query = OVSTAGE_INVALID_QUERY_HANDLE;
+        waitOp(stage, ovstage_query(stage, &filter, nullptr, 0, &query), "query");
+        ovstage_query_result_t result{};
+        check(stage, ovstage_fetch_query_result(stage, query, OVSTAGE_TIMEOUT_INFINITE, &result),
+              "fetch_query_result");
+        std::printf("Direct children of /World/Group: %llu\n", static_cast<unsigned long long>(result.total_prim_count));
+        // Direct children of /World/Group: 2
+        check(stage, ovstage_release_query_result(stage, &result), "release_query_result");
+        waitOp(stage, ovstage_release_query(stage, query), "release_query");
+        // [/snippet:query-direct-children-c]
+    }
+
+    {
+        // [snippet:query-required-attributes-c]
+        // Separate HAS predicates require both attributes, regardless of their values.
+        ovstage_predicate_t predicates[2]{};
+        predicates[0].attribute.string = literal_to_ovx_string("points");
+        predicates[0].op = OVSTAGE_FILTER_OP_HAS;
+        predicates[1].attribute.string = literal_to_ovx_string("faceVertexCounts");
+        predicates[1].op = OVSTAGE_FILTER_OP_HAS;
+        ovstage_filter_t filter{};
+        filter.predicates = predicates;
+        filter.count = 2;
+
+        // Wait, inspect the match count, and release the result and query.
+        ovstage_query_handle_t query = OVSTAGE_INVALID_QUERY_HANDLE;
+        waitOp(stage, ovstage_query(stage, &filter, nullptr, 0, &query), "query");
+        ovstage_query_result_t result{};
+        check(stage, ovstage_fetch_query_result(stage, query, OVSTAGE_TIMEOUT_INFINITE, &result),
+              "fetch_query_result");
+        std::printf("Prims with points and faceVertexCounts: %llu\n", static_cast<unsigned long long>(result.total_prim_count));
+        // Prims with points and faceVertexCounts: 2
+        check(stage, ovstage_release_query_result(stage, &result), "release_query_result");
+        waitOp(stage, ovstage_release_query(stage, query), "release_query");
+        // [/snippet:query-required-attributes-c]
+    }
+
+    {
+        // [snippet:query-matched-paths-c]
+        // Query the direct children of /World/Group.
+        const ovx_string_t parent = literal_to_ovx_string("/World/Group");
+        ovstage_predicate_t predicate{};
+        predicate.attribute.string = literal_to_ovx_string("usd-parent");
+        predicate.op = OVSTAGE_FILTER_OP_IN;
+        predicate.values = &parent;
+        predicate.value_count = 1;
+        ovstage_filter_t filter{};
+        filter.predicates = &predicate;
+        filter.count = 1;
+        ovstage_query_handle_t query = OVSTAGE_INVALID_QUERY_HANDLE;
+        waitOp(stage, ovstage_query(stage, &filter, nullptr, 0, &query), "query paths");
+
+        // usd-path contains prim-path identifiers resolved through the stage dictionary.
+        const ovx_string_t name = literal_to_ovx_string("usd-path");
+        ovx_token_t pathAttribute = OVX_INVALID_TOKEN;
+        checkOvx(dict, path_dictionary_create_tokens_from_strings(dict, &name, 1, &pathAttribute),
+                 "intern usd-path");
+        ovstage_ordinal_range_t range{};
+        range.end_ordinal = 2; // No start ordinal: read current paths.
+        ovstage_read_handle_t read = OVSTAGE_INVALID_READ_HANDLE;
+        waitOp(stage, ovstage_read_attributes(stage, query, &pathAttribute, 1, range, &read), "read paths");
+
+        std::vector<std::string> matchedPaths;
+        for (;;)
+        {
+            ovstage_read_group_t group{};
+            const ovstage_api_status_t fetched =
+                ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group);
+            if (fetched == OVSTAGE_ERROR_END_OF_ITERATION)
+                break;
+            check(stage, fetched, "fetch_read_next");
+
+            const DLTensor& tensor = group.data.tensors[0];
+            const auto* pathIds = reinterpret_cast<const uint64_t*>(
+                static_cast<const uint8_t*>(tensor.data) + tensor.byte_offset);
+            for (uint32_t i = 0; i < group.prims.count; ++i)
+            {
+                const uint32_t row = group.data.index_map ? group.data.index_map[i] : i;
+                matchedPaths.push_back(resolvePath(dict, pathIds[row]));
+            }
+            check(stage, ovstage_release_group(stage, &group), "release_group");
+        }
+        waitOp(stage, ovstage_release_read(stage, read), "release_read");
+        waitOp(stage, ovstage_release_query(stage, query), "release_query");
+
+        std::sort(matchedPaths.begin(), matchedPaths.end());
+        std::printf("Matched paths:");
+        for (const std::string& path : matchedPaths)
+            std::printf(" %s", path.c_str());
+        std::printf("\n");
+        // Matched paths: /World/Group/Left /World/Group/Right
+        // [/snippet:query-matched-paths-c]
+    }
+
+    {
+        // [snippet:query-applied-schema-c]
+        // Select prims carrying this applied API schema.
+        const ovx_string_t schema = literal_to_ovx_string("ShadowAPI");
+        ovstage_predicate_t predicate{};
+        predicate.attribute.string = literal_to_ovx_string("usd-schemas");
+        predicate.op = OVSTAGE_FILTER_OP_CONTAINS;
+        predicate.values = &schema;
+        predicate.value_count = 1;
+        ovstage_filter_t filter{};
+        filter.predicates = &predicate;
+        filter.count = 1;
+
+        // Wait for the query before inspecting its result.
+        ovstage_query_handle_t query = OVSTAGE_INVALID_QUERY_HANDLE;
+        waitOp(stage, ovstage_query(stage, &filter, nullptr, 0, &query), "query applied schema");
+        ovstage_query_result_t result{};
+        check(stage, ovstage_fetch_query_result(stage, query, OVSTAGE_TIMEOUT_INFINITE, &result),
+              "fetch_query_result");
+        std::printf("Prims with ShadowAPI: %llu\n",
+                    static_cast<unsigned long long>(result.total_prim_count));
+                    // Prims with ShadowAPI: 1
+
+        // The result and query handle have separate lifetimes; release both.
+        check(stage, ovstage_release_query_result(stage, &result), "release_query_result");
+        waitOp(stage, ovstage_release_query(stage, query), "release_query");
+        // [/snippet:query-applied-schema-c]
+    }
+
+    {
+        // [snippet:query-list-schemas-c]
+        // Select the prim whose applied schemas we want to inspect.
+        const ovx_string_t primPath = literal_to_ovx_string("/World/Group/Right");
+        ovstage_predicate_t predicate{};
+        predicate.attribute.string = literal_to_ovx_string("usd-path");
+        predicate.op = OVSTAGE_FILTER_OP_IN;
+        predicate.values = &primPath;
+        predicate.value_count = 1;
+        ovstage_filter_t filter{};
+        filter.predicates = &predicate;
+        filter.count = 1;
+        ovstage_query_handle_t query = OVSTAGE_INVALID_QUERY_HANDLE;
+        waitOp(stage, ovstage_query(stage, &filter, nullptr, 0, &query), "query prim schemas");
+
+        // usd-schemas contains an array of token identifiers for each prim.
+        const ovx_string_t name = literal_to_ovx_string("usd-schemas");
+        ovx_token_t schemaAttribute = OVX_INVALID_TOKEN;
+        checkOvx(dict, path_dictionary_create_tokens_from_strings(dict, &name, 1, &schemaAttribute),
+                 "intern usd-schemas");
+        ovstage_ordinal_range_t range{};
+        range.end_ordinal = 2; // Snapshot at 2 (no start); use UINT64_MAX for current schemas.
+        ovstage_read_handle_t read = OVSTAGE_INVALID_READ_HANDLE;
+        waitOp(stage, ovstage_read_attributes(stage, query, &schemaAttribute, 1, range, &read), "read schemas");
+
+        std::vector<std::string> schemaNames;
+        for (;;)
+        {
+            ovstage_read_group_t group{};
+            const ovstage_api_status_t fetched =
+                ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group);
+            if (fetched == OVSTAGE_ERROR_END_OF_ITERATION)
+                break;
+            check(stage, fetched, "fetch_read_next");
+
+            // Array attributes return a separate tensor for each prim.
+            for (uint32_t i = 0; i < group.data.tensor_count; ++i)
+            {
+                const DLTensor& tensor = group.data.tensors[i];
+                const auto* tokens = reinterpret_cast<const ovx_token_t*>(
+                    static_cast<const uint8_t*>(tensor.data) + tensor.byte_offset);
+                for (int64_t j = 0; j < tensor.shape[0]; ++j)
+                    schemaNames.push_back(tokenName(dict, tokens[j]));
+            }
+            check(stage, ovstage_release_group(stage, &group), "release_group");
+        }
+        waitOp(stage, ovstage_release_read(stage, read), "release_read");
+        waitOp(stage, ovstage_release_query(stage, query), "release_query");
+
+        std::sort(schemaNames.begin(), schemaNames.end());
+        std::printf("APIs on /World/Group/Right:");
+        for (const std::string& schemaName : schemaNames)
+            std::printf(" %s", schemaName.c_str());
+        std::printf("\n");
+        // APIs on /World/Group/Right: MaterialBindingAPI MeshSubdivision ShadowAPI
+        // [/snippet:query-list-schemas-c]
+    }
+
     // ---- 3. one filter query per supported predicate ----
     // [snippet:filter-predicates]
     // The support matrix is narrow: HAS works on any attribute; the value operators only pair
@@ -385,10 +670,7 @@ int main(int argc, char** argv)
 
     // ---- 5. map scene-graph instancing ----
     // [snippet:instancing-queries-c]
-    // Prototype-root names are synthesized by the runtime (/__Prototype_<id>) and the id is NOT
-    // stable across runs: enumerate them, or match the /__Prototype_ prefix -- never hardcode
-    // one. Path lists returned by the instancing calls are fresh references the caller must
-    // release; the prim-path handles inside are dictionary-lifetime.
+    // Enumerate generated prototype paths; do not hard-code their names.
     ovx_primpath_list_t prototypeRoots = OVX_INVALID_PRIMPATH_LIST;
     status = ovstage_instancing_get_prototype_roots(stage, &prototypeRoots);
     check(stage, status, "get_prototype_roots");
@@ -398,11 +680,8 @@ int main(int argc, char** argv)
         std::fprintf(stderr, "expected at least one prototype root\n");
         return EXIT_FAILURE;
     }
-    bool allPrefixed = true;
-    for (const ovx_primpath_t handle : protoHandles)
-        allPrefixed = allPrefixed && resolvePath(dict, handle).rfind("/__Prototype_", 0) == 0;
-    std::printf("prototype roots: %llu (all prefixed /__Prototype_: %s)\n",
-                static_cast<unsigned long long>(protoHandles.size()), allPrefixed ? "yes" : "no");
+    std::printf("prototype roots: %llu\n", static_cast<unsigned long long>(protoHandles.size()));
+    // prototype roots: 1
 
     // One prototype -> its instance roots (both instanceable references).
     const ovx_primpath_t prototypeRoot = protoHandles[0];
@@ -414,6 +693,7 @@ int main(int argc, char** argv)
         instancePaths.push_back(resolvePath(dict, handle));
     std::sort(instancePaths.begin(), instancePaths.end());
     std::printf("instance roots of the prototype:");
+    // instance roots of the prototype: /World/InstanceA /World/InstanceB
     for (const std::string& p : instancePaths)
         std::printf(" %s", p.c_str());
     std::printf("\n");
@@ -429,20 +709,75 @@ int main(int argc, char** argv)
     check(stage, status, "get_prototype_root");
     std::printf("/World/InstanceA maps back to the same prototype root: %s\n",
                 backToPrototype == prototypeRoot ? "yes" : "no");
+    // /World/InstanceA maps back to the same prototype root: yes
+
+    // Lists own references; individual path handles need no release.
+    checkOvx(dict, path_dictionary_release_path_list_reference(dict, instanceRoots), "release instances");
+    checkOvx(dict, path_dictionary_release_path_list_reference(dict, prototypeRoots), "release prototypes");
     // [/snippet:instancing-queries-c]
 
     // Release every handle, then destroy: ovstage_destroy_instance requires all ops and handles
-    // released first. The instancing path lists carry a fresh reference the caller must release.
+    // released first. The instancing path lists were released above.
     enq = ovstage_release_query(stage, introQuery);
     waitOp(stage, enq, "release_query");
     enq = ovstage_release_query(stage, targetQuery);
     waitOp(stage, enq, "release_query");
     enq = ovstage_release_query(stage, sceneQuery);
     waitOp(stage, enq, "release_query");
-    path_dictionary_release_path_list_reference(dict, instanceRoots);
-    path_dictionary_release_path_list_reference(dict, prototypeRoots);
     path_dictionary_release_path_list_reference(dict, targetPaths);
     path_dictionary_release_path_list_reference(dict, scenePaths);
+    ovstage_destroy_instance(stage);
+
+    // Load the nested fixture into a separate stage so the examples above stay independent.
+    check(nullptr, ovstage_create_instance(&desc, &stage), "create nested stage");
+    dict = getPathDictionary(stage);
+    const std::string sceneFile(scenePath);
+    const auto slash = sceneFile.find_last_of("/\\");
+    const std::string nestedFile = (slash == std::string::npos ? "" : sceneFile.substr(0, slash + 1)) + "nested.usda";
+    // [snippet:instancing-timing-c]
+    const ovx_string_t nestedPath{ nestedFile.data(), nestedFile.size() };
+    waitPop(stage, ovstage_population_open_usd_from_file(
+        stage, nestedPath, 1, NAN, OVSTAGE_POPULATION_DOMAIN_PHYSICS), "populate nested scene");
+    // Wait for population, then advance the watermark before querying.
+    waitOp(stage, ovstage_advance_write_floor(stage, &floor1), "advance watermark");
+    // [/snippet:instancing-timing-c]
+
+    // [snippet:instancing-nested-c]
+    const ovx_string_t names[] = { literal_to_ovx_string("/World/OuterSource/NestedLeaf"),
+                                  literal_to_ovx_string("/World/OuterA/NestedLeaf") };
+    ovx_primpath_t nestedPaths[2];
+    checkOvx(dict, path_dictionary_create_paths_from_strings(dict, names, 2, nestedPaths), "intern paths");
+    ovx_primpath_t leaf = OVX_INVALID_PRIMPATH, nestedLeaf = OVX_INVALID_PRIMPATH;
+    check(stage, ovstage_instancing_get_prototype_root(stage, nestedPaths[0], &leaf), "leaf prototype");
+    ovx_primpath_list_t leafInstances = OVX_INVALID_PRIMPATH_LIST;
+    check(stage, ovstage_instancing_get_instance_roots(stage, leaf, &leafInstances), "leaf instances");
+    std::vector<std::string> leafPaths;
+    for (auto path : pathListHandles(dict, leafInstances))
+        leafPaths.push_back(resolvePath(dict, path));
+    std::sort(leafPaths.begin(), leafPaths.end());
+    for (const auto& path : leafPaths)
+        std::printf("%s\n", path.c_str());
+        // /World/OuterA/NestedLeaf
+        // /World/OuterSource/NestedLeaf
+    check(stage, ovstage_instancing_get_prototype_root(stage, nestedPaths[1], &nestedLeaf), "nested prototype");
+    std::printf("same leaf prototype: %s\n", nestedLeaf == leaf ? "yes" : "no");
+    // same leaf prototype: yes
+    checkOvx(dict, path_dictionary_release_path_list_reference(dict, leafInstances), "release leaf instances");
+    // [/snippet:instancing-nested-c]
+
+    // [snippet:instancing-not-found-c]
+    const ovx_string_t sourceName = literal_to_ovx_string("/World/LeafSource");
+    ovx_primpath_t source = OVX_INVALID_PRIMPATH, unusedPrototype = OVX_INVALID_PRIMPATH;
+    checkOvx(dict, path_dictionary_create_paths_from_strings(dict, &sourceName, 1, &source), "intern source");
+    status = ovstage_instancing_get_prototype_root(stage, source, &unusedPrototype);
+    if (status == OVSTAGE_ERROR_NOT_FOUND)
+    {
+        std::printf("not an instance root\n");
+        // not an instance root
+    }
+    else
+        check(stage, status, "get prototype");
+    // [/snippet:instancing-not-found-c]
     ovstage_destroy_instance(stage);
     return 0;
 }

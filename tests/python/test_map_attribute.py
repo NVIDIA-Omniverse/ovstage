@@ -1,10 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: LicenseRef-NvidiaProprietary
 #
-# Public ovstage map/unmap test: map_attribute reserves writable storage-side
-# buffers you fill directly (the zero-copy programming model), committed per group
-# via unmap_group or all at once by the final unmap. Covers an existing column and
-# a freshly-created one. CPU-only. The write-flavors example is the workflow tour.
+# Public ovstage map/unmap test: map_attribute prepares writable staging buffers
+# you fill directly. Commit each group via unmap_group, or commit remaining groups
+# in the final unmap. Covers existing and newly created columns. CPU-only.
+# The write-flavors example is the workflow tour.
 
 import numpy as np
 import pytest
@@ -49,11 +49,12 @@ def test_map_existing_and_fresh_column(stage):
             stage.advance_write_floor(ordinal=1).wait()
 
             # [snippet:map-unmap-cpu]
-            # map_attribute reserves storage-side buffers you fill directly. The
-            # mapped buffer is a WRITE-ONLY staging buffer for the session's ordinal
-            # (uninitialized, not a view of current values), so fill every element.
-            # Commit per group via unmap_group (streaming) or all at once when the
-            # session's with-block exits (the final unmap).
+            # map_attribute prepares writable staging buffers for the session's ordinal.
+            # Each buffer is WRITE-ONLY (uninitialized, not a view of current values),
+            # so fill every element.
+            # Commit per group via unmap_group (streaming), or commit remaining groups
+            # when the session's with-block exits (the final unmap).
+            # [snippet:dlpack-map-existing]
             fill = {0: 10.0, 1: 20.0}  # by list-relative prim index (A, B)
             with stage.map_attribute(query, existing, ordinal=2) as session:
                 session.wait()
@@ -64,9 +65,10 @@ def test_map_existing_and_fresh_column(stage):
                         buffer[row] = fill[group.prim_index(local)]
                     session.unmap_group(group).wait()  # streaming commit of this group
             stage.advance_write_floor(ordinal=2).wait()
+            # [/snippet:dlpack-map-existing]
 
             # A NEW column: the descriptor dtype (3-lane float32) defines it. No
-            # unmap_group this time — the final unmap commits everything.
+            # unmap_group this time — the final unmap commits the remaining groups.
             fill3 = {0: [1.0, 2.0, 3.0], 1: [4.0, 5.0, 6.0]}
             with stage.map_attribute(query, fresh, ordinal=3, dtype=FLOAT3) as session:
                 session.wait()
@@ -74,7 +76,7 @@ def test_map_existing_and_fresh_column(stage):
                     buffer = group.array(0)
                     for local in range(group.prim_count):
                         row = group.data_row_index(local) if group.has_data_index_map else local
-                        buffer[row * 3:row * 3 + 3] = fill3[group.prim_index(local)]
+                        buffer[row] = fill3[group.prim_index(local)]
             stage.advance_write_floor(ordinal=3).wait()
             # [/snippet:map-unmap-cpu]
 
@@ -129,3 +131,98 @@ def test_map_group_dlpack_readonly_view_rejects_write(stage):
         finally:
             stage.release_query(query).wait()
             paths.destroy_path_list(plist)
+
+
+@pytest.mark.parametrize("components,matrix", [(1, False), (3, False), (4, False),
+                                                (12, False), (16, False),
+                                                (4, True), (9, True), (16, True)])
+@pytest.mark.parametrize("array", [False, True])
+@pytest.mark.parametrize("streaming", [False, True])
+def test_read_map_share_typed_layout(stage, components, matrix, array, streaming):
+    from ovstage import AttributeSemantic, typed_tensor_to_write
+
+    semantic = AttributeSemantic.MATRIX if matrix else AttributeSemantic.NONE
+    side = int(components ** 0.5)
+    tail = (side, side) if matrix else (components,) if components > 1 else ()
+    with PathDictionary(stage) as paths:
+        # Deliberately reverse path order; compare via each group's prim mapping.
+        plist = paths.create_path_list_from_strings(["/Typed/B", "/Typed/A"])
+        query = stage.query_from_path_list(plist)
+        attr = paths.intern_token("typed-map")
+        dtype = DLDataType(code=DLDataTypeCode.kDLFloat, bits=64, lanes=components)
+        expected = {}
+        try:
+            with stage.map_attribute(query, attr, ordinal=1, dtype=dtype, semantic=semantic,
+                                     element_sizes=[0, 2] if array else None) as session:
+                session.wait()
+                for group in session.groups():
+                    for i in range(group.tensor_count):
+                        tensor = group.tensor(i)
+                        rows = (0 if i == 0 else 2) if array else 2
+                        assert tensor.dtype.lanes == 1
+                        assert tensor.shape_tuple == (rows, *tail)
+                        view = group.array(i)
+                        assert view.shape == tensor.shape_tuple and view.flags.writeable
+                        producer = group.dlpack(i)
+                        assert producer.shape == tensor.shape_tuple
+                        if view.size:
+                            assert np.from_dlpack(producer).shape == view.shape
+                            assert view.ctypes.data == tensor.data + tensor.byte_offset
+                        converted = typed_tensor_to_write(tensor)
+                        assert converted.data == tensor.data
+                        assert converted.dtype.lanes == components
+                        assert converted.shape_tuple == (rows,)
+                        view[:] = np.arange(view.size).reshape(view.shape) + 10 * (i + 1)
+                        if array:
+                            expected[group.prim_index(i)] = view.copy()
+                        else:
+                            for local in range(group.prim_count):
+                                expected[group.prim_index(local)] = view[group.data_row_index(local)].copy()
+                    if streaming:
+                        session.unmap_group(group).wait()
+                        with pytest.raises(RuntimeError):
+                            group.tensor(0)
+            stage.advance_write_floor(ordinal=1).wait()
+            read = stage.read_attributes(query, [attr], OrdinalRange.latest(1))
+            read.wait()
+            try:
+                seen = set()
+                for group in read.groups():
+                    with group:
+                        for local in range(group.prim_count):
+                            index = group.prim_index(local)
+                            row = group.data_row_index(local)
+                            value = group.array(row) if array else group.array(0)[row]
+                            np.testing.assert_array_equal(value, expected[index])
+                            assert not group.array(row if array else 0).flags.writeable
+                            seen.add(index)
+                assert seen == {0, 1}
+            finally:
+                read.release().wait()
+        finally:
+            stage.release_query(query).wait()
+            paths.destroy_path_list(plist)
+
+
+# [snippet:typed-write-adapter-outer-stride]
+@pytest.mark.parametrize("stride", [4, 8, 0])
+def test_typed_write_adapter_preserves_outer_stride(stride):
+    from ovstage import DLTensor, typed_tensor_to_write
+
+    backing = np.arange(16, dtype=np.float64)
+    values = np.lib.stride_tricks.as_strided(backing, shape=(2, 2, 2),
+        strides=(stride * backing.itemsize, 2 * backing.itemsize, backing.itemsize))
+    source = DLTensor.from_dlpack(values)
+    converted = typed_tensor_to_write(source)
+    assert converted.shape_tuple == (2,)
+    assert converted.dtype.lanes == 4
+    assert converted.strides[0] == stride // 4
+    assert converted.data == source.data
+    assert source.shape_tuple == (2, 2, 2) and source.dtype.lanes == 1
+    import ctypes
+    invalid_strides = (ctypes.c_int64 * 3)(stride, 3, 1)
+    source.strides = invalid_strides
+    with pytest.raises(ValueError, match="component axes"):
+        typed_tensor_to_write(source)
+
+# [/snippet:typed-write-adapter-outer-stride]

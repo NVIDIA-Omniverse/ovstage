@@ -43,13 +43,8 @@ def test_index_map_and_mask(stage):
             assert _values(stage, query, heat, 1, order) == [10.0, 20.0, 30.0, 40.0]
 
             # [snippet:sparse-index-map-and-mask]
-            # Two sparse forms, mutually exclusive per write. index_map is a GATHER:
-            # count selects how many of the query's prims are targeted (the first
-            # `count`, in query order) and index_map[i] picks the SOURCE tensor row
-            # for target i. A non-involutory 3-cycle proves the direction (gather reads
-            # source[index_map[i]] into target i; scatter would give a different result).
-            # mask is a bitmask over the `count` target rows: only set bits are written.
-            # Untouched prims keep their earlier value.
+            # index_map chooses source rows; mask chooses target prims.
+            # These are separate writes because the two options cannot be combined.
             stage.write_attribute(
                 query, heat, ordinal=2, tensors=np.array([111.0, 222.0, 333.0], np.float32),
                 is_array=False, index_map=[1, 2, 0],  # A<-row1(222), B<-row2(333), C<-row0(111)

@@ -95,6 +95,16 @@ def _write_float_columns(stage, prim_paths, columns, ordinal: int) -> None:
     stage.advance_write_floor(ordinal=ordinal).wait()
 
 
+def _prim_count(stage, prim_path: str) -> int:
+    with PathDictionary(stage) as paths:
+        path_list = paths.create_path_list_from_strings([prim_path])
+        try:
+            with stage.query_from_path_list(path_list) as query:
+                return stage.fetch_query_result(query).total_prim_count
+        finally:
+            paths.destroy_path_list(path_list)
+
+
 def _attribute_names(stage, prim_path: str) -> set[str]:
     with PathDictionary(stage) as paths:
         with stage.query(filter=Filter([Predicate("usd-path", FilterOp.IN, [prim_path])])) as query:
@@ -106,6 +116,22 @@ def _filtered_prim_count(stage, predicates) -> int:
     with stage.query(filter=Filter(predicates)) as query:
         query.wait()
         return query.result().total_prim_count
+
+
+def _retain_empty_destination(path):
+    path.write_text(
+        """#usda 1.0
+(
+    customLayerData = {
+        bool populateAllAuthoredAttributes = true
+    }
+)
+""",
+        encoding="utf-8",
+    )
+    owner = Stage("test.ovstage.population-export.destination-owner")
+    population.open_usd(owner, str(path), ordinal=1, domains=PopulationDomain.ALL)
+    return owner
 
 
 def test_export_local_transforms_with_defaults(stage, tmp_path):
@@ -212,30 +238,32 @@ def test_export_custom_attributes_preserving_names(stage, tmp_path):
         ordinal=1,
     )
     destination = tmp_path / "custom-properties.usda"
-    # [snippet:export-custom-attributes-to-usd]
-    report = population.export_to_usd_file(
-        stage,
-        str(destination),
-        ordinal=1,
-        attribute_rules=[
-            {
-                "source_attribute_name": "userProperties:*",
-                "source_attribute_name_match": population.OVSTAGE_POPULATION_EXPORT_NAME_MATCH_GLOB,
-                "flags": (
-                    population.OVSTAGE_POPULATION_EXPORT_RULE_INFER_CUSTOM_TYPE
-                    | population.OVSTAGE_POPULATION_EXPORT_RULE_REQUIRED
-                ),
-            }
-        ],
-    )
-    # [/snippet:export-custom-attributes-to-usd]
+    destination_owner = _retain_empty_destination(destination)
+    try:
+        # [snippet:export-custom-attributes-to-usd]
+        report = population.export_to_usd_layer(
+            stage,
+            str(destination),
+            ordinal=1,
+            attribute_rules=[
+                {
+                    "source_attribute_name": "userProperties:*",
+                    "source_attribute_name_match": population.OVSTAGE_POPULATION_EXPORT_NAME_MATCH_GLOB,
+                    "flags": (
+                        population.OVSTAGE_POPULATION_EXPORT_RULE_INFER_CUSTOM_TYPE
+                        | population.OVSTAGE_POPULATION_EXPORT_RULE_REQUIRED
+                    ),
+                }
+            ],
+        )
+        # [/snippet:export-custom-attributes-to-usd]
 
-    assert report["prims_exported"] == 4
-    assert report["attributes_exported"] == 4
-    assert report["custom_attributes_inferred"] == 2
-    text = destination.read_text(encoding="utf-8")
-    assert "float userProperties:temperature" in text
-    assert "float userProperties:confidence" in text
+        assert report["prims_exported"] == 4
+        assert report["attributes_exported"] == 4
+        assert report["custom_attributes_inferred"] == 2
+        population.apply_usd_changes(destination_owner, ordinal=2)
+    finally:
+        destination_owner.destroy()
 
 
 def test_export_runtime_attribute_to_usd_schema_name(stage, tmp_path):
@@ -265,28 +293,32 @@ def test_export_runtime_attribute_to_usd_schema_name(stage, tmp_path):
     stage.advance_write_floor(ordinal=1).wait()
 
     destination = tmp_path / "schema-mapping.usda"
-    # [snippet:export-schema-attribute-to-usd]
-    report = population.export_to_usd_file(
-        stage,
-        str(destination),
-        ordinal=1,
-        layer_mode=population.OVSTAGE_POPULATION_EXPORT_LAYER_MODE_DEF,
-        attribute_rules=[
-            {
-                "source_attribute_name": "solver:collisionRadius",
-                "destination_attribute_name": "radius",
-                "usd_type_name": "double",
-                "flags": population.OVSTAGE_POPULATION_EXPORT_RULE_REQUIRED,
-            }
-        ],
-    )
-    # [/snippet:export-schema-attribute-to-usd]
+    destination_owner = _retain_empty_destination(destination)
+    try:
+        # [snippet:export-schema-attribute-to-usd]
+        report = population.export_to_usd_layer(
+            stage,
+            str(destination),
+            ordinal=1,
+            layer_mode=population.OVSTAGE_POPULATION_EXPORT_LAYER_MODE_DEF,
+            attribute_rules=[
+                {
+                    "source_attribute_name": "solver:collisionRadius",
+                    "destination_attribute_name": "radius",
+                    "usd_type_name": "double",
+                    "flags": population.OVSTAGE_POPULATION_EXPORT_RULE_REQUIRED,
+                }
+            ],
+        )
+        # [/snippet:export-schema-attribute-to-usd]
 
-    assert report["attributes_exported"] == 1
-    text = destination.read_text(encoding="utf-8")
-    assert 'def Sphere "Ball"' in text
-    assert "double radius = 2.5" in text
-    assert "solver:collisionRadius" not in text
+        assert report["attributes_exported"] == 1
+        population.apply_usd_changes(destination_owner, ordinal=2)
+        exported_names = _attribute_names(destination_owner, "/World/Ball")
+        assert "radius" in exported_names
+        assert "solver:collisionRadius" not in exported_names
+    finally:
+        destination_owner.destroy()
 
 
 def test_export_homogeneous_mesh_subtree(stage, tmp_path):
@@ -320,7 +352,7 @@ def Xform "World"
 }
 """
     population.open_usd_from_string(
-        stage, source, ordinal=1, time_code=math.nan, domains=PopulationDomain.ALL
+        stage, source, ordinal=1, time=math.nan, domains=PopulationDomain.ALL
     )
     stage.advance_write_floor(1).wait()
 
@@ -334,7 +366,8 @@ def Xform "World"
     )
     # [/snippet:export-homogeneous-mesh-subtree]
 
-    assert report["api_schemas_applied"] == 3
+    # The physics schemas, and the MaterialBindingAPI RENDERING gives each mesh.
+    assert report["api_schemas_applied"] == 5
     assert report["attributes_exported"] >= 8
 
     with Stage("test.ovstage.population-export.mesh-result") as destination_owner:
@@ -342,7 +375,7 @@ def Xform "World"
             destination_owner,
             str(destination),
             ordinal=1,
-            time_code=math.nan,
+            time=math.nan,
             domains=PopulationDomain.ALL,
         )
         destination_owner.advance_write_floor(1).wait()
@@ -396,13 +429,17 @@ def test_export_changed_property_overlay(stage, tmp_path):
 
     rule = {"source_attribute_name": "temperature", "usd_type_name": "float"}
     base_destination = tmp_path / "base-properties.usda"
-    base_report = population.export_to_usd_file(
-        stage,
-        str(base_destination),
-        ordinal=1,
-        attribute_rules=[rule],
-    )
-    assert base_report["attributes_exported"] == 3
+    base_owner = _retain_empty_destination(base_destination)
+    try:
+        base_report = population.export_to_usd_layer(
+            stage,
+            str(base_destination),
+            ordinal=1,
+            attribute_rules=[rule],
+        )
+        assert base_report["attributes_exported"] == 3
+    finally:
+        base_owner.destroy()
 
     _write_float_columns(
         stage,
@@ -411,23 +448,25 @@ def test_export_changed_property_overlay(stage, tmp_path):
         ordinal=2,
     )
     changed_destination = tmp_path / "changed-properties.usda"
-    # [snippet:export-changed-properties-to-usd]
-    report = population.export_to_usd_file(
-        stage,
-        str(changed_destination),
-        ordinal=2,
-        selection=population.OVSTAGE_POPULATION_EXPORT_SELECTION_CHANGED_PROPERTIES_SINCE_ORDINAL,
-        since_ordinal=1,
-        attribute_rules=[rule],
-    )
-    # [/snippet:export-changed-properties-to-usd]
+    changed_owner = _retain_empty_destination(changed_destination)
+    try:
+        # [snippet:export-changed-properties-to-usd]
+        report = population.export_to_usd_layer(
+            stage,
+            str(changed_destination),
+            ordinal=2,
+            selection=population.OVSTAGE_POPULATION_EXPORT_SELECTION_CHANGED_PROPERTIES_SINCE_ORDINAL,
+            since_ordinal=1,
+            attribute_rules=[rule],
+        )
+        # [/snippet:export-changed-properties-to-usd]
 
-    assert report["attributes_exported"] == 1
-    assert report["prims_exported"] == 1
-    changed_text = changed_destination.read_text(encoding="utf-8")
-    assert 'over "SensorB"' in changed_text
-    assert "SensorA" not in changed_text
-    assert "SensorC" not in changed_text
+        assert report["attributes_exported"] == 1
+        assert report["prims_exported"] == 1
+        population.apply_usd_changes(changed_owner, ordinal=2)
+        assert _prim_count(changed_owner, "/World/SensorB") == 1
+    finally:
+        changed_owner.destroy()
 
 
 def test_async_export_completes_with_report(stage, tmp_path):
@@ -453,15 +492,8 @@ def test_population_export_package_surface_and_descriptor_layout(ovstage_mod):
     assert population.ExportProjection.SCHEMA_DECLARED == 1
     assert callable(population.export_typed_hierarchy_to_usd_file)
     assert callable(population.export_typed_hierarchy_to_usd_file_async)
-    for removed in (
-        "export_to_usd_layer",
-        "export_to_usd_layer_async",
-        "export_to_usd_stage",
-        "export_to_usd_stage_async",
-        "export_typed_hierarchy_to_usd_layer",
-        "export_typed_hierarchy_to_usd_layer_async",
-    ):
-        assert not hasattr(population, removed)
+    assert callable(population.export_typed_hierarchy_to_usd_layer)
+    assert callable(population.export_typed_hierarchy_to_usd_layer_async)
 
     desc, _ = _descriptor()
     assert desc.struct_size == ctypes.sizeof(_bindings.ovstage_population_export_desc_t)
@@ -527,29 +559,48 @@ def test_population_export_package_rejects_unknown_rule_enum_values(options):
 def test_population_export_package_typed_helpers_compile_the_same_policies(monkeypatch):
     calls = []
 
+    def capture_layer_sync(stage, layer, ordinal, **options):
+        calls.append(("layer-sync", options))
+        return {"attributes_exported": 1}
+
     def capture_file_sync(stage, identifier, ordinal, **options):
         calls.append(("file-sync", options))
         return {"attributes_exported": 2}
 
+    expected_layer_async = object()
     expected_file_async = object()
+
+    def capture_layer_async(stage, layer, ordinal, **options):
+        calls.append(("layer-async", options))
+        return expected_layer_async
 
     def capture_file_async(stage, identifier, ordinal, **options):
         calls.append(("file-async", options))
         return expected_file_async
 
+    monkeypatch.setattr(_export, "export_to_usd_layer", capture_layer_sync)
     monkeypatch.setattr(_export, "export_to_usd_file", capture_file_sync)
+    monkeypatch.setattr(_export, "export_to_usd_layer_async", capture_layer_async)
     monkeypatch.setattr(_export, "export_to_usd_file_async", capture_file_async)
 
+    report = population.export_typed_hierarchy_to_usd_layer(
+        _Stage(), "anon:layer", "/", 7, include_custom_namespaces=["simulation"]
+    )
     file_report = population.export_typed_hierarchy_to_usd_file(
         _Stage(), "scene.usda", "/", 7, include_custom_namespaces=["simulation"]
+    )
+    layer_operation = population.export_typed_hierarchy_to_usd_layer_async(
+        _Stage(), "anon:layer", "/", 7, include_custom_namespaces=["simulation"]
     )
     file_operation = population.export_typed_hierarchy_to_usd_file_async(
         _Stage(), "scene.usda", "/", 7, include_custom_namespaces=["simulation"]
     )
 
+    assert report["attributes_exported"] == 1
     assert file_report["attributes_exported"] == 2
+    assert layer_operation is expected_layer_async
     assert file_operation is expected_file_async
-    assert [kind for kind, _ in calls] == ["file-sync", "file-async"]
+    assert [kind for kind, _ in calls] == ["layer-sync", "file-sync", "layer-async", "file-async"]
     for _, options in calls:
         assert options["source_api_schema_policy"] == population.SourceApiSchemaPolicy.APPLY_RECORDED
         assert options["projection"] == population.ExportProjection.SCHEMA_DECLARED
@@ -582,7 +633,7 @@ def Xform "World"
         stage,
         scene,
         ordinal=1,
-        time_code=math.nan,
+        time=math.nan,
         domains=PopulationDomain.ALL,
     )
     stage.advance_write_floor(1).wait()
@@ -597,7 +648,8 @@ def Xform "World"
     # [/snippet:export-typed-hierarchy-to-usd-file]
 
     assert report["prims_exported"] >= 3
-    assert report["api_schemas_applied"] == 2
+    # Each prim's physics schema, and the MaterialBindingAPI RENDERING gives it.
+    assert report["api_schemas_applied"] == 4
     assert report["attributes_exported"] >= 4
     text = output.read_text(encoding="utf-8")
     assert 'def Sphere "Ball"' in text

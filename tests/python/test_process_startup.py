@@ -29,7 +29,12 @@ import sys
 import pytest
 
 _CHILD = """import ovstage
+from ovstage._src import bindings
 
+assert bindings._loader._version is None
+build_info = ovstage.get_build_info()
+assert build_info.build_string and build_info.git_hash
+assert bindings._loader._version is None
 ovstage.library_version()
 with ovstage.Stage("test.ovstage.launch"):
     pass
@@ -59,3 +64,49 @@ def test_usable_when_an_argument_spans_multiple_lines(tmp_path):
     script = tmp_path / "startup_child.py"
     script.write_text(_CHILD)
     _assert_started(_run([str(script), "embedded\nnewline"]))
+
+_ORDINAL_POLICY_CHILD = """import ovstage
+
+policy_name = {policy_name!r}
+policy = getattr(ovstage.OrdinalAdmissionPolicy, policy_name) if policy_name is not None else None
+config = ovstage.StageConfig(runtime_default_ordinal_admission_policy=policy) if policy is not None else None
+resolved = (
+    ovstage.OrdinalAdmissionPolicy.NONDECREASING
+    if policy in (None, ovstage.OrdinalAdmissionPolicy.DEFAULT)
+    else policy
+)
+conflicting = (
+    ovstage.OrdinalAdmissionPolicy.NONDECREASING
+    if resolved == ovstage.OrdinalAdmissionPolicy.FLOOR_ONLY
+    else ovstage.OrdinalAdmissionPolicy.FLOOR_ONLY
+)
+with ovstage.Stage("startup.first-policy", config=config) as first:
+    original = first.config
+    assert original.runtime_default_ordinal_admission_policy == policy
+    for requested in (None, ovstage.OrdinalAdmissionPolicy.DEFAULT, resolved):
+        inherited_config = ovstage.StageConfig(runtime_default_ordinal_admission_policy=requested)
+        with ovstage.Stage("startup.inherited-policy", config=inherited_config) as inherited:
+            assert inherited.config == original
+    try:
+        with ovstage.Stage(
+            "startup.conflicting-policy",
+            config=ovstage.StageConfig(runtime_default_ordinal_admission_policy=conflicting),
+        ):
+            raise AssertionError("a conflicting process policy was accepted")
+    except ovstage.OvstageError as error:
+        assert error.code == ovstage.ErrorCode.INVALID_ARGUMENT
+    assert first.config == original
+
+with ovstage.Stage(
+    "startup.policy-after-release",
+    config=ovstage.StageConfig(runtime_default_ordinal_admission_policy=conflicting),
+) as reset:
+    assert reset.config.runtime_default_ordinal_admission_policy == conflicting
+print("STARTUP_OK")
+"""
+
+
+@pytest.mark.usefixtures("ovstage_mod")
+@pytest.mark.parametrize("policy_name", [None, "DEFAULT", "FLOOR_ONLY"])
+def test_ordinal_admission_selection_in_a_fresh_process(policy_name):
+    _assert_started(_run(["-c", _ORDINAL_POLICY_CHILD.format(policy_name=policy_name)]))

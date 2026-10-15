@@ -117,10 +117,11 @@ static bool tryCheck(ovstage_instance_t* stage, ovstage_api_status_t status, con
 // [snippet:producer-tick]
 // One producer value tick: write this tick's subset at ordinal `tick` (several
 // writes may land at the same ordinal), then seal the tick by advancing the
-// GLOBAL write floor to it. The floor is the producer's publish signal -- data
-// at ordinals <= floor is sealed and will never change -- and the application
-// owns the ordinal counter; the store never mints ordinals. Returns false on
-// a rejected write (reported by tryWaitOp) so the caller decides the policy.
+// GLOBAL write floor to it. The floor tells the consumer which ordinals are
+// sealed against further writes. Values may still change at newer ordinals.
+// The application owns the ordinal counter; the store never mints ordinals.
+// Returns false on a rejected write (reported by tryWaitOp) so the caller decides
+// the policy.
 static bool producerValueTick(const Example& ex, int tick)
 {
     const int* sensors = kTickSubsets[tick - 1];
@@ -187,9 +188,9 @@ static bool runProducerTick(const Example& ex, int tick)
 // [snippet:poll-write-floor]
 // The consumer's poll: ask for the GLOBAL write floor (attribute = zero token
 // + empty string), fetch the ordinal, release the ordinal-query handle. This
-// is the producer's publish cursor -- everything at or below the floor is
-// sealed for range membership. Payload storage is latest-only, so a later
-// change to the same selected (attribute, path) can make the fixed-range read
+// tells the consumer which ordinals are sealed for change-range queries.
+// Payload storage is latest-only, so a later change to the same selected
+// (attribute, path) can make the fixed-range read
 // return OUT_OF_RANGE.
 // Returns false on a failed op (already reported) so the caller decides the
 // policy; the handle is released either way.

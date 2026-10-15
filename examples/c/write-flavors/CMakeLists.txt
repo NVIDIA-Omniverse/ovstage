@@ -30,3 +30,12 @@ target_link_libraries(write-flavors PRIVATE ovstage::ovstage)
 
 # Setup runtime dependencies (rpath / loader-path guidance)
 ovstage_setup_runtime(write-flavors)
+
+# Optional CUDA companion; the main example remains CPU-only.
+option(OVSTAGE_EXAMPLE_CUDA "Build the CUDA tensor-write example" OFF)
+if(OVSTAGE_EXAMPLE_CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    add_executable(cuda-ingest cuda_ingest.cpp)
+    target_link_libraries(cuda-ingest PRIVATE ovstage::ovstage CUDA::cudart)
+    ovstage_setup_runtime(cuda-ingest)
+endif()

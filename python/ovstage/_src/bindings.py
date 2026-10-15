@@ -34,10 +34,11 @@ import ctypes
 import operator
 import os
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Optional
 
-from .dlpack import DLDataType, DLManagedTensorVersioned, DLTensor
+from .dlpack import DLDataType, DLDevice, DLManagedTensorVersioned, DLTensor
 
 # ── Scalar typedefs (all 64-bit handles / ordinals) ────────────────────────
 ovstage_api_status_t = ctypes.c_uint32
@@ -77,17 +78,12 @@ def check_timeout(timeout: int) -> int:
         value = operator.index(timeout)
     except TypeError:
         raise TypeError(
-            "timeout must be an int (nanoseconds; 0 polls, TIMEOUT_INFINITE "
-            f"blocks), got {type(timeout).__name__}"
+            "timeout must be an int (nanoseconds; 0 polls, TIMEOUT_INFINITE " f"blocks), got {type(timeout).__name__}"
         ) from None
     if value < 0:
-        raise ValueError(
-            f"timeout must be non-negative, got {timeout}; pass TIMEOUT_INFINITE to block"
-        )
+        raise ValueError(f"timeout must be non-negative, got {timeout}; pass TIMEOUT_INFINITE to block")
     if value > OVSTAGE_TIMEOUT_INFINITE:
-        raise ValueError(
-            f"timeout must fit in uint64 (<= {OVSTAGE_TIMEOUT_INFINITE}), got {timeout}"
-        )
+        raise ValueError(f"timeout must fit in uint64 (<= {OVSTAGE_TIMEOUT_INFINITE}), got {timeout}")
     return value
 
 
@@ -133,6 +129,12 @@ OVSTAGE_CONFIG_KEY_TYPE_STRING = 4
 OVSTAGE_CONFIG_KEY_TYPE_BLOB = 5
 
 OVSTAGE_CONFIG_RUNTIME_DEFAULT_HIERARCHY_COMPUTATION_MODEL = 0
+OVSTAGE_CONFIG_RUNTIME_DEFAULT_ORDINAL_ADMISSION_POLICY = 1
+
+OVSTAGE_ORDINAL_ADMISSION_DEFAULT = 0
+OVSTAGE_ORDINAL_ADMISSION_FLOOR_ONLY = 1
+OVSTAGE_ORDINAL_ADMISSION_NONDECREASING = 2
+OVSTAGE_ORDINAL_ADMISSION_STRICTLY_INCREASING = 3
 
 OVSTAGE_HIERARCHY_PARENT = 0
 OVSTAGE_HIERARCHY_CHILDREN = 1
@@ -188,6 +190,90 @@ class ovx_string_t(ctypes.Structure):
 
     def __repr__(self) -> str:
         return f"ovx_string_t({str(self)!r})"
+
+
+@dataclass(frozen=True)
+class BuildInfo:
+    """Build information embedded in the loaded OVStage native library.
+
+    Future versions may append fields while preserving the meaning and order
+    of existing fields. ``build_string`` has the form
+    ``version+branch.build_number.git_hash.build_location`` and starts with the
+    OVStage semantic version. Native string views are decoded and copied, so
+    every string stored in this Python object is owned by Python.
+
+    :ivar int struct_size: Size of the native build-information structure.
+    :ivar int build_number: Numeric CI or local build number.
+    :ivar str build_string: Full version, build number, and source revision.
+    :ivar str git_branch: Source branch used for the build.
+    :ivar str git_hash: Source revision used for the build.
+    :ivar str build_location: Build-system or location identifier.
+    """
+
+    struct_size: int
+    build_number: int
+    build_string: str
+    git_branch: str
+    git_hash: str
+    build_location: str
+
+
+class _ovstage_build_info_header_t(ctypes.Structure):
+    _fields_ = [("struct_size", ctypes.c_uint32)]
+
+
+class _ovstage_build_info_t(ctypes.Structure):
+    _fields_ = [
+        ("struct_size", ctypes.c_uint32),
+        ("build_number", ctypes.c_uint32),
+        ("build_string", ovx_string_t),
+        ("git_branch", ovx_string_t),
+        ("git_hash", ovx_string_t),
+        ("build_location", ovx_string_t),
+    ]
+
+
+def _read_build_info(lib: ctypes.CDLL) -> BuildInfo:
+    info_ptr = lib.ovstage_get_build_info()
+    if not info_ptr:
+        raise RuntimeError("ovstage_get_build_info returned null")
+    info_header = ctypes.cast(info_ptr, ctypes.POINTER(_ovstage_build_info_header_t)).contents
+    expected_size = ctypes.sizeof(_ovstage_build_info_t)
+    if info_header.struct_size < expected_size:
+        raise RuntimeError(
+            f"ovstage_get_build_info returned struct_size={info_header.struct_size}, "
+            f"smaller than the required {expected_size}"
+        )
+    info = info_ptr.contents
+
+    def decode(name: str, value: ovx_string_t) -> str:
+        if value.ptr is None:
+            if value.length:
+                raise RuntimeError(f"ovstage_get_build_info returned null {name} with non-zero length {value.length}")
+            return ""
+        try:
+            return ctypes.string_at(value.ptr, value.length).decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise RuntimeError(f"ovstage_get_build_info returned invalid UTF-8 in {name}") from exc
+
+    return BuildInfo(
+        struct_size=info.struct_size,
+        build_number=info.build_number,
+        build_string=decode("build_string", info.build_string),
+        git_branch=decode("git_branch", info.git_branch),
+        git_hash=decode("git_hash", info.git_hash),
+        build_location=decode("build_location", info.build_location),
+    )
+
+
+def _validate_build_info_version(build_info: BuildInfo, version: tuple[int, int, int]) -> None:
+    runtime_version = ".".join(str(component) for component in version)
+    embedded_version = build_info.build_string.partition("+")[0]
+    if embedded_version != runtime_version:
+        raise RuntimeError(
+            f"ovstage build information mismatch: API reports {runtime_version} "
+            f"but the embedded build string reports {embedded_version}"
+        )
 
 
 # ovstage_log_callback_t: void(ovstage_log_severity_t severity, double timestamp,
@@ -331,6 +417,15 @@ class ovstage_op_wait_result_t(ctypes.Structure):
     ]
 
 
+class ovstage_clone_result_t(ctypes.Structure):
+    _fields_ = [
+        ("ordinal", ovstage_ordinal_t),
+        ("target_count", ctypes.c_size_t),
+        ("source_prim_count", ctypes.c_size_t),
+        ("prims_cloned", ctypes.c_size_t),
+    ]
+
+
 # ── ovstage_population result structs (ovstage_population.h) ─────────────────
 # The population USD bridge has its own async enqueue/wait model, parallel to
 # but distinct from the data-plane one above: every mutating call returns an
@@ -448,6 +543,46 @@ class ovstage_cuda_sync_t(ctypes.Structure):
     ]
 
 
+class ovstage_placement_t(ctypes.Structure):
+    # Mirrors C ovstage_placement_t (experimental; in
+    # ovstage_api/experimental/ovstage_placement_extension.h)
+    # { DLDevice device; uintptr_t stream; uintptr_t availability_event; }.
+    # Destination residency for a whole operation, as opposed to ovstage_cuda_sync_t,
+    # which describes the source handoff. A NULL pointer means unspecified (follow
+    # the source tensor). ``stream`` is the stream the operation's device work is
+    # issued on: 0 or 1 = the legacy default stream, 2 = the per-thread default
+    # stream, otherwise a specific cudaStream_t.
+    # ``availability_event`` is a caller-owned cudaEvent_t ovstage records into once
+    # the data the op makes available is safe to dereference (0 = none) -- the one
+    # outbound field here, where ovstage_cuda_sync_t's wait_event is inbound. On a
+    # read it is deliberately not the op's own completion: the read op completes
+    # first, and the event also covers device work the caller never issued.
+    #
+    # The C struct carries no size or version field, so this mirror must match it
+    # field for field: a missing trailing member means the native side reads past
+    # the end of what Python allocated. A change to it bumps
+    # OVSTAGE_PLACEMENT_EXTENSION_VERSION.
+    _fields_ = [
+        ("device", DLDevice),
+        ("stream", ctypes.c_size_t),
+        ("availability_event", ctypes.c_size_t),
+    ]
+
+
+def make_placement(device_type: int, device_id: int, stream: int, availability_event: int) -> ovstage_placement_t:
+    """Build an ovstage_placement_t. C callers use OVSTAGE_PLACEMENT_INIT.
+
+    Every field is required rather than defaulted: the struct has no size field,
+    so each member this helper forgets to set is a member the native side still
+    reads.
+    """
+    placement = ovstage_placement_t()
+    placement.device = DLDevice(device_type, device_id)
+    placement.stream = stream
+    placement.availability_event = availability_event
+    return placement
+
+
 class ovstage_data_t(ctypes.Structure):
     _fields_ = [
         ("tensors", ctypes.POINTER(DLTensor)),
@@ -489,8 +624,8 @@ class ovstage_read_group_t(ctypes.Structure):
         ("attribute", ovx_token_t),
         ("ordinal", ovstage_ordinal_t),
         ("is_delete", ctypes.c_bool),
-        ("is_array", ctypes.c_bool),         # ragged/CSR source column (vs fixed scalar)
-        ("semantic", ctypes.c_int),          # ovstage_attribute_semantic_t (recovered from column metadata)
+        ("is_array", ctypes.c_bool),  # ragged/CSR source column (vs fixed scalar)
+        ("semantic", ctypes.c_int),  # ovstage_attribute_semantic_t (recovered from column metadata)
         ("prims", ovstage_prim_group_t),
         ("data", ovstage_data_t),
         ("meta", ovstage_attribute_meta_t),
@@ -556,6 +691,7 @@ class ovstage_write_data_t(ctypes.Structure):
         # See AttributeSemantic in ovstage.types for details.
         ("semantic", ctypes.c_int),
         ("is_array", ctypes.c_bool),
+        ("attribute_mode", ctypes.c_int),  # ovstage_attribute_mode_t (REJECT=0 / FORCE)
     ]
 
 
@@ -569,12 +705,13 @@ class ovstage_attribute_write_t(ctypes.Structure):
 class ovstage_map_desc_t(ctypes.Structure):
     _fields_ = [
         ("attribute", ovx_string_or_token_t),
-        ("dtype", DLDataType),               # element type used only when creating a new column (else ignored)
+        ("dtype", DLDataType),  # element type used only when creating a new column (else ignored)
         # ovstage_attribute_semantic_t (NONE=0). Records semantic metadata when
         # the map creates a column; see ovstage_write_data_t
         # for the geometric vs. ID semantic split.
         ("semantic", ctypes.c_int),
-        ("prim_mode", ctypes.c_int),         # ovstage_prim_mode_t (UPSERT / INSERT)
+        ("prim_mode", ctypes.c_int),  # ovstage_prim_mode_t (UPSERT / INSERT)
+        ("attribute_mode", ctypes.c_int),  # ovstage_attribute_mode_t (REJECT=0 / FORCE)
     ]
 
 
@@ -611,8 +748,12 @@ _FN_create_tokens_from_strings = ctypes.CFUNCTYPE(
     _PD_RES, _PD_CTX, ctypes.POINTER(ovx_string_t), ctypes.c_size_t, ctypes.POINTER(ovx_token_t)
 )
 _FN_create_paths_from_tokens = ctypes.CFUNCTYPE(
-    _PD_RES, _PD_CTX, ctypes.POINTER(ovx_token_t), ctypes.POINTER(ctypes.c_size_t),
-    ctypes.c_size_t, ctypes.POINTER(ovx_primpath_t),
+    _PD_RES,
+    _PD_CTX,
+    ctypes.POINTER(ovx_token_t),
+    ctypes.POINTER(ctypes.c_size_t),
+    ctypes.c_size_t,
+    ctypes.POINTER(ovx_primpath_t),
 )
 _FN_create_paths_from_strings = ctypes.CFUNCTYPE(
     _PD_RES, _PD_CTX, ctypes.POINTER(ovx_string_t), ctypes.c_size_t, ctypes.POINTER(ovx_primpath_t)
@@ -629,17 +770,27 @@ _FN_get_strings_from_tokens = ctypes.CFUNCTYPE(
     _PD_RES, _PD_CTX, ctypes.POINTER(ovx_token_t), ctypes.c_size_t, ctypes.POINTER(ovx_string_t)
 )
 _FN_get_tokens_from_paths = ctypes.CFUNCTYPE(
-    _PD_RES, _PD_CTX, ctypes.POINTER(ovx_primpath_t), ctypes.c_size_t,
-    ctypes.POINTER(ovx_token_t), ctypes.c_size_t,
-    ctypes.POINTER(ctypes.POINTER(ovx_token_t)), ctypes.POINTER(ctypes.c_size_t),
+    _PD_RES,
+    _PD_CTX,
+    ctypes.POINTER(ovx_primpath_t),
+    ctypes.c_size_t,
+    ctypes.POINTER(ovx_token_t),
+    ctypes.c_size_t,
+    ctypes.POINTER(ctypes.POINTER(ovx_token_t)),
+    ctypes.POINTER(ctypes.c_size_t),
     ctypes.POINTER(ctypes.c_size_t),
 )
 _FN_get_num_paths_from_path_list = ctypes.CFUNCTYPE(
     _PD_RES, _PD_CTX, ovx_primpath_list_t, ctypes.POINTER(ctypes.c_size_t)
 )
 _FN_get_paths_from_path_list = ctypes.CFUNCTYPE(
-    _PD_RES, _PD_CTX, ovx_primpath_list_t, ctypes.c_size_t, ctypes.c_size_t,
-    ctypes.POINTER(ovx_primpath_t), ctypes.POINTER(ctypes.c_size_t),
+    _PD_RES,
+    _PD_CTX,
+    ovx_primpath_list_t,
+    ctypes.c_size_t,
+    ctypes.c_size_t,
+    ctypes.POINTER(ovx_primpath_t),
+    ctypes.POINTER(ctypes.c_size_t),
 )
 _FN_release_error = ctypes.CFUNCTYPE(None, _PD_CTX, ovx_string_t)
 
@@ -691,51 +842,107 @@ _CFT = ctypes.CFUNCTYPE
 class ovstage_vtable_t(ctypes.Structure):
     _fields_ = [
         # Op tracking
-        ("wait_op", _CFT(_ERR, _CTX, ovstage_op_id_t, ovstage_timeout_ns_t,
-                         ctypes.POINTER(ovstage_op_wait_result_t))),
+        ("wait_op", _CFT(_ERR, _CTX, ovstage_op_id_t, ovstage_timeout_ns_t, ctypes.POINTER(ovstage_op_wait_result_t))),
         ("release_op", _CFT(_ERR, _CTX, ovstage_op_id_t)),
         # Write-floor advance
         ("advance_write_floor", _CFT(_ENQ, _CTX, ctypes.POINTER(ovstage_write_floor_desc_t))),
         # Ordinal queries
         ("get_oldest_preserved_ordinal", _CFT(_ENQ, _CTX, ctypes.POINTER(ovstage_ordinal_query_handle_t))),
-        ("get_attribute_write_floor", _CFT(_ENQ, _CTX, ovx_string_or_token_t,
-                                           ctypes.POINTER(ovstage_ordinal_query_handle_t))),
-        ("fetch_ordinal", _CFT(_ERR, _CTX, ovstage_ordinal_query_handle_t, ovstage_timeout_ns_t,
-                               ctypes.POINTER(ovstage_ordinal_t))),
+        (
+            "get_attribute_write_floor",
+            _CFT(_ENQ, _CTX, ovx_string_or_token_t, ctypes.POINTER(ovstage_ordinal_query_handle_t)),
+        ),
+        (
+            "fetch_ordinal",
+            _CFT(_ERR, _CTX, ovstage_ordinal_query_handle_t, ovstage_timeout_ns_t, ctypes.POINTER(ovstage_ordinal_t)),
+        ),
         ("release_ordinal_query", _CFT(_ENQ, _CTX, ovstage_ordinal_query_handle_t)),
         # Query
-        ("query", _CFT(_ENQ, _CTX, ctypes.POINTER(ovstage_filter_t), ctypes.POINTER(ovx_token_t),
-                       ctypes.c_size_t, ctypes.POINTER(ovstage_query_handle_t))),
-        ("query_from_path_list", _CFT(_ERR, _CTX, ovx_primpath_list_t,
-                                      ctypes.POINTER(ovstage_query_handle_t))),
-        ("fetch_query_result", _CFT(_ERR, _CTX, ovstage_query_handle_t, ovstage_timeout_ns_t,
-                                    ctypes.POINTER(ovstage_query_result_t))),
+        (
+            "query",
+            _CFT(
+                _ENQ,
+                _CTX,
+                ctypes.POINTER(ovstage_filter_t),
+                ctypes.POINTER(ovx_token_t),
+                ctypes.c_size_t,
+                ctypes.POINTER(ovstage_query_handle_t),
+            ),
+        ),
+        ("query_from_path_list", _CFT(_ERR, _CTX, ovx_primpath_list_t, ctypes.POINTER(ovstage_query_handle_t))),
+        (
+            "fetch_query_result",
+            _CFT(_ERR, _CTX, ovstage_query_handle_t, ovstage_timeout_ns_t, ctypes.POINTER(ovstage_query_result_t)),
+        ),
         ("release_query_result", _CFT(_ERR, _CTX, ctypes.POINTER(ovstage_query_result_t))),
         ("release_query", _CFT(_ENQ, _CTX, ovstage_query_handle_t)),
         # Read
-        ("read_attributes", _CFT(_ENQ, _CTX, ovstage_query_handle_t, ctypes.POINTER(ovx_token_t),
-                                 ctypes.c_size_t, ovstage_ordinal_range_t,
-                                 ctypes.POINTER(ovstage_read_handle_t))),
-        ("fetch_read_next", _CFT(_ERR, _CTX, ovstage_read_handle_t, ovstage_timeout_ns_t,
-                                 ctypes.POINTER(ovstage_read_group_t))),
+        (
+            "read_attributes",
+            _CFT(
+                _ENQ,
+                _CTX,
+                ovstage_query_handle_t,
+                ctypes.POINTER(ovx_token_t),
+                ctypes.c_size_t,
+                ovstage_ordinal_range_t,
+                ctypes.POINTER(ovstage_read_handle_t),
+            ),
+        ),
+        (
+            "fetch_read_next",
+            _CFT(_ERR, _CTX, ovstage_read_handle_t, ovstage_timeout_ns_t, ctypes.POINTER(ovstage_read_group_t)),
+        ),
         ("release_group", _CFT(_ERR, _CTX, ctypes.POINTER(ovstage_read_group_t))),
         ("release_read", _CFT(_ENQ, _CTX, ovstage_read_handle_t)),
         # Write (copy-in)
-        ("write_attribute", _CFT(_ENQ, _CTX, ovstage_query_handle_t, ovx_string_or_token_t,
-                                 ovstage_ordinal_t, ovstage_write_data_t, ctypes.c_int)),
-        # Map / unmap (zero-copy write)
-        ("map_attribute", _CFT(_ENQ, _CTX, ovstage_query_handle_t, ctypes.POINTER(ovstage_map_desc_t),
-                               ovstage_ordinal_t, ctypes.POINTER(ctypes.c_size_t),
-                               ctypes.c_size_t, ctypes.POINTER(ovstage_map_handle_t))),
-        ("fetch_map_next", _CFT(_ERR, _CTX, ovstage_map_handle_t, ovstage_timeout_ns_t,
-                                ctypes.POINTER(ovstage_map_group_t))),
-        ("unmap_group", _CFT(_ENQ, _CTX, ovstage_map_handle_t, ctypes.POINTER(ovstage_map_group_t),
-                             ovstage_cuda_sync_t)),
+        (
+            "write_attribute",
+            _CFT(
+                _ENQ,
+                _CTX,
+                ovstage_query_handle_t,
+                ovx_string_or_token_t,
+                ovstage_ordinal_t,
+                ovstage_write_data_t,
+                ctypes.c_int,
+            ),
+        ),
+        # Map / unmap (writable staging buffers)
+        (
+            "map_attribute",
+            _CFT(
+                _ENQ,
+                _CTX,
+                ovstage_query_handle_t,
+                ctypes.POINTER(ovstage_map_desc_t),
+                ovstage_ordinal_t,
+                ctypes.POINTER(ctypes.c_size_t),
+                ctypes.c_size_t,
+                ctypes.POINTER(ovstage_map_handle_t),
+            ),
+        ),
+        (
+            "fetch_map_next",
+            _CFT(_ERR, _CTX, ovstage_map_handle_t, ovstage_timeout_ns_t, ctypes.POINTER(ovstage_map_group_t)),
+        ),
+        (
+            "unmap_group",
+            _CFT(_ENQ, _CTX, ovstage_map_handle_t, ctypes.POINTER(ovstage_map_group_t), ovstage_cuda_sync_t),
+        ),
         ("unmap_attribute", _CFT(_ENQ, _CTX, ovstage_map_handle_t, ovstage_cuda_sync_t)),
         # Structural
-        ("delete_attributes", _CFT(_ENQ, _CTX, ovstage_query_handle_t,
-                                   ctypes.POINTER(ovx_string_or_token_t), ctypes.c_size_t,
-                                   ovstage_ordinal_t)),
+        (
+            "delete_attributes",
+            _CFT(
+                _ENQ,
+                _CTX,
+                ovstage_query_handle_t,
+                ctypes.POINTER(ovx_string_or_token_t),
+                ctypes.c_size_t,
+                ovstage_ordinal_t,
+            ),
+        ),
         # Diagnostics
         ("get_version", _CFT(None, _CTX, _U32P, _U32P, _U32P)),
         ("get_error_string", _CFT(ctypes.c_char_p, _CTX, ovstage_api_status_t)),
@@ -743,15 +950,109 @@ class ovstage_vtable_t(ctypes.Structure):
         # Resources
         ("get_path_dictionary", _CFT(path_dictionary_instance_p, _CTX)),
         # Batched write
-        ("write_attributes", _CFT(_ENQ, _CTX, ovstage_query_handle_t,
-                                   ctypes.POINTER(ovstage_attribute_write_t), ctypes.c_size_t,
-                                   ovstage_ordinal_t, ctypes.c_int)),
+        (
+            "write_attributes",
+            _CFT(
+                _ENQ,
+                _CTX,
+                ovstage_query_handle_t,
+                ctypes.POINTER(ovstage_attribute_write_t),
+                ctypes.c_size_t,
+                ovstage_ordinal_t,
+                ctypes.c_int,
+            ),
+        ),
         # Extensions
         ("query_extension", _CFT(_ERR, _CTX, ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p))),
     ]
 
 
 ovstage_vtable_p = ctypes.POINTER(ovstage_vtable_t)
+
+
+# ── Device-placement extension ("ovstage.placement"), experimental ──────────
+# Not a vtable slot: reached through query_extension, so the vtable above keeps
+# its released layout and an older library reports NOT_FOUND instead of being
+# called through a slot it does not have. Field order must match
+# ovstage_placement_extension_v1_t in
+# ovstage_api/experimental/ovstage_placement_extension.h exactly.
+class ovstage_extension_header_t(ctypes.Structure):
+    """``ovstage_extension_header_t``: begins every extension table."""
+
+    _fields_ = [("struct_size", ctypes.c_uint32), ("version", ctypes.c_uint32)]
+
+
+OVSTAGE_PLACEMENT_EXTENSION_NAME = b"ovstage.placement"
+# Accepted by exact match only; see _placement_extension.
+OVSTAGE_PLACEMENT_EXTENSION_VERSION = 1
+
+
+class ovstage_placement_extension_v1_t(ctypes.Structure):
+    """``ovstage_placement_extension_v1_t``: placed write, map and read."""
+
+    _fields_ = [
+        ("header", ovstage_extension_header_t),
+        (
+            "write_attribute_on_device",
+            _CFT(
+                _ENQ,
+                _CTX,
+                ovstage_query_handle_t,
+                ovx_string_or_token_t,
+                ovstage_ordinal_t,
+                ovstage_write_data_t,
+                ctypes.c_int,
+                ctypes.POINTER(ovstage_placement_t),
+            ),
+        ),
+        (
+            "write_attributes_on_device",
+            _CFT(
+                _ENQ,
+                _CTX,
+                ovstage_query_handle_t,
+                ctypes.POINTER(ovstage_attribute_write_t),
+                ctypes.c_size_t,
+                ovstage_ordinal_t,
+                ctypes.c_int,
+                ctypes.POINTER(ovstage_placement_t),
+            ),
+        ),
+        # Unlike the two write entries, which take the placement last, this one
+        # takes it *before* out_map_handle -- that is the C signature.
+        (
+            "map_attribute_on_device",
+            _CFT(
+                _ENQ,
+                _CTX,
+                ovstage_query_handle_t,
+                ctypes.POINTER(ovstage_map_desc_t),
+                ovstage_ordinal_t,
+                ctypes.POINTER(ctypes.c_size_t),
+                ctypes.c_size_t,
+                ctypes.POINTER(ovstage_placement_t),
+                ctypes.POINTER(ovstage_map_handle_t),
+            ),
+        ),
+        # The placed read, like the placed map, takes the placement *before* its
+        # out-handle. Unlike the placed write and map it is permissive: a column
+        # that is not current on the named device is made available there rather
+        # than the read failing, so there is no device-residency status to mirror
+        # here.
+        (
+            "read_attributes_on_device",
+            _CFT(
+                _ENQ,
+                _CTX,
+                ovstage_query_handle_t,
+                ctypes.POINTER(ovx_token_t),
+                ctypes.c_size_t,
+                ovstage_ordinal_range_t,
+                ctypes.POINTER(ovstage_placement_t),
+                ctypes.POINTER(ovstage_read_handle_t),
+            ),
+        ),
+    ]
 
 # Real layout for the instance bundle declared field-less above. ovstage_population_*
 # and the lifecycle entry points take a pointer to this struct; the data-plane
@@ -765,6 +1066,34 @@ ovstage_instance_t._fields_ = [
 # _InstanceApi can be driven by the same ``ovstage_<slot>`` names the call sites
 # already use.
 _VTABLE_SLOT_BY_SYMBOL = {"ovstage_" + name: name for (name, _ctype) in ovstage_vtable_t._fields_}
+# The placed operations keep their ovstage_* names but resolve through the
+# placement extension rather than a vtable slot; see _InstanceApi.
+_PLACEMENT_ENTRY_BY_SYMBOL = {
+    "ovstage_" + name: name for (name, _ctype) in ovstage_placement_extension_v1_t._fields_ if name != "header"
+}
+
+
+def _placement_extension(bundle) -> Optional[ovstage_placement_extension_v1_t]:
+    """Return the instance's placement table, or ``None`` when it has none.
+
+    Mirrors ovstage_query_placement_extension(): only exactly
+    OVSTAGE_PLACEMENT_EXTENSION_VERSION is accepted, since another version is
+    incompatible by definition, and a table smaller than the struct defined here
+    is treated as absent, since its trailing fields would be read past its end.
+    """
+    table = ctypes.c_void_p()
+    status = bundle.vtable.contents.query_extension(
+        bundle.context, OVSTAGE_PLACEMENT_EXTENSION_NAME, ctypes.byref(table)
+    )
+    if status != OVSTAGE_OK or not table.value:
+        return None
+    ext = ctypes.cast(table, ctypes.POINTER(ovstage_placement_extension_v1_t)).contents
+    if (
+        ext.header.version != OVSTAGE_PLACEMENT_EXTENSION_VERSION
+        or ext.header.struct_size < ctypes.sizeof(ovstage_placement_extension_v1_t)
+    ):
+        return None
+    return ext
 
 
 class _InstanceApi:
@@ -786,6 +1115,9 @@ class _InstanceApi:
     def __getattr__(self, name: str):
         slot = _VTABLE_SLOT_BY_SYMBOL.get(name)
         if slot is None:
+            entry = _PLACEMENT_ENTRY_BY_SYMBOL.get(name)
+            if entry is not None:
+                return self._placement_dispatch(name, entry)
             return getattr(self._lib, name)  # flat symbol
 
         def _dispatch(instance_ptr, *args):
@@ -796,6 +1128,31 @@ class _InstanceApi:
             bundle = instance_ptr.contents
             fn = getattr(bundle.vtable.contents, slot)
             return fn(bundle.context, *args)
+
+        _dispatch.__name__ = name
+        return _dispatch
+
+    def _placement_dispatch(self, name: str, entry: str):
+        """Dispatch a placed operation through the instance's placement extension.
+
+        Like the C wrappers, an instance without the extension gets a rejected
+        enqueue (NOT_FOUND, invalid op id) rather than a call through a missing
+        function, so the caller's usual status handling reports it.
+        """
+
+        def _dispatch(instance_ptr, *args):
+            if not instance_ptr:
+                if self._invalid_instance_error is not None:
+                    raise self._invalid_instance_error(name)
+                raise RuntimeError(f"{name} called with a null ovstage instance")
+            bundle = instance_ptr.contents
+            ext = _placement_extension(bundle)
+            if ext is None:
+                rejected = ovstage_enqueue_result_t()
+                rejected.status = OVSTAGE_ERROR_NOT_FOUND
+                rejected.op_index = OVSTAGE_INVALID_OP_ID
+                return rejected
+            return getattr(ext, entry)(bundle.context, *args)
 
         _dispatch.__name__ = name
         return _dispatch
@@ -864,6 +1221,7 @@ class _LibraryLoader:
     def __init__(self):
         self._lib: Optional[ctypes.CDLL] = None
         self._version: Optional[tuple] = None
+        self._build_info: Optional[BuildInfo] = None
         self._dll_dir_cookies: list = []  # keep os.add_dll_directory handles alive (Windows)
 
     @property
@@ -875,12 +1233,30 @@ class _LibraryLoader:
         return self._version
 
     def load(self) -> ctypes.CDLL:
+        lib = self.open_loader()
+        if self._version is None:
+            version = _probe_version(lib)
+            if self._build_info is not None:
+                _validate_build_info_version(self._build_info, version)
+            self._version = version
+        return lib
+
+    def open_loader(self) -> ctypes.CDLL:
+        """Open only the public loader, without initializing the runtime."""
         if self._lib is None:
             lib = self._open()
             _configure_prototypes(lib)
-            self._version = _probe_version(lib)
+            build_info = _read_build_info(lib) if hasattr(lib, "ovstage_get_build_info") else None
             self._lib = lib
+            self._build_info = build_info
         return self._lib
+
+    def get_build_info(self) -> BuildInfo:
+        lib = self.open_loader()
+        _require(lib, "ovstage_get_build_info")
+        if self._build_info is None:
+            raise RuntimeError("ovstage loader did not provide build information")
+        return self._build_info
 
     def _open(self) -> ctypes.CDLL:
         candidates = ovstage_loader_candidate_dirs()
@@ -971,8 +1347,14 @@ def _configure_prototypes(lib: ctypes.CDLL) -> None:
     # The entry points remain absent from the top-level Python API.
     lib.ovstage_initialize.argtypes = [ctypes.POINTER(ovstage_config_t)]
     lib.ovstage_initialize.restype = err
+    lib.ovstage_get_config.argtypes = [inst, ctypes.POINTER(ovstage_config_t)]
+    lib.ovstage_get_config.restype = err
     lib.ovstage_shutdown.argtypes = []
     lib.ovstage_shutdown.restype = err
+
+    if hasattr(lib, "ovstage_get_build_info"):
+        lib.ovstage_get_build_info.argtypes = []
+        lib.ovstage_get_build_info.restype = ctypes.POINTER(_ovstage_build_info_t)
 
     # Instance lifecycle (the only flat ovstage_* data-plane entry points). The
     # bundle ovstage_create_instance returns drives the vtable for everything else.
@@ -986,9 +1368,23 @@ def _configure_prototypes(lib: ctypes.CDLL) -> None:
     # via the vtable ``wait_op`` / ``release_op``.
     if hasattr(lib, "ovstage_clone"):
         lib.ovstage_clone.argtypes = [
-            inst, ovx_string_t, ctypes.POINTER(ovx_string_t), ctypes.c_size_t, ovstage_ordinal_t
+            inst,
+            ovx_string_t,
+            ctypes.POINTER(ovx_string_t),
+            ctypes.c_size_t,
+            ovstage_ordinal_t,
         ]
         lib.ovstage_clone.restype = ovstage_enqueue_result_t
+    # The clone's completion report is per-op state fetched by op id (no handle),
+    # alive until the op is released through the vtable ``release_op``.
+    if hasattr(lib, "ovstage_fetch_clone_result"):
+        lib.ovstage_fetch_clone_result.argtypes = [
+            inst,
+            ovstage_op_id_t,
+            ovstage_timeout_ns_t,
+            ctypes.POINTER(ovstage_clone_result_t),
+        ]
+        lib.ovstage_fetch_clone_result.restype = err
 
     # Hierarchy: flat data-plane entry points. Lookup/compute enqueue normal
     # ovstage ops and are observed through the vtable wait_op/release_op path.
@@ -1081,26 +1477,63 @@ def _configure_prototypes(lib: ctypes.CDLL) -> None:
     pop_enq = ovstage_population_enqueue_result_t
     ref_handle = ovstage_population_usd_reference_handle_t
     if hasattr(lib, "ovstage_population_open_usd_from_file"):
-        lib.ovstage_population_open_usd_from_file.argtypes = [inst, ovx_string_t, ovstage_ordinal_t,
-                                                              ctypes.c_double, ctypes.c_uint32]
+        lib.ovstage_population_open_usd_from_file.argtypes = [
+            inst,
+            ovx_string_t,
+            ovstage_ordinal_t,
+            ctypes.c_double,
+            ctypes.c_uint32,
+        ]
         lib.ovstage_population_open_usd_from_file.restype = pop_enq
-        lib.ovstage_population_open_usd_from_string.argtypes = [inst, ovx_string_t, ovstage_ordinal_t,
-                                                                ctypes.c_double, ctypes.c_uint32]
+        lib.ovstage_population_open_usd_from_string.argtypes = [
+            inst,
+            ovx_string_t,
+            ovstage_ordinal_t,
+            ctypes.c_double,
+            ctypes.c_uint32,
+        ]
         lib.ovstage_population_open_usd_from_string.restype = pop_enq
     if all(hasattr(lib, name) for name in POPULATION_DESC_ENTRY_POINTS):
         pop_desc = ctypes.POINTER(ovstage_population_desc_t)
-        lib.ovstage_population_open_usd_from_file_with_desc.argtypes = [inst, ovx_string_t, ovstage_ordinal_t,
-                                                                        ctypes.c_double, pop_desc, ctypes.c_size_t]
+        lib.ovstage_population_open_usd_from_file_with_desc.argtypes = [
+            inst,
+            ovx_string_t,
+            ovstage_ordinal_t,
+            ctypes.c_double,
+            pop_desc,
+            ctypes.c_size_t,
+        ]
         lib.ovstage_population_open_usd_from_file_with_desc.restype = pop_enq
-        lib.ovstage_population_open_usd_from_string_with_desc.argtypes = [inst, ovx_string_t, ovstage_ordinal_t,
-                                                                          ctypes.c_double, pop_desc, ctypes.c_size_t]
+        lib.ovstage_population_open_usd_from_string_with_desc.argtypes = [
+            inst,
+            ovx_string_t,
+            ovstage_ordinal_t,
+            ctypes.c_double,
+            pop_desc,
+            ctypes.c_size_t,
+        ]
         lib.ovstage_population_open_usd_from_string_with_desc.restype = pop_enq
+    # Independently optional: absence must not disable the older desc-taking opens.
+    if hasattr(lib, "ovstage_population_repopulate_usd_with_desc"):
+        lib.ovstage_population_repopulate_usd_with_desc.argtypes = [
+            inst, ovstage_ordinal_t, ctypes.c_double,
+            ctypes.POINTER(ovstage_population_desc_t), ctypes.c_size_t,
+        ]
+        lib.ovstage_population_repopulate_usd_with_desc.restype = pop_enq
     if hasattr(lib, "ovstage_population_open_usd_from_file"):
-        lib.ovstage_population_add_usd_reference_from_file.argtypes = [inst, ovx_string_t, ovx_string_t,
-                                                                       ctypes.POINTER(ref_handle)]
+        lib.ovstage_population_add_usd_reference_from_file.argtypes = [
+            inst,
+            ovx_string_t,
+            ovx_string_t,
+            ctypes.POINTER(ref_handle),
+        ]
         lib.ovstage_population_add_usd_reference_from_file.restype = pop_enq
-        lib.ovstage_population_add_usd_reference_from_string.argtypes = [inst, ovx_string_t, ovx_string_t,
-                                                                         ctypes.POINTER(ref_handle)]
+        lib.ovstage_population_add_usd_reference_from_string.argtypes = [
+            inst,
+            ovx_string_t,
+            ovx_string_t,
+            ctypes.POINTER(ref_handle),
+        ]
         lib.ovstage_population_add_usd_reference_from_string.restype = pop_enq
         lib.ovstage_population_remove_usd_reference.argtypes = [inst, ref_handle]
         lib.ovstage_population_remove_usd_reference.restype = pop_enq
@@ -1110,13 +1543,18 @@ def _configure_prototypes(lib: ctypes.CDLL) -> None:
         lib.ovstage_population_apply_usd_time.restype = pop_enq
         lib.ovstage_population_apply_usd_changes.argtypes = [inst, ovstage_ordinal_t]
         lib.ovstage_population_apply_usd_changes.restype = pop_enq
-        lib.ovstage_population_wait_op.argtypes = [inst, ovstage_population_op_id_t, ovstage_timeout_ns_t,
-                                                   ctypes.POINTER(ovstage_population_op_wait_result_t)]
+        lib.ovstage_population_wait_op.argtypes = [
+            inst,
+            ovstage_population_op_id_t,
+            ovstage_timeout_ns_t,
+            ctypes.POINTER(ovstage_population_op_wait_result_t),
+        ]
         lib.ovstage_population_wait_op.restype = err
         lib.ovstage_population_get_last_error.argtypes = []
         lib.ovstage_population_get_last_error.restype = ovx_string_t
         lib.ovstage_population_get_last_op_error.argtypes = [ovstage_population_op_id_t]
         lib.ovstage_population_get_last_op_error.restype = ovx_string_t
+
 
 def _probe_version(lib: ctypes.CDLL) -> tuple:
     """Read the implementation version via a throwaway instance's vtable.
@@ -1159,6 +1597,15 @@ def library_version() -> Optional[tuple]:
     """
     _loader.load()
     return _loader.version
+
+
+def get_build_info() -> BuildInfo:
+    """Return build information from the native OVStage loader.
+
+    The loader library is opened on first use, but the OVStage runtime is not
+    initialized and no Stage instance is created.
+    """
+    return _loader.get_build_info()
 
 
 # ── Logging (ovstage_set_log_callback / ovstage_flush_log) ───────────────────
@@ -1247,7 +1694,9 @@ def set_log_callback(callback, severity=None, channel_filter: Optional[str] = No
 
     if callback is None:
         _check_process_status(
-            lib.ovstage_set_log_callback(check_enum_member(severity, LogSeverity, "severity"), filter_ptr, _log_callback_t(), None),
+            lib.ovstage_set_log_callback(
+                check_enum_member(severity, LogSeverity, "severity"), filter_ptr, _log_callback_t(), None
+            ),
             "ovstage_set_log_callback",
         )
         # The disable call flushes and tears the dispatcher thread down before
@@ -1270,12 +1719,14 @@ def set_log_callback(callback, severity=None, channel_filter: Optional[str] = No
 
     trampoline = _log_callback_t(_trampoline)
     _check_process_status(
-        lib.ovstage_set_log_callback(check_enum_member(severity, LogSeverity, "severity"), filter_ptr, trampoline, None),
+        lib.ovstage_set_log_callback(
+            check_enum_member(severity, LogSeverity, "severity"), filter_ptr, trampoline, None
+        ),
         "ovstage_set_log_callback",
     )
-    # Publish only after the install succeeds. Retire (don't free) the previous
-    # trampoline: the dispatcher may still fire it for a message it dequeued
-    # before the swap. flush_log() later clears the retired list.
+    # Replace the active callback only after installation succeeds. Retire (don't
+    # free) the previous trampoline: the dispatcher may still fire it for a message
+    # dequeued before the swap. flush_log() later clears the retired list.
     if _active_log_trampoline is not None:
         _retired_log_trampolines.append(_active_log_trampoline)
     _active_log_trampoline = trampoline

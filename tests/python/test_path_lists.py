@@ -233,11 +233,11 @@ def test_outliving_a_closed_shared_dictionary_still_releases(ovstage_mod, stage)
 
 
 def test_outliving_its_own_stage_is_silent(ovstage_mod, recwarn):
-    """A standalone dictionary owns its Stage, so destroy() really does kill the
-    list — nothing to reclaim, and a warning would be un-actionable noise."""
-    pd = ovstage_mod.PathDictionary()
+    """Stage destruction invalidates its lists, leaving nothing to reclaim."""
+    stage = ovstage_mod.Stage("list-owner")
+    pd = ovstage_mod.PathDictionary(stage)
     plist = pd.create_path_list_from_strings(PATHS)
-    pd.destroy()  # owns its private Stage -> the C dictionary goes with it
+    stage.destroy()  # outstanding list references do not retain the dictionary
     del pd, plist
     gc.collect()
     assert not [w for w in recwarn.list if issubclass(w.category, ResourceWarning)]
@@ -345,3 +345,32 @@ def test_loop_reuse_creates_one_reference(paths):
             assert paths.path_list_count(plist) == len(PATHS)
     # [/snippet:path-list-loop-reuse]
     assert plist.released
+
+
+def test_dictionary_requires_an_explicit_stage(ovstage_mod):
+    with pytest.raises(TypeError):
+        ovstage_mod.PathDictionary()
+    with pytest.raises(TypeError):
+        ovstage_mod.PathDictionary(None)
+
+
+def test_lists_belong_to_their_stage(ovstage_mod):
+    with ovstage_mod.Stage("first") as first, ovstage_mod.Stage("second") as second:
+        with ovstage_mod.PathDictionary(first) as a, ovstage_mod.PathDictionary(second) as b:
+            first_list = a.create_path_list_from_strings(PATHS)
+            with b.create_path_list_from_strings(PATHS) as second_list:
+                with pytest.raises(ovstage_mod.OvxError):
+                    b.path_list_count(first_list)
+                with pytest.raises(ovstage_mod.OvxError):
+                    b.add_path_list_reference(first_list)
+                with pytest.raises(ovstage_mod.OvxError):
+                    b.destroy_path_list(first_list)
+                with pytest.raises(ovstage_mod.OvstageError):
+                    second.query_from_path_list(first_list)
+                assert b.get_path_strings(second_list) == PATHS
+                with second.query_from_path_list(second_list):
+                    pass
+                first.destroy()
+                with pytest.raises(ovstage_mod.OvxError, match="Stage has been destroyed"):
+                    a.path_list_count(first_list)
+                assert b.get_path_strings(second_list) == PATHS

@@ -153,7 +153,7 @@ extern "C"
         size_t value_count;
     };
 
-    /** Which of an in-scope prim's properties a selector publishes.
+    /** Which of an in-scope prim's properties a selector includes in population.
      *
      *  Built the same way as `ovstage_population_prim_predicate_t`: `kind` names the
      *  live `values` member, and several values of one kind match if any one of them

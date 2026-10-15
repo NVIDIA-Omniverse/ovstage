@@ -1,10 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: LicenseRef-NvidiaProprietary
 //
-// Public ovstage map/unmap test: map_attribute reserves writable storage-side
-// buffers you fill directly (the zero-copy programming model), committed per group
-// via unmap_group or all at once by the final unmap. Covers an existing column and
-// a freshly-created one. CPU-only. The write-flavors example is the workflow tour.
+// Public ovstage map/unmap test: map_attribute prepares writable staging buffers
+// you fill directly. Commit each group via unmap_group, or commit remaining groups
+// in the final unmap. Covers existing and newly created columns. CPU-only.
+// The write-flavors example is the workflow tour.
 
 #include <ovstage/ovstage.h>
 #include <ovx/path_dictionary/path_dictionary.h>
@@ -135,12 +135,13 @@ TEST_F(MapTest, MapExistingAndFreshColumn)
     seal(1);
 
     // [snippet:map-unmap-cpu-c]
-    // map_attribute reserves storage-side buffers you fill directly. The mapped
-    // buffer is a WRITE-ONLY staging buffer for the session's ordinal
-    // (uninitialized, not a view of current values), so fill every element.
-    // Commit per group via unmap_group (streaming) or all at once with the final
-    // unmap_attribute, which also releases the session. CPU unmaps pass a zero
-    // ovstage_cuda_sync_t (no GPU work to wait on).
+    // map_attribute prepares writable staging buffers for the session's ordinal.
+    // Each buffer is WRITE-ONLY (uninitialized, not a view of current values),
+    // so fill every element.
+    // Commit per group via unmap_group (streaming), or commit remaining groups
+    // with the final unmap_attribute, which also releases the session. CPU
+    // unmaps pass a zero ovstage_cuda_sync_t (no GPU work to wait on).
+    // [snippet:dlpack-map-existing-c]
     ovstage_map_desc_t existingDesc{};
     existingDesc.attribute = { existing, {} };
     existingDesc.prim_mode = OVSTAGE_PRIM_MODE_UPSERT;
@@ -166,9 +167,10 @@ TEST_F(MapTest, MapExistingAndFreshColumn)
     }
     ASSERT_TRUE(waitOp(stage_, ovstage_unmap_attribute(stage_, map, ovstage_cuda_sync_t{}), "unmap_attribute"));
     seal(2);
+    // [/snippet:dlpack-map-existing-c]
 
     // A NEW column: the descriptor dtype (3-lane float32) defines it. No
-    // unmap_group this time — the final unmap commits everything.
+    // unmap_group this time — the final unmap commits the remaining groups.
     ovstage_map_desc_t freshDesc{};
     freshDesc.attribute = { fresh, {} };
     freshDesc.dtype = DLDataType{ kDLFloat, 32, 3 };

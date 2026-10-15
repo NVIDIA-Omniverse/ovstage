@@ -48,7 +48,7 @@ Resolve inputs in this order: existing repository files and referenced snippets,
   `map_attribute`) that also yields a fetch handle.
 - Whether ordering matters: same-ordinal ops serialize; different-ordinal ops are independent
   by contract, but the current implementation does not execute backend tasks in parallel.
-- Whether the same attribute and prim paths are covered by a pending write, a fetched read group,
+- Whether the same canonical attribute and prim paths are covered by a pending write, a fetched read group,
   or an active map whose lifetime has not ended.
 - The shipped `include/` headers (notably `ovstage_api/ovstage_api.h`'s execution-model
   notes) are the authoritative contract — treat them as the source of truth.
@@ -76,7 +76,7 @@ Resolve inputs in this order: existing repository files and referenced snippets,
 5. To run the CPU ahead: keep enqueuing across ordinals without adding explicit waits; only
    `wait_op` (or `fetch_*` with a timeout) when you actually need a result. This pipelines work
    but does not guarantee concurrent backend execution.
-6. Before submitting an operation that overlaps the same attribute and prim paths, release fetched
+6. Before submitting an operation that overlaps the same canonical attribute and prim paths, release fetched
    read groups with `release_group` and finish active maps with `unmap_*`. If a read overlaps a
    pending write, wait for the write, then retry the read.
 7. Release op-tracking state with `ovstage_release_op` once an op is known complete.
@@ -96,8 +96,9 @@ This skill has no scripts.
 - The referenced snippets remain the source of truth; update or add tested snippets before documenting new API usage.
 - **Non-blocking poll / pipelined-submission patterns are snippet-backed** — the
   write-flavors example ships the `timeout == 0` poll loop and the multi-ordinal
-  CPU-ahead pattern (`pipelined-submission`, `poll-wait-release`); the minimal example
-  additionally shows the simple blocking form (`OVSTAGE_TIMEOUT_INFINITE`).
+  CPU-ahead pattern (`pipelined-submission`, `poll-wait-release`), the public C test
+  asserts the single-op poll → release flow (`nonblocking-poll-c`), and the minimal
+  example shows the simple blocking form (`OVSTAGE_TIMEOUT_INFINITE`).
 - **Async execution does not mean wait-free submission or parallel backend execution.** The
   current implementation performs validation and request preparation on the submitting thread;
   an enqueue that consumes a not-yet-ready handle may also wait for that handle's producer.
@@ -107,15 +108,20 @@ This skill has no scripts.
   defer observation, not as a guarantee of submission latency, multi-core scaling, or GPU overlap.
 - **Fail-on-overlap is a current-backend policy, not a general OVStage contract rule.** The
   current implementation may reject a read overlapping an earlier pending write,
-  or a write/map/delete overlapping a live read group or active map on the same attribute and
-  prim paths. This protects borrowed read storage and map layout. The API contract requires safe
+  or a write/map/delete overlapping a live read group or active map on the same canonical
+  attribute and prim paths. Aliases of one stored column share these checks. This protects
+  borrowed read storage and map layout. The API contract requires safe
   lifetimes and ordering, but another implementation could serialize, add dependencies, or retain
   versions instead of rejecting. Do not confuse this policy with genuine contract-level failures
   such as write-floor violations, INSERT conflicts, schema mismatches, or a map whose layout
   actually changed.
-- **Latest-snapshot payloads:** this build retains only the latest committed payload;
-  async consumers may lag within the bounded dirty-membership frontier reported by
-  `ovstage_get_oldest_preserved_ordinal`.
+- **Current-value payloads:** this build retains only the current committed payload. A
+  change-range consumer may let its *start* lag down to the frontier reported by
+  `ovstage_get_oldest_preserved_ordinal`. The requested *end* cannot lag: a snapshot or
+  change range returns `OUT_OF_RANGE` if a selected `(attribute, path)` has a recorded
+  change after that end, and a snapshot selects every queried path. If newer values are
+  acceptable, use end `UINT64_MAX` (Python: `(1 << 64) - 1`) to request current values;
+  a selected unsealed change still returns `WRITE_FLOOR_VIOLATION`.
 
 ## Overview
 
@@ -129,9 +135,23 @@ ovstage is an **asynchronous, ordinal-keyed submit/observe** system:
   Same-ordinal ops execute in submission order; **different-ordinal ops are independent by
   contract and may run concurrently in another implementation**. This build currently sends
   all backend tasks for an instance through one serialized execution lane.
+- **Admission is separate from ordering.** Under the `STRICTLY_INCREASING`
+  policy, write, map publication, clone and delete cannot modify the same cell
+  twice at one ordinal. They must clear applicable floors and retained
+  cell/lifecycle changes; disjoint cells may share an ordinal. Optional policies
+  relax retained-history checks while preserving normal operation floors; see
+  [Ordinal Admission Policies](../../docs/scene/writing_attributes.rst). WRITE/MAP
+  enqueue check floors provisionally, so observe execution/setup failures even
+  after successful enqueue.
 - **Observe on demand.** Block or poll with `ovstage_wait_op`; obtain stage data with
   `ovstage_fetch_*(handle, timeout, out)`. `timeout == 0` polls; `OVSTAGE_TIMEOUT_INFINITE`
   blocks; `OVSTAGE_ERROR_TIMEOUT` means the result is not ready yet.
+- **Failure does not roll back completed entries.** Use a newer ordinal for
+  whole-batch repair when an entry may have committed, including reserved metadata
+  that completes before ordinary attribute entries during execution: the strictly increasing
+  policy rejects replaying completed cells at the same ordinal. A same-ordinal retry
+  must satisfy the selected policy on its actual targets, current floors, and stage
+  state; see the `error-handling` skill.
 
 This is what lets a producer (physics, etc.) push many ordinals of data while consumers
 observe at their own cadence.
@@ -151,25 +171,21 @@ A blocking write → seal → read sequence (each step waited with `OVSTAGE_TIME
 
 To run the CPU ahead, submit without adding explicit waits and poll with `timeout == 0`, doing
 other work between polls. A submission can still spend time in synchronous preparation or wait
-for a prerequisite handle, and queued backend tasks currently execute serially per instance:
-
-```c
-// op_id from a prior enqueue (e.g. ovstage_write_attribute(...).op_index)
-ovstage_op_wait_result_t wait{};
-ovstage_api_status_t s = ovstage_wait_op(stage, op_id, /*timeout=*/0, &wait);
-if (s == OVSTAGE_ERROR_TIMEOUT) {
-    // not done yet — go do other CPU work / submit the next ordinal, retry later.
-    // wait.lowest_pending_op_id reports the lowest still-pending op in the chain.
-} else if (s == OVSTAGE_OK) {
-    // completed (check wait.error_op_id_count for per-op failures)
-    ovstage_release_op(stage, op_id);
-}
-```
-
-The shipping form of this pattern — several ordinals submitted ahead, then drained with
-zero-timeout polls that release each completed op:
+for a prerequisite handle, and queued backend tasks currently execute serially per instance.
+The write-flavors example is the shipping form: several ordinals are submitted ahead, then
+drained in submission order with zero-timeout polls. Each poll has three outcomes:
+`OVSTAGE_ERROR_TIMEOUT` — still executing, so do other CPU work or submit the next ordinal
+and poll again (`wait.lowest_pending_op_id` names the op the waited chain is stalled on);
+`OVSTAGE_OK` — completed, so check `wait.error_op_id_count` for per-op failures and retire
+the op with `ovstage_release_op`; any other status — the wait did not complete normally
+(`OVSTAGE_ERROR_OP_FAILED` when the waited op failed; see `error-handling`):
 
 > **Source:** `examples/c/write-flavors/main.cpp` snippets `pipelined-submission`, `poll-wait-release`
+
+The public test asserts the single-op form — poll until the status is no longer `TIMEOUT`,
+then require `OVSTAGE_OK`, zero per-op errors, a clean release, and that the write landed:
+
+> **Source:** `tests/c/test_minimal.cpp` snippet `nonblocking-poll-c`
 
 ## Key Types / Functions
 
@@ -207,11 +223,20 @@ zero-timeout polls that release each completed op:
 The Python bindings expose the same model: enqueues return handle objects (`Query` /
 `Read` / `Map`) with a `.wait(timeout=…)` that raises `ovstage.OvstageError` on op failure
 (`timeout=0` polls, `TIMEOUT_INFINITE` blocks, and other finite values wait up to the
-timeout). See the `error-handling` skill for the exception surface.
+timeout) and returns the handle on success, so the fetch chains inside the handle's `with`
+block: `group = read.wait().fetch_next()`. A timed-out `.wait()` leaves the op waitable.
+Mutation methods return an `Operation`; its `ok` property reports enqueue acceptance
+only, even if execution later fails. Keep it until `wait()` observes completion.
+Query/read/map context managers manage handle lifetimes; explicitly wait and use
+the documented fetch/commit calls to observe results. Dropping an operation or
+relying on a finalizer does not report execution errors.
+See the `error-handling` skill for the exception surface.
 
 > **Source:** `examples/python/minimal/main.py` snippet `minimal-write-read`
 >
 > Followed by: `examples/python/minimal/main.py` snippet `nonblocking-poll`
+
+> **Source:** `tests/python/test_minimal.py` snippet `wait-chaining`
 
 ## References
 

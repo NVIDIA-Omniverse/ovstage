@@ -10,9 +10,10 @@
 #
 # Client-side authoring + hierarchy: build a multi-environment world with ZERO
 # USD -- prims come into existence via attribute writes to nested paths -- then
-# show that derived world transforms are pull-computed: they stay stale until a
-# hierarchy computation model runs. The world-transform compute runs on the GPU
-# in this ovstage revision, so a CUDA-capable device is required.
+# show that derived world transforms are pull-computed: the rows start absent,
+# the client seeds them, and a hierarchy computation model fills or refreshes
+# them. The compute runs on the GPU in this ovstage revision, so a CUDA-capable
+# device is required.
 #
 # Expected output: see README.md. Snippet markers are referenced by the skills
 # under ../../../skills/ -- keep them intact.
@@ -92,10 +93,8 @@ def main() -> int:
             # [/snippet:author-applied-schemas]
 
             # [snippet:author-local-transforms]
-            # omni:xform is the canonical 4x4 double local-matrix column (an
-            # alias of the derived `omni:fabric:localMatrix`): ONE 16-lane float64
-            # element per prim, MATRIX semantic. Sealing ordinal 1 makes the
-            # authored state readable.
+            # Write omni:xform as one 16-lane float64 MATRIX element per prim.
+            # Sealing ordinal 1 makes the authored state readable.
             stage.write_attribute(
                 proto_query, "omni:xform", ordinal=1, tensors=_matrix_rows(PROTO_LOCALS),
                 is_array=False, semantic=AttributeSemantic.MATRIX,
@@ -117,10 +116,14 @@ def main() -> int:
             # Clone the prototype subtree to three targets in ONE call (clone is
             # an ordinal-keyed write; the source must exist, the targets must
             # not), then give each environment root a distinct translation so
-            # the environments tile along +X.
+            # the environments tile along +X. The clone records every copied
+            # cell at its ordinal, so the strict policy requires a
+            # newer ordinal for customization.
             stage.clone("/World/Proto", ENV_PATHS, ordinal=2)
             for index, env in enumerate(ENV_PATHS):
-                _write_local_translation(stage, paths, env, (100.0 * (index + 1), 0.0, 0.0), ordinal=2)
+                _write_local_translation(stage, paths, env, (100.0 * (index + 1), 0.0, 0.0), ordinal=3)
+            # Seal only 2 here. Ordinal 3 stays open for the output-row seed and
+            # hierarchy computation below, then is sealed before result reads.
             stage.advance_write_floor(ordinal=2).wait()
             print("cloned /World/Proto ->", " ".join(ENV_PATHS))
             # [/snippet:clone-prototype-envs]
@@ -134,16 +137,18 @@ def main() -> int:
             print("hierarchy computation models:", " ".join(model.name for model in models))
             # [/snippet:hierarchy-computation-models]
 
-            # ---- 5. staleness demo: world transforms are pull-computed ----
+            # ---- 5. derived world transforms are pull-computed ----
             # [snippet:world-matrix-staleness]
             # Derived world transforms are PULL-computed. Before any compute the
             # derived column does not even exist: reading it yields no rows (a
-            # normal state, not an error). A pure client-side stage then
-            # materializes the output column itself (identity placeholder rows
-            # -- USD population would have created them); the placeholders stay
-            # STALE until a computation model runs. compute_hierarchy takes the
-            # ordinal to compute from (input) and the ordinal stamped onto the
-            # derived results (output).
+            # normal state, not an error). A pure client-side stage creates the
+            # output rows itself (identity rows -- USD population would have
+            # created them), then runs a computation model. compute_hierarchy
+            # computes from the latest committed inputs and stamps
+            # output_ordinal onto the derived results. The current
+            # implementation ignores input_ordinal. Compute first, then seal
+            # that ordinal: the derived rows are recorded at output_ordinal,
+            # and the seal then publishes a complete snapshot to readers.
             translation = _read_world_translation(stage, paths, "/World/Env_0/Body/Tip", end_ordinal=2)
             print("world matrix rows before compute_hierarchy:",
                   "absent (derived rows are pull-computed)" if translation is None else "unexpectedly present")
@@ -158,14 +163,7 @@ def main() -> int:
                     tensors=_matrix_rows([(0.0, 0.0, 0.0)] * len(all_paths)),
                     is_array=False, semantic=AttributeSemantic.MATRIX,
                 ).wait()
-                stage.advance_write_floor(ordinal=3).wait()
             paths.destroy_path_list(all_list)
-
-            translation = _read_world_translation(stage, paths, "/World/Env_0/Body/Tip", end_ordinal=3)
-            if translation is None:
-                raise SystemExit("no derived world matrix row for /World/Env_0/Body/Tip"
-                                 " after seeding placeholders")
-            print("stale placeholder world translation /World/Env_0/Body/Tip:", _fmt_translation(translation))
 
             try:
                 stage.compute_hierarchy(input_ordinal=3, output_ordinal=3,
@@ -174,8 +172,9 @@ def main() -> int:
                 raise SystemExit(f"compute_hierarchy failed (code {int(err.code)}): {err.message}\n"
                                  "the world-transform compute runs on the GPU and needs a CUDA-capable"
                                  " device")
+            stage.advance_write_floor(ordinal=3).wait()
 
-            # Now the derived rows are correct compositions: each Tip world
+            # The derived rows are correct compositions: each Tip world
             # translation is the sum of the pure translations down its chain.
             for tip in TIP_PATHS:
                 translation = _read_world_translation(stage, paths, tip, end_ordinal=3)
@@ -187,17 +186,18 @@ def main() -> int:
             # ---- 6. late edit: move /World/Env_1, compute again ----
             # [snippet:recompute-after-edit]
             # A local edit at a later ordinal needs another compute_hierarchy
-            # with the new input ordinal to land in the derived rows. Reading
-            # the derived column between the edit and the recompute is NOT a
-            # reliable staleness probe -- the read itself can pull an
-            # incremental refresh -- so this example reads only after the
-            # compute.
+            # to land in the derived rows. The computation uses the latest
+            # committed inputs. The current implementation ignores
+            # input_ordinal. Reading the derived column between the edit and
+            # the recompute is NOT a reliable staleness probe -- the read
+            # itself can pull an incremental refresh -- so this example reads
+            # only after the compute.
             _write_local_translation(stage, paths, "/World/Env_1", (200.0, 0.0, 40.0), ordinal=4)
-            stage.advance_write_floor(ordinal=4).wait()
             print("moved /World/Env_1 at ordinal 4")
 
             stage.compute_hierarchy(input_ordinal=4, output_ordinal=4,
                                     model=HierarchyComputationModel.GPU_INCREMENTAL)
+            stage.advance_write_floor(ordinal=4).wait()
             translation = _read_world_translation(stage, paths, "/World/Env_1/Body/Tip", end_ordinal=4)
             if translation is None:
                 raise SystemExit("no derived world matrix row for /World/Env_1/Body/Tip after recompute")
@@ -264,15 +264,15 @@ def _read_world_translation(stage, paths, path, end_ordinal):
         read.wait()
         group = read.fetch_next()
         if group is not None:
-            # This single-prim query must yield exactly one 16-lane float64 row.
+            # This single-prim query must yield one scalar-lane float64 4x4 matrix row.
             # Check tensor_count before touching tensor 0: a zero-tensor group
             # would make group.tensor(0) raise instead of this diagnostic.
             if group.tensor_count != 1:
                 raise SystemExit(f"unexpected {WORLD_MATRIX} read-group shape for {path}")
             tensor = group.tensor(0)
-            if (not tensor.data or tensor.shape_tuple != (1,)
+            if (not tensor.data or tensor.shape_tuple != (1, 4, 4)
                     or tensor.dtype.code != DLDataTypeCode.kDLFloat
-                    or tensor.dtype.bits != 64 or tensor.dtype.lanes != 16):
+                    or tensor.dtype.bits != 64 or tensor.dtype.lanes != 1):
                 raise SystemExit(f"unexpected {WORLD_MATRIX} read-group shape for {path}")
             # A data index_map (sparse row gather) can only map to row 0 here.
             row = group.data_row_index(0) if group.has_data_index_map else 0

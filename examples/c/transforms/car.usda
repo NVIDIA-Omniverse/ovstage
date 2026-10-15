@@ -1,0 +1,15 @@
+#usda 1.0
+
+def Xform "World"
+{
+    def Xform "Car"
+    {
+        double3 xformOp:translate = (10, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        def Xform "Wheel"
+        {
+            double3 xformOp:translate = (2, 0, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+    }
+}

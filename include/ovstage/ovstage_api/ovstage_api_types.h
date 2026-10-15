@@ -29,13 +29,13 @@
  *
  * The vtable owns *resource* lifecycles (queries, reads, maps, ops, groups,
  * query results, ordinal queries) but **not** the instance's own lifecycle.
- * Each backend provides its own factory function and its own destructor —
+ * Each implementation provides its own factory function and its own destructor —
  * those are intentionally not part of this contract.
  *
  * The execution-model documentation lives at the top of `ovstage_api.h`
  * alongside the vtable definition.
  *
- * @version 0.2.1
+ * @version 0.3.0
  * @date 2026-05-28
  */
 
@@ -57,8 +57,8 @@
  * exactly these values, so a compile-time `#if` check and a runtime query
  * always agree. */
 #define OVSTAGE_VERSION_MAJOR 0
-#define OVSTAGE_VERSION_MINOR 2
-#define OVSTAGE_VERSION_PATCH 1
+#define OVSTAGE_VERSION_MINOR 3
+#define OVSTAGE_VERSION_PATCH 0
 
 /* Marks a deprecated public entry point: OVSTAGE_DEPRECATED("Use <new> instead")
  * on the old declaration. Emits a compiler warning at the call site where
@@ -111,7 +111,7 @@ typedef enum ovstage_api_status_t
     OVSTAGE_ERROR_INVALID_HANDLE        = 2,  /**< Stale/invalid handle of any kind. */
     OVSTAGE_ERROR_NOT_FOUND             = 3,
     OVSTAGE_ERROR_PRIM_NOT_FOUND        = 4,  /**< INSERT mode and prim already exists. */
-    OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION = 5,  /**< Write at/below effective write floor; snapshot read with current state above it; range read with a selected change above it. */
+    OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION = 5,  /**< Mutation blocked by an effective floor or retained value/prim-lifecycle change; read selects an unsealed change at/before its end. */
     OVSTAGE_ERROR_NOT_SUPPORTED         = 6,
     OVSTAGE_ERROR_QUEUE_FULL            = 7,  /**< Backpressure: submit queue full. */
     OVSTAGE_ERROR_END_OF_ITERATION      = 8,  /**< No more groups to iterate. */
@@ -119,7 +119,7 @@ typedef enum ovstage_api_status_t
     OVSTAGE_ERROR_LAYOUT_CHANGED        = 10, /**< Layout changed during map. */
     OVSTAGE_ERROR_TIMEOUT               = 11, /**< Fetch/wait did not complete within timeout. */
     OVSTAGE_ERROR_OP_FAILED             = 12, /**< An enqueued op failed; see get_last_op_error. */
-    OVSTAGE_ERROR_OUT_OF_RANGE          = 13, /**< Requested ordinal range cannot be materialized from retained payloads. */
+    OVSTAGE_ERROR_OUT_OF_RANGE          = 13, /**< Values needed for the requested snapshot or change range are no longer available. */
     OVSTAGE_ERROR_INTERNAL              = 99
 } ovstage_api_status_t;
 
@@ -235,7 +235,7 @@ typedef uint64_t ovstage_query_handle_t;
 typedef uint64_t ovstage_read_handle_t;
 #define OVSTAGE_INVALID_READ_HANDLE ((ovstage_read_handle_t)0)
 
-/** @brief Map handle — identifies an enqueued zero-copy write session. */
+/** @brief Map handle — identifies an enqueued mapped-write session. */
 typedef uint64_t ovstage_map_handle_t;
 #define OVSTAGE_INVALID_MAP_HANDLE ((ovstage_map_handle_t)0)
 
@@ -315,6 +315,23 @@ typedef enum {
     OVSTAGE_PRIM_MODE_INSERT = 1,  /**< Create only; OVSTAGE_ERROR_PRIM_NOT_FOUND if exists. */
 } ovstage_prim_mode_t;
 
+/**
+ * @brief What a write or map does when a target prim already has the attribute
+ *        with a different schema.
+ *
+ * An attribute's schema is its storage -- dtype, row layout, and fixed versus
+ * array kind -- and its authored semantic.
+ *
+ * - REJECT (default): the write or map fails.
+ * - FORCE: the target prim's existing schema is replaced by the written one.
+ *
+ * See write_attribute and map_attribute for how a replacement is applied.
+ */
+typedef enum {
+    OVSTAGE_ATTRIBUTE_MODE_REJECT = 0,  /**< A differing existing schema fails the write or map (default). */
+    OVSTAGE_ATTRIBUTE_MODE_FORCE  = 1,  /**< A differing existing schema is replaced by the written one. */
+} ovstage_attribute_mode_t;
+
 /** @brief Write-floor advance scope. */
 typedef enum {
     OVSTAGE_SCOPE_ALL     = 0,  /**< Advance all attributes (and the global write floor). */
@@ -334,11 +351,25 @@ typedef enum {
  *   data rows along its leading dimension.
  * - Per-row transport uses tensor_count = N; each tensor describes one
  *   transported data row's variable-length payload.
- * - A fixed-size value tensor returned by read or map is canonical: `ndim == 1`,
- *   `shape[0]` is the number of transported data rows, and `dtype.lanes`
- *   is the complete tuple width (for example, point3f uses 3 lanes and
- *   matrix4d uses 16). Write-side convenience trailing dimensions are not
- *   retained or reconstructed.
+ * - Read and map tensors expose scalar-lane, row-major shapes. The leading dimension
+ *   is the transported data-row count for fixed-size values, or the element
+ *   count for each array-value tensor. Multi-component values add a trailing
+ *   component dimension (for example, point3f is `[N, 3]`); a MATRIX semantic
+ *   with a supported square component count adds two dimensions instead
+ *   (matrix2d, matrix3d and matrix4d are `[N, 2, 2]`, `[N, 3, 3]` and
+ *   `[N, 4, 4]`). `dtype.lanes` is always 1. Scalars have shape `[N]`.
+ *   Generic tuples retain a single component axis, including non-square
+ *   tuples; their dimensions are not inferred as matrices. The original
+ *   write shape is not retained: read shape is reconstructed from the stored
+ *   component count and attribute semantic.
+ * - Reads and maps share this layout. Read payloads are read-only; map
+ *   payloads are writable until accepted unmap submission. Descriptor
+ *   metadata remains implementation-owned and read-only in both cases.
+ * - Every returned tensor carries explicit compact strides: `strides` is
+ *   non-NULL and describes row-major scalar elements.
+ *   DLPack v1.2+ forbids NULL strides when `ndim != 0`, and OVStage conforms
+ *   on output; NULL strides remain accepted on write-side input as compact
+ *   row-major.
  *
  * Tensor count is not an attribute-kind signal. Read results report logical
  * kind in ovstage_read_group_t::is_array. Copy-in writes declare it in
@@ -354,7 +385,8 @@ typedef enum {
  * mask and index_map are mutually exclusive (at most one non-NULL).
  *
  * For the write (copy-in) path, ovstage_write_data_t mirrors this shape
- * but additionally allows storage-managed tensor lifetime; see the Write
+ * but uses its documented canonical input layout and additionally allows
+ * storage-managed tensor lifetime; see the Write
  * section of ovstage_api.h.
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
@@ -368,10 +400,14 @@ typedef enum {
  * @invariant For value groups, `tensor_count >= 1`. For fixed-size attributes
  *            it is 1; for array attributes it equals the number of logical prim
  *            elements.
- * @invariant A fixed-size value tensor has `ndim == 1`; its leading shape is
- *            the transported data-row count and `dtype.lanes` carries the
- *            tuple width. Logical element `i` selects row `i` when `index_map`
- *            is NULL, or row `index_map[i]` otherwise.
+ * @invariant A fixed-size value tensor has leading shape equal to the
+ *            transported data-row count. Read and map tensors have
+ *            `dtype.lanes == 1` and type-aware trailing dimensions. Logical element `i`
+ *            selects row `i` when `index_map` is NULL, or row `index_map[i]`
+ *            otherwise.
+ * @invariant Every published tensor has non-NULL `strides` with
+ *            compact row-major strides; NULL strides are never produced
+ *            (DLPack v1.2+ forbids NULL strides when `ndim != 0`).
  * @invariant For delete/tombstone read groups (`is_delete == true`),
  *            `tensor_count == 0`, `tensors == NULL`, and `count == 0`.
  * @invariant `index_map` and `mask` are mutually exclusive.
@@ -439,27 +475,72 @@ typedef struct {
 /**
  * @brief Ordinal range for read operations.
  *
- * - Latest snapshot request: has_start_ordinal = false, end_ordinal = N.
- *   In the current implementation, recorded columns return their latest
- *   committed payload, not a historical payload selected at or before N.
+ * - Snapshot: has_start_ordinal = false, end_ordinal = N. Requests values at N
+ *   for each requested attribute on all queried paths. A zero-initialized
+ *   range is therefore a snapshot at ordinal 0, not a request for current values.
  * - Change range [start, end]: has_start_ordinal = true,
- *   start_ordinal <= end_ordinal. Selects keys with retained changes in the
- *   inclusive interval [start_ordinal, end_ordinal]. As a limitation of the
- *   current implementation, this interval selects keys only; it does not select
- *   a historical payload version. A selected change above the effective write
- *   floor fails with OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION. If a selected public
- *   key (attribute and path) also has a retained change after end_ordinal, the
- *   read fails with OVSTAGE_ERROR_OUT_OF_RANGE because the payload for the fixed
- *   range is no longer available, whether or not the later change is sealed.
- *   Otherwise, the selected key returns its latest committed payload or
- *   tombstone.
+ *   start_ordinal <= end_ordinal. Selects queried attribute/path pairs with
+ *   recorded changes in [start_ordinal, end_ordinal], including both ends.
+ *
+ * A selected change at or before the end and above the effective write floor
+ * fails with OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION. If the read detects that the
+ * requested values are no longer available, it fails with OVSTAGE_ERROR_OUT_OF_RANGE.
+ * Use UINT64_MAX as the end to request current values; a selected unsealed
+ * change still fails with OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION.
+ *
+ * The requested end need not be at or below the attribute's write floor
+ * (ovstage_get_attribute_write_floor). While the end is above the floor,
+ * changes in (floor, end] can still be admitted and, once sealed, change what
+ * the same request returns. Once the end is at or below the floor, later
+ * writes, deletes and maps cannot change the recorded values that a successful
+ * read of the same request returns for paths the query still selects. This
+ * does not cover derived attributes or query membership, which reflect current
+ * state, changes that ovstage_compute_hierarchy records at or below the floor,
+ * or history below the retention frontier (see below).
+ *
+ * A returned group's ordinal (ovstage_read_group_t::ordinal) is informational.
+ * It may be above or below the requested end, and it is not, by itself, proof
+ * of which state the payload represents.
+ *
+ * A selected key whose schema was replaced in the change interval (a write or
+ * map commit with OVSTAGE_ATTRIBUTE_MODE_FORCE) returns both a tombstone for the
+ * previous schema and its payload in the written schema; see write_attribute.
  *
  * Implementations may coalesce or discard history below their inclusive
  * retention frontier. Query ovstage_get_oldest_preserved_ordinal before relying
- * on an old interval.
+ * on an old snapshot or interval. Below the frontier, history may be insufficient
+ * to detect unavailable values; success does not guarantee the requested earlier state.
  *
- * @remark The current implementation retains bounded exact
- * change membership at or above the frontier reported by
+ * @remark This implementation stores only the current values. For each
+ * attribute, it first checks for the write-floor violation described above.
+ * Otherwise, a recorded change after end_ordinal on a selected path causes
+ * OVSTAGE_ERROR_OUT_OF_RANGE, whether that later change is sealed or not.
+ * Sealing the later change does not restore the older values. A read stops
+ * at the first attribute that fails either check. An end of UINT64_MAX skips
+ * this later-change check. Because a later change after the end makes a
+ * bounded request fail with OVSTAGE_ERROR_OUT_OF_RANGE, a bounded read is not
+ * a replay point.
+ *
+ * These checks use recorded change history. Snapshot reads of values without
+ * such history, including derived attributes such as usd-path, return current
+ * state. Queries select current paths, not the paths present at N.
+ * After an attribute's deletion history is discarded, a snapshot from before
+ * that deletion may succeed without a row for that attribute.
+ *
+ * @remark Under OVSTAGE_ORDINAL_ADMISSION_FLOOR_ONLY, a write or delete above
+ * the applicable floors can be admitted even when the same attribute and path
+ * already has a change at a higher ordinal. STRICTLY_INCREASING and the default
+ * NONDECREASING policy reject such older changes against retained history.
+ * Under FLOOR_ONLY, reads return the most recently applied change rather than
+ * the one at the highest ordinal, and a read whose end covers both changes can
+ * succeed with it. A group's ordinal then need not match the change whose
+ * value is returned: depending on the operations that changed the attribute,
+ * it can be the most recently applied ordinal or the highest one recorded, and
+ * it may come from a prim outside the query. Groups of derived attributes such
+ * as usd-path report the requested end.
+ *
+ * @remark The current implementation retains bounded exact change membership
+ * at or above the frontier reported by
  * ovstage_get_oldest_preserved_ordinal. Callers must query the frontier rather
  * than assume a fixed retention depth. Ordinal ranges are therefore not a
  * historical-payload event log. Historical-payload support must first return a
@@ -470,8 +551,8 @@ typedef struct {
  */
 typedef struct {
     ovstage_ordinal_t start_ordinal;     /**< Range start (only when has_start_ordinal). */
-    ovstage_ordinal_t end_ordinal;       /**< Upper-bound ordinal. */
-    bool              has_start_ordinal; /**< false = latest snapshot; true = range [start, end]. */
+    ovstage_ordinal_t end_ordinal;       /**< Upper-bound ordinal; UINT64_MAX requests current values. */
+    bool              has_start_ordinal; /**< false = snapshot at end; true = changes in [start, end]. */
 } ovstage_ordinal_range_t;
 
 /** Per-attribute USD semantic — the authored *interpretation* of a column's
@@ -503,7 +584,11 @@ typedef struct {
     *                                   (one 64-bit token id per row; id 0 is
     *                                    the empty token)
     *          * RELATIONSHIP_PATH_ID → `dtype = {kDLUInt, 64, 1}`
-    *                                   (one 64-bit path id per row)
+    *                                   (one 64-bit path id per element;
+    *                                    `is_array = true` is a
+    *                                    relationship's target list,
+    *                                    `is_array = false` holds exactly
+    *                                    one path per row)
     *          * CONNECTION_PATH_ID   → `dtype = {kDLUInt, 64, 2}`
     *                                   (one `(path_id, token_id)` pair per row,
     *                                    using one 16-byte element per row)
@@ -515,6 +600,8 @@ typedef struct {
     *      An asset has two paths: the path as authored, and the path after
     *      resolution. ASSET_PATH_ID carries both as token ids. A token id of 0
     *      means no path, so an unresolved asset has a resolved token id of 0.
+    *      CONNECTION_PATH_ID writes are singular: they require exactly one
+    *      pair per target prim. Extra pairs are rejected.
     *
     *    - PATH_EXPRESSION_STRING carries the expression text as one interned
     *      token id, dtype `{kDLUInt, 64, 1}`. `is_array = false` is a scalar
@@ -528,7 +615,12 @@ typedef struct {
     *      `is_array = true`) — NOT a pre-interned token id. It stamps the
     *      USD-string role on the column, so the resulting column is the
     *      canonical USD-string representation. Read recovers the semantic by
-    *      decoding that role.
+    *      decoding that role. The row is length-delimited: every byte,
+    *      including a trailing NUL, is part of the value, so do not append a
+    *      C-style terminator. USD cannot persist a NUL byte inside a string,
+    *      so export refuses a STRING row that contains one and reports it as
+    *      unsupported. Only an untyped (SEMANTIC_NONE) byte row keeps the
+    *      legacy reading where one trailing NUL is an optional terminator.
     *
     *  Either way, borrow and replicate modes converge on the same authored
     *  interpretation because they consult the same attribute column. */
@@ -543,6 +635,8 @@ typedef enum
     OVSTAGE_SEMANTIC_VECTOR                 = 6,
     OVSTAGE_SEMANTIC_NORMAL                 = 7,
     OVSTAGE_SEMANTIC_COLOR                  = 8,
+    /** Four floating-point lanes in (x, y, z, w) order: imaginary part first,
+     *  real part last. */
     OVSTAGE_SEMANTIC_QUATERNION             = 9,
     OVSTAGE_SEMANTIC_MATRIX                 = 10,
     OVSTAGE_SEMANTIC_TEXTURE_COORDINATE     = 11,
@@ -555,8 +649,8 @@ typedef enum
 /* ═══════════════════════════════════════════════════════════════════════════════
  * Read Group
  *
- * Each group represents attribute data for a subset of prims at a single
- * ordinal. Groups are independently allocated and released.
+ * Each group represents attribute data for a subset of prims; see
+ * ovstage_read_group_t::ordinal. Groups are independently allocated and released.
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
 /**
@@ -565,7 +659,7 @@ typedef enum
 typedef struct {
     ovstage_read_group_id_t read_group_id; /**< Opaque payload identity for release_group. */
     ovx_token_t              attribute; /**< Which attribute this group contains. */
-    ovstage_ordinal_t        ordinal;   /**< Data ordinal. */
+    ovstage_ordinal_t        ordinal;   /**< Informational ordinal; may differ from the requested end and does not by itself prove which state the payload represents. See ovstage_ordinal_range_t. */
     bool                     is_delete; /**< true = tombstone group (deletions). */
     bool                     is_array;   /**< true = source is a ragged (variable-length / USD-array or byte-string) column; false = fixed scalar. The data is CSR either way, so this is the only signal that distinguishes e.g. a 1-byte string from a scalar uint8. */
     ovstage_attribute_semantic_t semantic; /**< Authored USD interpretation of the column's bytes (point vs float3, asset vs string, …). NONE when unspecified. Orthogonal to dtype/is_array; see ovstage_attribute_semantic_t. */
@@ -604,13 +698,14 @@ typedef struct {
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
 /**
- * @brief Descriptor for a zero-copy map session (map_attribute).
+ * @brief Descriptor for a map session (map_attribute).
  */
 typedef struct {
     ovx_string_or_token_t        attribute;  /**< Attribute to map (name or interned token). */
     DLDataType                   dtype;      /**< Requested element type. Required to create a new mapped attribute. Leave zero-initialized only when the target prims already have one unambiguous schema for this attribute name. `dtype.lanes` carries the tuple width. */
-    ovstage_attribute_semantic_t semantic;   /**< Authored USD interpretation (point vs float3, asset vs string, ...). NONE = unspecified. Must match an existing prim/name unless the attribute is being created. */
+    ovstage_attribute_semantic_t semantic;   /**< Authored USD interpretation (point vs float3, asset vs string, ...). NONE = unspecified; adopts an unambiguous compatible existing identity. Conflicting authored roles on a target prim/name are rejected unless attribute_mode is FORCE. Takes effect only when unmap succeeds. */
     ovstage_prim_mode_t          prim_mode;  /**< UPSERT (create absent prims, update present) or INSERT (create-only; OVSTAGE_ERROR_PRIM_NOT_FOUND if a prim already exists). */
+    ovstage_attribute_mode_t     attribute_mode; /**< REJECT (default) fails setup when a target prim has the attribute with a different schema; FORCE replaces that schema when each group commits. FORCE requires `dtype`. See ovstage_attribute_mode_t. */
 } ovstage_map_desc_t;
 
 /* ═══════════════════════════════════════════════════════════════════════════════
@@ -719,12 +814,21 @@ typedef struct {
  * Tensor lifetime is selected per attribute write via two mutually exclusive arrays:
  * - `tensors`         : client-managed DLTensors. Caller guarantees they remain
  *                       valid until the corresponding op completes (observable
- *                       via the wait_op slot on the enqueue op_id).
+ *                       via the wait_op slot on the enqueue op_id). A placed
+ *                       write with an `availability_event` (see the
+ *                       experimental ovstage_placement_t) may still read them
+ *                       after that, so there they remain valid until the event
+ *                       completes, or, if it could not be recorded, until the
+ *                       synchronization ovstage_placement_t names for that case.
  * - `managed_tensors` : storage-managed DLManagedTensorVersioned. Ownership
  *                       transfers to the implementation, which invokes each
- *                       tensor's deleter when its storage is no longer needed.
+ *                       tensor's deleter once no work of the op reads its
+ *                       storage. With an `availability_event` that can be after
+ *                       the op completes, on an implementation-owned thread, and
+ *                       at the latest while the instance is destroyed.
  *
- * Tensor transport layout matches ovstage_data_t (see above). Logical
+ * Tensor selection matches ovstage_data_t (see above); write tensors use
+ * the canonical input layout documented below. Logical
  * attribute kind is declared independently by `is_array`.
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
@@ -745,8 +849,10 @@ typedef struct {
  *            shape dimensions (for example `(N, 3)` with `lanes == 1`, or
  *            `(N, 4)` with `lanes == 4`). Those per-row dimensions are folded
  *            into `dtype.lanes`; their rank and shape are not preserved. Reads
- *            and maps expose the canonical 1-D form (`(N,)`, lanes 3 or 16 in
- *            these examples). Without `index_map`, `shape[0]` must equal the
+ *            and maps instead expose scalar lanes with component axes derived
+ *            from the stored width and semantic: `(N, 3)` for a three-component
+ *            tuple, `(N, 4, 4)` for a 4x4 MATRIX, and `(N, 16)` for a generic
+ *            16-component tuple. Without `index_map`, `shape[0]` must equal the
  *            logical element count. A flat `(N * L,)`, `lanes == 1` tensor is
  *            not an encoding of `N` rows of width `L`.
  * @invariant When `is_array == true`, `tensor_count == 1` selects packed
@@ -799,16 +905,17 @@ typedef struct {
  * implicit broadcasting or kind correction.
  */
 typedef struct {
-    const DLTensor*                        tensors;          /**< Client-managed tensors (read-only to the implementation). Must remain valid until op completes. NULL when managed_tensors is provided. */
-    const DLManagedTensorVersioned* const* managed_tensors;  /**< Storage-managed tensors (read-only to the implementation). Deleter invoked when storage no longer needs them. NULL when tensors is provided. */
+    const DLTensor*                        tensors;          /**< Client-managed tensors (read-only to the implementation). Must remain valid until op completes, or until the placement's availability_event has completed when one is supplied (longer if that event could not be recorded; see ovstage_placement_t). NULL when managed_tensors is provided. */
+    const DLManagedTensorVersioned* const* managed_tensors;  /**< Storage-managed tensors (read-only to the implementation). Deleter invoked once no work of the op reads them, which can be after op completion when an availability_event is supplied. NULL when tensors is provided. */
     uint32_t                               tensor_count;     /**< Number of tensors in tensors/managed_tensors; selects transport layout, not attribute kind. */
 
     uint32_t                               count;       /**< Logical element count; addresses the leading `count` prims in query order. Required (non-zero) when index_map/mask present; `0` = every prim the query covers. */
     const uint32_t*                        index_map;   /**< NULL = identity; non-NULL = gather/reorder/dedup. `count` source row indices, each below the transported row count. */
     ovstage_mask_t                         mask;        /**< NULL = all valid; non-NULL = bitmask over elements, at least `ceil(count / 64)` words long. Selects target elements; it does not change how the payload is cut into rows. */
     ovstage_cuda_sync_t                    cuda_sync;   /**< GPU sync applied before access; `{0,0}` = none. See ovstage_cuda_sync_t. */
-    ovstage_attribute_semantic_t           semantic;    /**< Authored USD interpretation for this write (NONE = unspecified). Must match an existing prim/name unless the attribute is being created. Geometric semantics are recorded at creation and surfaced back on read; see ovstage_attribute_semantic_t. */
-    bool                                   is_array;    /**< Logical attribute kind. Sole authority for fixed (`false`) versus array (`true`) storage. Kept last to minimize padding; it occupies existing tail padding on 64-bit ABIs. */
+    ovstage_attribute_semantic_t           semantic;    /**< Authored USD interpretation for this write (NONE = unspecified). Must match an existing prim/name unless the attribute is being created or attribute_mode is FORCE. Geometric semantics are recorded at creation and surfaced back on read; see ovstage_attribute_semantic_t. */
+    bool                                   is_array;    /**< Logical attribute kind. Sole authority for fixed (`false`) versus array (`true`) storage. */
+    ovstage_attribute_mode_t               attribute_mode; /**< REJECT (default) fails the write when a target prim has the attribute with a different schema; FORCE replaces that schema. See ovstage_attribute_mode_t. Last field: the fields before it keep their earlier offsets. */
 } ovstage_write_data_t;
 
 /**
@@ -832,7 +939,7 @@ typedef struct {
  * convenience wrappers in `ovstage_api_utils.h` and sibling extension APIs.
  *
  * Instance creation and destruction are NOT part of the contract. Each
- * backend (e.g. ovstage) provides its own factory function.
+ * implementation (e.g. ovstage) provides its own factory function.
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
 #ifndef OVSTAGE_INSTANCE_T_DECLARED

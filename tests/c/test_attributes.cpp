@@ -179,11 +179,19 @@ TEST_F(SemanticsTest, SemanticRolesRoundTrip)
     releaseRead(&group, read);
     ASSERT_TRUE(readSemantic(matrix, &group, &read, &semantic));
     const bool hasMatrixTensor = group.data.tensor_count > 0u;
-    const uint16_t matrixLanes = hasMatrixTensor ? group.data.tensors[0].dtype.lanes : 0u;
+    if (hasMatrixTensor)
+    {
+        const DLTensor& tensor = group.data.tensors[0];
+        EXPECT_EQ(tensor.dtype.lanes, 1u);
+        ASSERT_EQ(tensor.ndim, 3);
+        ASSERT_NE(tensor.shape, nullptr);
+        EXPECT_EQ(tensor.shape[0], 2);
+        EXPECT_EQ(tensor.shape[1], 4);
+        EXPECT_EQ(tensor.shape[2], 4);
+    }
     releaseRead(&group, read);
     EXPECT_EQ(semantic, OVSTAGE_SEMANTIC_MATRIX);
     ASSERT_TRUE(hasMatrixTensor);
-    EXPECT_EQ(matrixLanes, 16u);
 
     ASSERT_TRUE(readSemantic(material, &group, &read, &semantic));
     const bool hasMaterialTensor = group.data.tensor_count > 0u && group.data.tensors[0].data;

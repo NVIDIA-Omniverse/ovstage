@@ -7,20 +7,72 @@
  * so renderers like ovrtx (via ovrtx_attach_ovstage) can consume it.
  *
  * Ordinal ownership. The application — typically a frame coordinator —
- * owns ordinal lifecycle: it advances the write floor for each tick, and
- * hands the current ordinal to the population API. The population API
+ * owns ordinal lifecycle: it supplies ordinals for population and advances the
+ * write floor after the producers for a tick have completed. The population API
  * never opens or commits an ordinal of its own; each call is invoked
- * against a caller-provided ordinal so multiple producers can fold into
- * one write floor per tick.
+ * against a caller-provided ordinal. Multiple producer ordinals can be sealed
+ * by one write-floor advance at the end of a tick.
  *
- * Every population entry point that carries an `ordinal` mutates the stage
- * through the ovstage write API, so it is bound by the same admission rule as
- * `ovstage_write_attributes`: the ordinal must be strictly **greater than** the
+ * Every population entry point that carries an `ordinal` requires the same
+ * ordinal discipline as `ovstage_write_attributes`: it must be greater than the
  * effective write floor at execution time, or the writes are rejected with
  * `OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION`. A newly created instance starts with a
  * write floor of 0, so the first population must use an ordinal of at least 1;
  * 0 is never a usable write ordinal. (0 remains valid wherever an ordinal is
  * *read* — it is a real ordinal value, not a sentinel.)
+ *
+ * Wait for population to complete before applying direct writes that override
+ * populated values, and use a newer ordinal for those writes. Use increasing
+ * ordinals for successive `ovstage_population_apply_usd_changes` and
+ * `ovstage_population_apply_usd_time` calls that update the same data. Complete
+ * all updates before advancing the write floor. See
+ * `ovstage_ordinal_admission_policy_t` for the available admission policies.
+ *
+ * @remark RENDERING population rejects updates at or below the global write
+ * floor. Other ordinal conflicts involving population are not fully checked.
+ *
+ * Repopulating an instance. An open writes the new content over whatever the
+ * instance already holds; it never removes what an earlier open left behind. That
+ * holds attribute by attribute, not only prim by prim: a prim both scenes contain
+ * keeps any attribute the new scene no longer provides, alongside the values the
+ * new scene did bring, and a prim only the old scene had stays whole. Opening
+ * different content on a populated instance therefore yields a mixture of the two
+ * unless the caller clears first.
+ *
+ * To replace the content instead, clear it first. `ovstage_population_reset_usd`
+ * empties the USD source and the following `ovstage_population_apply_usd_changes`
+ * removes what had been populated from it, leaving prims the application wrote
+ * itself alone. Each step is an enqueue: wait for it to complete before the next,
+ * or the open can begin writing before the clear has landed.
+ *
+ *     ovstage_population_reset_usd(stage);
+ *     ovstage_population_apply_usd_changes(stage, n);
+ *     ovstage_population_open_usd_from_file(stage, path, n + 1, time, domains);
+ *
+ * To empty the instance outright, including the application's own prims, delete
+ * every prim on it. The query is an enqueue too: wait for it before handing its
+ * handle to the delete, and release the handle afterwards.
+ *
+ *     ovstage_query(stage, NULL, NULL, 0, &all);           // no filter: every prim
+ *     ovstage_delete_attributes(stage, all, NULL, 0, n);   // no attributes: whole prims
+ *     ovstage_release_query(stage, all);
+ *     ovstage_population_open_usd_from_file(stage, path, n + 1, time, domains);
+ *
+ * Use a newer ordinal for the open than for the preceding clear.
+ *
+ * `ovstage_population_repopulate_usd_with_desc` follows the same rule: it writes
+ * over what the instance holds and removes nothing.
+ *
+ * Failure and the ordinal. A call rejected at enqueue — reported in the returned
+ * `ovstage_population_enqueue_result_t`'s `status` — never ran. Nothing was
+ * written, the previously populated content is unchanged, and the caller may
+ * retry at the same ordinal.
+ *
+ * A failure reported later, by `ovstage_population_wait_op`, carries no such
+ * guarantee: the operation was already under way, so it may have written at the
+ * ordinal and may have discarded the previous content. Repopulate at a higher
+ * ordinal rather than reusing the failed one. The status code does not narrow
+ * this further; `ovstage_population_get_last_error` carries the detail.
  *
  * Stage metadata. Populated onto the root prim, `/`, when something asks for it: a
  * selected domain may bring stage metadata of its own, and a desc names whatever it
@@ -32,20 +84,20 @@
  * populate gains an attribute and a key removed loses one.
  *
  * ovrtx pairing contract. An ovstage_population_open_usd_* call or
+ * ovstage_population_repopulate_usd_with_desc or
  * ovstage_population_apply_usd_changes call performs a wholesale or
  * structural stage mutation. A consumer attached in borrow mode
  * (for example, a renderer attached with `ovrtx_attach_ovstage`) must re-anchor
  * its derived state from the shared stage before its next render: the
  * canonical sequence is
  *     `ovstage_population_open_usd_*` /
+ *     `ovstage_population_repopulate_usd_with_desc` /
  *     `ovstage_population_apply_usd_changes` -> wait_op ->
  *     `ovstage_advance_write_floor` -> `ovrtx_update_from_stage` ->
  *     `ovrtx_step_with_stage`.
  * `ovstage_population_apply_usd_time` is time-only and does not require
  * the consumer to rebuild; the consumer's incremental update path is
- * sufficient. No additional ovstage_population_* C entry point is needed
- * for this pairing. No additional public ovstage symbols are required for
- * this integration path.
+ * sufficient.
  */
 
 #ifndef OVSTAGE_POPULATION_H
@@ -53,6 +105,8 @@
 
 #include "ovstage_api/ovstage_api.h"
 #include "ovstage_population_predicate.h"
+
+#include <math.h>
 
 #ifdef __cplusplus
 extern "C"
@@ -71,7 +125,9 @@ extern "C"
         /** Meshes, lights, materials, and cameras. */
         OVSTAGE_POPULATION_DOMAIN_RENDERING = 1u << 0,
         /** Colliders, rigid bodies, joints, articulations, and the physics
-         *  schema attributes/relationships authored on them. */
+         *  schema attributes/relationships authored on them. Every prim it
+         *  populates also carries its composed USD type name as
+         *  `usd-metadata:typeName`. */
         OVSTAGE_POPULATION_DOMAIN_PHYSICS   = 1u << 1,
         OVSTAGE_POPULATION_DOMAIN_ALL       = OVSTAGE_POPULATION_DOMAIN_RENDERING |
                                               OVSTAGE_POPULATION_DOMAIN_PHYSICS,
@@ -151,6 +207,32 @@ extern "C"
 
 #define OVSTAGE_POPULATION_INVALID_USD_REFERENCE_HANDLE ((ovstage_population_usd_reference_handle_t)0)
 
+    /** The `time` value that selects USD's *default* time code rather than a
+     *  numeric one.
+     *
+     *  Every population entry point taking a `time` takes it in seconds. Passing
+     *  this instead evaluates each property at USD's default time code.
+     *
+     *  The value is a NaN.
+     *
+     *  **Never compare a time against it with `==`.** A NaN is not equal to
+     *  itself, so `time == OVSTAGE_POPULATION_DEFAULT_TIME` is false even for the
+     *  default time. Use `ovstage_population_is_default_time` instead. */
+#define OVSTAGE_POPULATION_DEFAULT_TIME NAN
+
+    /** Test whether a `time` selects USD's default time code.
+     *
+     *  Use this rather than `time == OVSTAGE_POPULATION_DEFAULT_TIME`, which is
+     *  false even for the default time.
+     *
+     *  @param time  A time in seconds, as passed to a population entry point.
+     *  @return `true` if @p time selects the default time code, `false` if it
+     *   names a numeric time. */
+    static inline bool ovstage_population_is_default_time(double time)
+    {
+        return isnan(time) != 0;
+    }
+
     /** Result of enqueuing a population operation.
      *
      *  Population runs asynchronously: `status` reports only that the operation
@@ -191,45 +273,58 @@ extern "C"
         ovstage_population_op_id_t        lowest_pending_op_id;
     } ovstage_population_op_wait_result_t;
 
-    /** The reserved `usd-prim-type` value population authors onto prims that have
-     *  no USD type (typeless `def "Foo"` containers). USD allows a defined prim to
-     *  carry no type name, but ovstage rows are keyed/created through their prim
-     *  type; authoring this synthetic type makes a typeless prim a first-class,
-     *  queryable row so prim-tree/hierarchy walks can cross it (e.g. a typeless
-     *  `/World` between `/` and its populated descendants). It is namespaced to
-     *  never collide with a real USD type, and consumers can filter `usd-prim-type`
-     *  against this value to recognize originally-typeless prims.
-     *
-     *  Returned as an `ovx_string_t` view over a static, null-terminated literal:
-     *  `.ptr` is a valid C string and `.length` its byte length. */
-    static inline ovx_string_t ovstage_population_untyped_type_name(void)
-    {
-        static const char name[] = "__ovstage_population_untyped__";
-        ovx_string_t result;
-        result.ptr = name;
-        result.length = sizeof(name) - 1;
-        return result;
-    }
-
     /** Reserved prim attributes.
      *
-     *  Every populated prim carries `usd-prim-type`, whatever put it in scope and
-     *  whatever its properties are. A prim USD gives no type name gets
-     *  `ovstage_population_untyped_type_name()` instead, so it is never absent.
+     *  Every populated prim with a USD type name, other than an instance root (below),
+     *  carries it as `usd-prim-type`,
+     *  whatever put the prim in scope and whatever its properties are. A prim to
+     *  which USD gives no type name is still populated but carries no `usd-prim-type`.
      *
-     *  `usd-schemas` carries the prim's applied API schema names, and is populated only
-     *  when it has any — a prim with none does not carry it at all, rather than carrying
-     *  an empty one.
+     *  Every populated prim carries `usd-schemas` with the prim's applied API schema
+     *  names; a prim with none carries an empty set. A `HAS` predicate on it therefore
+     *  matches every populated prim; use `CONTAINS` to select prims by a schema. An
+     *  instance of a multiple-apply schema, such as `CollectionAPI:lightLink`, also adds
+     *  the schema's bare name, `CollectionAPI`.
      *
-     *  Neither depends on the selector's property predicate. A selector that publishes no
-     *  properties at all still yields these. */
+     *  Every populated prim with a known USD type carries the types it derives from as
+     *  `usd-ancestor-types`, excluding its own type. A typeless prim, or a type no loaded
+     *  schema declares, carries none. Use `CONTAINS` to select prims by a base type, such
+     *  as every `Boundable` prim.
+     *
+     *  An instance root is the exception, in every domain. Its `usd-prim-type` is
+     *  `XformInstance`, or `ScopeInstance` when it is a `Scope`, whatever its authored type.
+     *  Its `usd-schemas` also carries `GeomInstanceAPI`, and `GeomInstanceRootAPI` when it is
+     *  outside a prototype; no USD schema applies these names. Its `usd-ancestor-types` is
+     *  `Xformable` alone. Where PHYSICS or a selector populates it, its authored type is
+     *  `usd-metadata:typeName`.
+     *  This does not apply when PHYSICS or a selector populates an instanceable prim
+     *  authored below a `PointInstancer`, such as one inside its prototypes scope: it keeps
+     *  its authored type and applied schemas, even alongside RENDERING, and carries neither
+     *  instance tag. Without RENDERING it receives its normal USD ancestors; with RENDERING,
+     *  population does not synthesize `usd-ancestor-types` at these authored paths.
+     *  It still links its prototype, so the instancing queries list it as an instance root.
+     *  RENDERING renders a `PointInstancer`'s prototypes from copies it makes under the
+     *  instancer and populates no instance data at the authored path.
+     *
+     *  None of these depends on the selector's property predicate. A selector that selects
+     *  no properties at all still yields them.
+     *
+     *  @remark The RENDERING domain currently differs in a few ways. Prims it populates
+     *   carry `usd-schemas` only when they have applied API schemas; a prim there with
+     *   none, such as a typeless container, carries neither `usd-prim-type` nor
+     *   `usd-schemas`. When RENDERING is selected, it provides `usd-ancestor-types` for
+     *   every prim, and its sets differ in a few cases, such as `Imageable` on a typeless
+     *   prim. Its `usd-schemas` carries further names no USD schema applies, such as
+     *   `PrimvarsAPI`. With RENDERING alone, a `Scope` and a non-`Scope` instance root
+     *   sharing a prototype may both carry the instance type of the first one encountered.
+     *   The population documentation lists these cases. These are temporary limitations. */
 
     /** Populated value types.
      *
-     *  What a USD value becomes in ovstage is fixed by its USD value type, and a caller
-     *  selecting arbitrary properties needs it up front to size and interpret a read.
-     *  The rules below give the whole mapping; the per-type table is in the population
-     *  documentation.
+     *  What a USD value becomes in ovstage is fixed by its USD value type: the type USD
+     *  reports for the attribute, which for a schema-declared attribute is the declared
+     *  type. The rules below give the whole mapping; the per-type table is in the
+     *  population documentation.
      *
      *  - **Numeric** types keep their bytes. The dtype's element type and bit width come
      *    from the USD scalar type and its lane count from the number of components, so
@@ -237,14 +332,17 @@ extern "C"
      *    `{int, 32, 4}`, and `matrix4d` is `{float, 64, 16}`.
      *  - **A USD array** populates with the same dtype as its element type and
      *    `is_array = true`. Everything else populates flat, one fixed-size value per prim.
-     *  - **String-like** types do not populate as text. `token`, `string`,
+     *  - **String-like** types normally do not populate as text. `token`, `string`,
      *    `pathExpression` and the halves of an `asset` are interned through the path
      *    dictionary and populate as `{uint, 64, 1}` ids, which a consumer resolves back
      *    through the dictionary. An `asset` is the exception in width: it carries the
-     *    `(authored, resolved)` pair as `{uint, 64, 2}`.
-     *  - **An empty** token, string, path expression, or asset half populates as id 0.
-     *    It is a value USD authors and reads back, so it is populated rather than
+     *    `(authored, resolved)` pair as `{uint, 64, 2}`. Schema-pinned exceptions are
+     *    listed in the population guide.
+     *  - **An empty** token, string, path expression, or asset half normally populates as
+     *    id 0. It is a value USD authors and reads back, so it is populated rather than
      *    dropped: absence means the property was not authored, not that it was empty.
+     *    A string pinned to the byte representation below instead populates as an
+     *    empty `OVSTAGE_SEMANTIC_STRING` byte row.
      *  - **The semantic** records what the bytes mean. It comes from the USD type's role
      *    where it has one (`point3f` to `OVSTAGE_SEMANTIC_POINT`, `color3f` to
      *    `..._COLOR`, `frame4d` to `..._FRAME`), and otherwise from the type itself
@@ -255,10 +353,39 @@ extern "C"
      *  - **`opaque`** carries no value by definition, so nothing is populated for it and
      *    nothing is reported.
      *
-     *  A few properties populate in a type their USD type does not predict, because the
-     *  `OVSTAGE_POPULATION_DOMAIN_RENDERING` domain publishes them in a fixed one and
-     *  both domains must agree on a shared stage. These are listed in the documentation;
-     *  `extent` is the one whose dtype differs rather than only its semantic. */
+     *  Some properties populate in a type their USD type does not predict, because the
+     *  `OVSTAGE_POPULATION_DOMAIN_RENDERING` domain populates them in a fixed one and
+     *  both domains must agree on a shared stage. The population guide lists them, with
+     *  the schema or prim type each pin is gated on. A value that cannot be represented
+     *  in the pinned type is skipped with a warning; the attribute keeps its required
+     *  type and its last written value. This mismatch does not fail population.
+     *
+     *  A value authored in another numeric type than its schema declares is converted to
+     *  the declared type as USD converts numeric values:
+     *
+     *  - Conversion keeps the shape: scalar to scalar, array to array, vector to vector of
+     *    the same dimension, over the `bool`, `uchar`, `int`, `uint`, `int64`, `uint64`,
+     *    `half`, `float` and `double` scalars and the `int`, `half`, `float` and `double`
+     *    vectors of 2, 3 and 4 components, in any role. Each scalar, element and component
+     *    converts on its own.
+     *  - To an integer or `bool`: an integer or `bool` value converts if it is in the
+     *    declared type's range (0 or 1 for `bool`); a floating-point value is truncated
+     *    toward zero and converts if that is in range, and an infinity or NaN does not
+     *    convert.
+     *  - To floating point: every value converts, rounded to the declared type. A value
+     *    beyond the declared type's range becomes an infinity, and a nonzero value too
+     *    small for it becomes zero. Infinities and NaN convert unchanged.
+     *  - Every element and component must convert, or the whole value is skipped with
+     *    a warning. The attribute keeps its declared type and its last written value.
+     *  - Shape mismatches and nonnumeric type mismatches (`token`, `string`, `asset`
+     *    and so on) also skip the value with a warning rather than failing population.
+     *  - Re-authoring the property's declared type or role replaces its column using
+     *    FORCE attribute replacement; an unconvertible value does not replace it.
+     *  - An attribute without a schema declaration uses its authored type, subject to
+     *    the representation rules above.
+     *
+     *  Export reads the populated state rather than the USD source, so everything above
+     *  carries over into exported USD; see `ovstage_population_export.h`. */
 
     /** Path predicates.
      *
@@ -271,7 +398,7 @@ extern "C"
     /** Populated ancestors.
      *
      *  A prim that `OVSTAGE_POPULATION_DOMAIN_PHYSICS` or a desc's selectors put in
-     *  scope is published together with every one of its ancestor prims, so a consumer
+     *  scope is populated together with every one of its ancestor prims, so a consumer
      *  can walk the prim tree down to it however sparse the selection is.
      *
      *  An ancestor that no selector matches on its own merit carries none of the data a
@@ -327,7 +454,12 @@ extern "C"
      *
      *  A prim that is not xformable gets none of these. Being xformable does not by
      *  itself put a prim in scope: the derivation only ever applies to prims population
-     *  already publishes. */
+     *  already includes.
+     *
+     *  These names belong to population. A USD property named `omni:xform`,
+     *  `omni:resetXformStack` or `omni:fabric:worldMatrix`, or `omni:fabric:localMatrix` /
+     *  `omni:fabric:resetXformStack` (how the stage stores the first two), is never
+     *  published, even when a selector names or matches it, on any prim. */
 
 
     /**
@@ -344,8 +476,16 @@ extern "C"
      *
      * @param paths       Array of @p path_count paths, each a USD plugin
      *                    descriptor (`plugInfo.json`) or a directory containing
-     *                    one. A descriptor's `Includes` are followed. Each
-     *                    `ovx_string_t` must remain valid until this call returns.
+     *                    one. A descriptor's `Includes` are followed. Symbolic
+     *                    links (and directory junctions on Windows) are
+     *                    followed, but a linked descriptor's relative `Root`,
+     *                    `ResourcePath` and `Includes` resolve beside the link,
+     *                    not beside its target. Link the directory holding a
+     *                    descriptor, or link the descriptor together with the
+     *                    files it refers to; otherwise the call succeeds but
+     *                    the definitions those paths lead to never resolve.
+     *                    Each `ovx_string_t` must remain valid until this call
+     *                    returns.
      * @param path_count  Number of entries in @p paths. Zero is a no-op.
      *
      * @return OVSTAGE_OK on success; OVSTAGE_ERROR_INVALID_ARGUMENT for a NULL
@@ -380,13 +520,15 @@ extern "C"
         const ovx_string_t* paths,
         size_t              path_count);
 
+
     /**
      * Enqueue an asynchronous operation to populate an ovstage instance from a
      * USD file.
      *
-     * Replaces any USD content previously loaded into this ovstage with the
-     * contents of @p path. This both loads the USD and populates the ovstage in
-     * one operation. Initial population is one-shot; live edits
+     * Loads @p path as this instance's USD source, replacing whatever source was
+     * loaded before, and populates from it in one operation. Replacing the source
+     * does not remove what an earlier populate wrote: see "Repopulating an instance"
+     * above. Initial population is one-shot; live edits
      * made afterwards are picked up by `ovstage_population_apply_usd_changes` /
      * `ovstage_population_apply_usd_time`.
      *
@@ -395,7 +537,7 @@ extern "C"
      *
      * @param stage      ovstage instance to populate into.
      * @param path       Filesystem path to a `.usda` / `.usdc` / `.usd` file, or
-     *                   an Omniverse Nucleus URL (`omniverse://server/path.usd`),
+     *                   an Omniverse Nucleus URL (`omniverse://<server>/<path>.usd`),
      *                   as an `ovx_string_t` view.
      * @param ordinal    Accumulating ordinal owned by the caller. Must be
      *                   greater than the effective write floor at execution
@@ -403,7 +545,8 @@ extern "C"
      *                   population starts at 1.
      * @param time       Time in seconds at which to evaluate attributes;
      *                   converted to a USD time code via the stage's
-     *                   timeCodesPerSecond.
+     *                   timeCodesPerSecond. `OVSTAGE_POPULATION_DEFAULT_TIME`
+     *                   evaluates at USD's default time code instead.
      * @param domains    Bitmask of `ovstage_population_domain_t` selecting which
      *                   data domains to populate. `0` (DOMAIN_NONE) populates
      *                   nothing; pass `OVSTAGE_POPULATION_DOMAIN_ALL` for
@@ -413,6 +556,10 @@ extern "C"
      *  the stage cannot be populated, the file cannot be opened, or population
      *  failed — are surfaced by `ovstage_population_wait_op`, with detail in
      *  `ovstage_population_get_last_error`.
+     * @remark A rejected enqueue leaves @p ordinal and the previously populated
+     *  content untouched, so the caller may retry at the same ordinal. A failure
+     *  reported by `ovstage_population_wait_op` carries no such guarantee:
+     *  repopulate at a higher ordinal.
      */
     ovstage_population_enqueue_result_t ovstage_population_open_usd_from_file(
         ovstage_instance_t* stage,
@@ -436,6 +583,8 @@ extern "C"
      *                   population starts at 1.
      * @param time       Time in seconds; converted to a USD time code via the
      *                   stage's timeCodesPerSecond.
+     *                   `OVSTAGE_POPULATION_DEFAULT_TIME` evaluates at USD's
+     *                   default time code instead.
      * @param domains    Bitmask of `ovstage_population_domain_t` selecting which
      *                   data domains to populate. `0` (DOMAIN_NONE) populates
      *                   nothing; pass `OVSTAGE_POPULATION_DOMAIN_ALL` for
@@ -445,6 +594,10 @@ extern "C"
      *  the stage cannot be populated, the USDA content fails to parse, or
      *  population failed — are surfaced by `ovstage_population_wait_op`, with
      *  detail in `ovstage_population_get_last_error`.
+     * @remark A rejected enqueue leaves @p ordinal and the previously populated
+     *  content untouched, so the caller may retry at the same ordinal. A failure
+     *  reported by `ovstage_population_wait_op` carries no such guarantee:
+     *  repopulate at a higher ordinal.
      */
     ovstage_population_enqueue_result_t ovstage_population_open_usd_from_string(
         ovstage_instance_t* stage,
@@ -464,7 +617,7 @@ extern "C"
      *
      * @param stage      ovstage instance to populate into.
      * @param path       Filesystem path to a `.usda` / `.usdc` / `.usd` file, or
-     *                   an Omniverse Nucleus URL (`omniverse://server/path.usd`),
+     *                   an Omniverse Nucleus URL (`omniverse://<server>/<path>.usd`),
      *                   as an `ovx_string_t` view.
      * @param ordinal    Accumulating ordinal owned by the caller. Must be
      *                   greater than the effective write floor at execution
@@ -472,7 +625,8 @@ extern "C"
      *                   population starts at 1.
      * @param time       Time in seconds at which to evaluate attributes;
      *                   converted to a USD time code via the stage's
-     *                   timeCodesPerSecond.
+     *                   timeCodesPerSecond. `OVSTAGE_POPULATION_DEFAULT_TIME`
+     *                   evaluates at USD's default time code instead.
      * @param descs      Array of descriptions selecting what to populate; their
      *                   `domains` are OR-ed together and their selectors combined.
      *                   Must stay valid only until this call returns. May be `NULL`
@@ -484,6 +638,10 @@ extern "C"
      *  the stage cannot be populated, the file cannot be opened, or population
      *  failed — are surfaced by `ovstage_population_wait_op`, with detail in
      *  `ovstage_population_get_last_error`.
+     * @remark A rejected enqueue leaves @p ordinal and the previously populated
+     *  content untouched, so the caller may retry at the same ordinal. A failure
+     *  reported by `ovstage_population_wait_op` carries no such guarantee:
+     *  repopulate at a higher ordinal.
      */
     ovstage_population_enqueue_result_t ovstage_population_open_usd_from_file_with_desc(
         ovstage_instance_t*                    stage,
@@ -508,6 +666,8 @@ extern "C"
      *                   population starts at 1.
      * @param time       Time in seconds; converted to a USD time code via the
      *                   stage's timeCodesPerSecond.
+     *                   `OVSTAGE_POPULATION_DEFAULT_TIME` evaluates at USD's
+     *                   default time code instead.
      * @param descs      Array of descriptions selecting what to populate; their
      *                   `domains` are OR-ed together and their selectors combined.
      *                   Must stay valid only until this call returns. May be `NULL`
@@ -519,6 +679,10 @@ extern "C"
      *  the stage cannot be populated, the USDA content fails to parse, or
      *  population failed — are surfaced by `ovstage_population_wait_op`, with
      *  detail in `ovstage_population_get_last_error`.
+     * @remark A rejected enqueue leaves @p ordinal and the previously populated
+     *  content untouched, so the caller may retry at the same ordinal. A failure
+     *  reported by `ovstage_population_wait_op` carries no such guarantee:
+     *  repopulate at a higher ordinal.
      */
     ovstage_population_enqueue_result_t ovstage_population_open_usd_from_string_with_desc(
         ovstage_instance_t*                    stage,
@@ -527,6 +691,41 @@ extern "C"
         double                                 time,
         const ovstage_population_desc_t*       descs,
         size_t                                 desc_count);
+
+    /**
+     * Enqueue a wholesale population from the stage's current USD source,
+     * without replacing or editing that source.
+     *
+     * Retains the same USD stage, root and session layers, authored edits,
+     * composition state, and handles returned by the add-reference operations.
+     * It does not reopen files, reload layers, change the edit target, or adopt
+     * another USD stage. Every attribute the supplied descriptions select is
+     * written again from USD at @p time, replacing any value written directly
+     * into the ovstage since. Like an open, it removes nothing: prims and
+     * attributes the descriptions do not populate, including ones absent from
+     * USD, remain; delete them when they must not survive it. The supplied
+     * descriptions replace the population scope used by subsequent changes/time
+     * operations; they are not combined with the previous scope.
+     *
+     * @param stage      Instance with an existing population source.
+     * @param ordinal    Caller-owned accumulating ordinal; must be greater than
+     *                   the effective write floor at execution time.
+     * @param time       Seconds, converted using the retained stage's
+     *                   timeCodesPerSecond, or OVSTAGE_POPULATION_DEFAULT_TIME.
+     * @param descs      Population descriptions, copied before the call returns.
+     *                   May be NULL when desc_count is zero (selects nothing).
+     * @param desc_count Number of descriptions.
+     * @return Enqueue status and op_index. No population state is rejected with
+     *         OVSTAGE_ERROR_NOT_FOUND; malformed arguments are rejected with
+     *         OVSTAGE_ERROR_INVALID_ARGUMENT. Await an accepted operation using
+     *         ovstage_population_wait_op.
+     */
+    ovstage_population_enqueue_result_t ovstage_population_repopulate_usd_with_desc(
+        ovstage_instance_t* stage,
+        ovstage_ordinal_t   ordinal,
+        double              time,
+        const ovstage_population_desc_t* descs,
+        size_t              desc_count);
 
     /**
      * Enqueue an asynchronous operation to add a USD file as a reference at
@@ -545,9 +744,19 @@ extern "C"
      * points first. The enqueue is rejected (`status`) if this stage has never been
      * populated.
      *
+     * The subtree that `ovstage_population_apply_usd_changes` republishes depends on
+     * @p target_path. For a not-yet-existing prim path it is only the new prim and
+     * the content beneath it. For an existing prim path it is that prim and every
+     * prim beneath it, including prims the reference does not add or change; for the
+     * root "/" it is the whole stage. Every selected attribute of a republished prim
+     * is written at the apply ordinal even when its value is unchanged, so a read of
+     * that ordinal range reports it as changed, and the written value replaces any
+     * value written directly into the ovstage since. To add content without
+     * republishing existing prims, target a not-yet-existing prim path.
+     *
      * @param stage         ovstage instance.
      * @param ref_file_path Filesystem path to a `.usda` / `.usdc` / `.usd` file, or an
-     *                    Omniverse Nucleus URL (`omniverse://server/path.usd`), as an
+     *                    Omniverse Nucleus URL (`omniverse://<server>/<path>.usd`), as an
      *                    `ovx_string_t` view — the layer to reference.
      * @param target_path Absolute path (starting with '/') selecting how the content
      *                    is merged, additively in every case:
@@ -641,11 +850,17 @@ extern "C"
      * Enqueue an asynchronous operation to reset (clear) all USD source content
      * from this stage.
      *
-     * Unlike the open entry points, which load and populate in one step, this
-     * edits only the USD source: call `ovstage_population_apply_usd_changes`
-     * afterwards to propagate the cleared state into the ovstage, or repopulate
-     * with `ovstage_population_open_usd_from_file` / `_open_usd_from_string`.
-     * Carries no ordinal.
+     * Unlike the open entry points, which load and populate in one step, this edits
+     * only the USD source. Call `ovstage_population_apply_usd_changes` afterwards to
+     * propagate the cleared state into the ovstage: until something does, what was
+     * populated from the old source is still there, and a later open merges into it
+     * rather than replacing it. Carries no ordinal.
+     *
+     * @remark Only USD source content is cleared. With the RENDERING domain
+     *  populated, the few prims the runtime currently maintains for its own
+     *  stage-level bookkeeping are not USD content and remain, so a query with no
+     *  path restriction still counts them afterwards; scope by `usd-path` prefix to
+     *  observe the emptied scene. This is a temporary, RENDERING-specific limitation.
      *
      * @param stage  ovstage instance.
      * @return Enqueue result (see `ovstage_population_enqueue_result_t`). A
@@ -670,6 +885,15 @@ extern "C"
      * selectors as well, so a description carrying selectors and `domains == 0` is
      * advanced like any other. Nothing outside that scope is written.
      *
+     * **Every in-scope time-sampled property is overwritten, whether or not @p time
+     * differs from the previous call.** Re-applying the same time is not a no-op:
+     * the values are re-read from USD and re-written at @p ordinal, so a property
+     * changed through the write API since the last advance is overwritten with what
+     * USD resolves at @p time.
+     *
+     * Passing `OVSTAGE_POPULATION_DEFAULT_TIME` as @p time advances to USD's
+     * default time code.
+     *
      * RENDERING — additional behavior: for the RENDERING domain this call also
      * reflects pending *structural* USD edits (prim add/remove, and attribute or
      * relationship changes that are not time samples) at the new time, even if
@@ -684,6 +908,8 @@ extern "C"
      *                   time.
      * @param time       New time in seconds; converted to a USD time code via
      *                   the stage's timeCodesPerSecond.
+     *                   `OVSTAGE_POPULATION_DEFAULT_TIME` advances to USD's
+     *                   default time code instead.
      * @return Enqueue result (see `ovstage_population_enqueue_result_t`). A
      *  rejected enqueue (no population state) is reported in `status`; a run-time
      *  failure is surfaced by `ovstage_population_wait_op`.
@@ -740,8 +966,11 @@ extern "C"
      *    are reported in @p out_wait_result, with per-op detail available from
      *    `ovstage_population_get_last_op_error` and the primary failure mirrored
      *    into `ovstage_population_get_last_error`.
-     *  - `OVSTAGE_ERROR_INVALID_ARGUMENT` for an unknown op id (zero, or never
-     *    enqueued), or when @p stage has no population state.
+     *  - `OVSTAGE_ERROR_INVALID_HANDLE` for an op id this instance's operation
+     *    stream never issued: zero, never enqueued, issued by a different
+     *    instance, or issued by a stream this instance has since replaced.
+     *  - `OVSTAGE_ERROR_NOT_FOUND` if @p stage has no population state (no
+     *    `_open_usd_*` has run on it).
      */
     ovstage_api_status_t ovstage_population_wait_op(
         ovstage_instance_t*                  stage,

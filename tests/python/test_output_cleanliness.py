@@ -58,7 +58,7 @@ scene = pathlib.Path(sys.argv[1])
 with ovstage.Stage("test.ovstage.output-cleanliness") as stage:
     if population.available():
         population.open_usd(
-            stage, str(scene), ordinal=1, time_code=0.0, domains=PopulationDomain.RENDERING
+            stage, str(scene), ordinal=1, time=0.0, domains=PopulationDomain.RENDERING
         )
         stage.advance_write_floor(ordinal=1).wait()
         print("POPULATED")

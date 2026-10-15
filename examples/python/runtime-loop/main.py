@@ -76,7 +76,7 @@ def main() -> int:
             # The application owns the ordinal lifecycle; population never opens
             # its own.
             population.open_usd(
-                stage, str(SCENE), ordinal=1, time_code=0.0, domains=PopulationDomain.RENDERING
+                stage, str(SCENE), ordinal=1, time=0.0, domains=PopulationDomain.RENDERING
             )
             stage.advance_write_floor(ordinal=1).wait()
             # [/snippet:populate]
@@ -90,7 +90,7 @@ def main() -> int:
             # ---- 2. read back: confirm the populate landed ----
             # [snippet:read-populated]
             # Read the reserved usd-prim-type metadata ovstage auto-maintains for
-            # every populated prim.
+            # every typed prim selected here.
             print("populated prim types:", ", ".join(_prim_types(stage, paths, scene_query, prim_type, 1)))
             # [/snippet:read-populated]
 
@@ -119,7 +119,7 @@ def main() -> int:
                     raise SystemExit("no data group returned for the final-frame omni:xform read")
                 try:
                     m = np.asarray(group.array(0)).ravel()  # row-major 4x4
-                    if m.size != 16:  # single-path query -> exactly one 16-lane matrix element
+                    if m.size != 16:  # single-path query -> exactly one 4x4 matrix row
                         raise SystemExit(f"unexpected omni:xform read layout: {m.size} values, expected 16")
                     print("final Torus xform translation (row [3][0:3]):", m[12:15])  # -> [100. 25. 0.]
                 finally:
@@ -171,7 +171,7 @@ def _translate_matrix(tx, ty, tz):
     """A 4x4 double transform as omni:xform expects it (row-major, translation in
     the last row). This example uses the canonical transport form: one 16-lane
     element per prim. A convenience 4x4 of lanes=1 is accepted on copy-in but
-    normalized back to shape [1], lanes=16 on raw reads and maps."""
+    stored in lane form. Raw reads and maps use shape [1, 4, 4], lanes=1."""
     m = np.array([1, 0, 0, 0,  0, 1, 0, 0,  0, 0, 1, 0,  tx, ty, tz, 1], dtype=np.float64)
     return make_dltensor(m, dtype=DLDataType(code=DLDataTypeCode.kDLFloat, bits=64, lanes=16), shape=[1])
 

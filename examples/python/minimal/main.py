@@ -49,12 +49,9 @@ def main() -> int:
 
                 # ---- 2. write, seal with the write floor, read back ----
                 # [snippet:minimal-write-read]
-                # Write one float per prim into the "temperature" column at ordinal 1,
-                # seal it by advancing the write floor to 1, then read it back. Tensor
-                # data crosses as a numpy array (CPU) via DLPack; async ops return an
-                # Operation whose .wait() raises OvstageError on failure. The read is
-                # a context manager -- block exit releases its handle even when an
-                # error interrupts -- and the fetched group is released in a finally.
+                # Write one value per prim, then advance the watermark before reading.
+                # wait() reports asynchronous failures; the context manager and finally
+                # block release the read and its result even if consuming the data fails.
                 stage.write_attribute(
                     query, attr, ordinal=1, tensors=np.array([1.0, 2.0, 3.0], np.float32), is_array=False
                 ).wait()
@@ -150,10 +147,8 @@ def main() -> int:
 # the exception surface and the non-blocking poll pattern.
 
 # [snippet:error-handling]
-# ovstage surfaces failures as exceptions: OvstageError for data-plane ops
-# (a numeric .code mapping to ovstage.ErrorCode, plus .message) and OvxError
-# for path-dictionary calls. Operation.wait() raises OvstageError if the
-# enqueue was rejected, or the op (or its ordinal-keyed dependencies) failed.
+# wait() reports rejected submissions and failed operations or dependencies.
+# OvstageError carries a numeric code and a message.
 def write_checked(stage, query, attr, ordinal, values) -> bool:
     try:
         stage.write_attribute(query, attr, ordinal=ordinal, tensors=values, is_array=False).wait()

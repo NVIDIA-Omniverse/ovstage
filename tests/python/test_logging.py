@@ -2,15 +2,10 @@
 # SPDX-License-Identifier: LicenseRef-NvidiaProprietary
 #
 # Public ovstage logging test: install a process-global log callback, flush, and
-# clear it (works on any build), and prove a channel-prefix filter with a NONE
-# default threshold suppresses delivery even while the stage does log-producing
-# work. CPU-only. Tested source for the logging skill.
-#
-# Note: there is no public API to emit a log message on demand, so this suite does
-# not assert that messages ARE delivered (some builds or workloads may legitimately
-# emit none); it asserts the callback lifecycle and suppression.
+# clear it (works on any build), verify the build-information record delivered
+# at callback installation, and prove a channel-prefix filter with a NONE default
+# threshold suppresses delivery. CPU-only. Tested source for the logging skill.
 
-import math
 
 from ovstage import LogSeverity, PopulationDomain, flush_log, population, set_log_callback
 
@@ -35,7 +30,7 @@ def _populate(stage):
     """Best-effort log-producing work; a no-op without the population bridge."""
     if population.available():
         population.open_usd_from_string(
-            stage, CUBE_USDA, ordinal=1, time_code=math.nan, domains=PopulationDomain.RENDERING
+            stage, CUBE_USDA, ordinal=1, time=population.DEFAULT_TIME, domains=PopulationDomain.RENDERING
         )
 
 
@@ -53,6 +48,7 @@ def test_log_callback_lifecycle(stage):
     finally:
         set_log_callback(None)  # clear: flushes and tears the dispatcher down
 
+    assert sum("OVStage build:" in message for _, message in seen) == 1
     for severity, message in seen:
         assert isinstance(severity, LogSeverity)
         assert isinstance(message, str)

@@ -16,12 +16,14 @@ high-performance data substrate for OV Libraries spanning physics, rendering, se
 animation, and graph. It provides a unified **C API** for reading, writing, querying, and
 managing simulation data such as transforms, velocities, materials, hierarchy, and
 metadata across CPU and GPU memory, with zero-copy data paths and DLPack tensor
-interchange. Currently, zero-copy applies to CUDA source-tensor writes; payload reads
-and map/unmap buffers are CPU-resident.
+interchange. Reads and maps use CPU buffers by default. The experimental
+:ref:`device-placement extension <ovstage-device-placement>` also supports CUDA
+buffers; reading a copy already current on the requested device avoids migration.
 
 In this documentation you will find getting started guides for C and Python, API
 references, and example projects.
 
+* :doc:`Start here: ovstage overview <concepts/overview>` — the data model, ordinals, watermarks, and reads.
 * :doc:`Getting started in C <c_api/getting_started>` — the validated bring-up path today.
 * :doc:`Getting started in Python <python_api/getting_started>` — the ctypes bindings over the same C API.
 
@@ -29,21 +31,6 @@ references, and example projects.
 
    ovstage is currently **pre-release** software. The API, runtime behavior, and
    packaging can change before GA.
-
-Execution Model
----------------
-
-ovstage uses an asynchronous, **ordinal-keyed** submit/observe model:
-
-* **Enqueue (synchronous).** State-mutating and data-producing calls return an
-  ``ovstage_enqueue_result_t`` (status + ``op_index``) immediately; the work is queued
-  and runs later.
-* **Ordinal-keyed write ordering.** Writes, deletes, and map commits carry an explicit
-  ``ordinal``. Same-ordinal ops run in submission order; different-ordinal ops are
-  independent and can run concurrently.
-* **Reads and queries are independent.** Reads target sealed data at or below the
-  immutable write floor. Queries resolve against the latest committed state.
-* **Zero-copy by default**, with DLPack ``DLTensor`` for tensor interchange.
 
 Support
 -------
@@ -71,6 +58,7 @@ The software and materials are governed by the `NVIDIA Software License Agreemen
    :hidden:
    :caption: Concepts
 
+   concepts/overview
    concepts/application_flow
    concepts/async_model
    concepts/error_handling
@@ -80,15 +68,16 @@ The software and materials are governed by the `NVIDIA Software License Agreemen
 .. toctree::
    :maxdepth: 2
    :hidden:
-   :caption: Scene Data
+   :caption: The Runtime Stage
 
+   scene/population
    scene/path_dictionary
    scene/queries
    scene/writing_attributes
    scene/transforms
    scene/reading_attributes
+   scene/device_placement
    scene/cloning
-   scene/population
    scene/exporting_to_usd
    scene/instancing
 
@@ -98,6 +87,7 @@ The software and materials are governed by the `NVIDIA Software License Agreemen
    :caption: Guides and Examples
 
    guides/runtime_loop
+   guides/benchmarking
    examples/index
 
 .. toctree::

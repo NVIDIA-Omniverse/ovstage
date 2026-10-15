@@ -35,3 +35,24 @@
     font-style: normal;
     font-weight: 400;
 }
+
+/* Keep the reference glossary compact while registering Sphinx term targets. */
+.overview-glossary dl.glossary {
+    display: grid;
+    grid-template-columns: minmax(8rem, 1fr) minmax(0, 4fr);
+}
+.overview-glossary dl.glossary > dt,
+.overview-glossary dl.glossary > dd {
+    margin: 0;
+    padding: 0.6rem;
+    border-bottom: 1px solid var(--pst-color-border);
+}
+.overview-glossary dl.glossary > dt {
+    grid-column: 1;
+}
+.overview-glossary dl.glossary > dd {
+    grid-column: 2;
+}
+.overview-glossary dl.glossary > dd > p:last-child {
+    margin-bottom: 0;
+}

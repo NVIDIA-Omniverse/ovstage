@@ -45,6 +45,7 @@ __all__ = [
     "DLPACK_MINOR_VERSION",
     "DLPACK_FLAG_BITMASK_READ_ONLY",
     "make_dltensor",
+    "typed_tensor_to_write",
     "dltensor_to_numpy",
     "numpy_to_dldatatype",
 ]
@@ -466,8 +467,9 @@ def _to_dlpack_capsule(
     ``DLManagedTensor``. Vector dtypes (``lanes > 1``) are expanded by adding
     exactly one trailing shape dimension and setting ``lanes = 1``, which is how
     array libraries consume them. This is lane expansion, not reconstruction of
-    a convenience write shape: a fixed matrix stored as ``shape=(N,)``,
-    ``lanes=16`` exports as ``(N, 16)``, not ``(N, 4, 4)``.
+    a convenience write shape: a caller-owned lane-based tensor exports one
+    component axis. Native read and map tensors already carry typed shapes,
+    including ``(N, 4, 4)`` for matrix4d, and keep those shapes.
     """
     actual_ndim = dl_tensor.ndim + (1 if dl_tensor.dtype.lanes > 1 else 0)
 
@@ -566,15 +568,17 @@ class ManagedDLTensor:
     ``torch.from_dlpack()`` for zero-copy access (CPU or CUDA), or call
     :meth:`numpy` for a CPU numpy view.
 
-    The tensor data is **borrowed** from ovstage and valid only until the owning
-    read/map group is released — copy it if it must outlive the read. A read
-    group is exported ``readonly=True``; a (writable) map group ``readonly=False``.
-    DLPack consumers see one trailing dimension added for a multi-lane dtype;
-    for example, a raw fixed matrix ``shape=(N,)``, ``lanes=16`` is exported as
-    ``(N, 16)`` rather than as any convenience input shape.
-    ``ManagedDLTensor.shape`` and its representation report the raw, unexpanded
-    ``(N,)`` shape; the trailing lane axis materializes only in a DLPack consumer
-    such as ``np.from_dlpack()``.
+    The tensor data and descriptor are **borrowed** from ovstage. Do not access
+    this producer or its consumer views after releasing the read group or after
+    an accepted group or final unmap submission. Retaining this producer does
+    not extend storage validity beyond those operations, and this producer does
+    not check whether the storage is still valid. Copy data while it is valid
+    if it must outlive the group. A read group is exported ``readonly=True``;
+    a (writable) map group ``readonly=False``.
+    Native read and map tensors have scalar lanes, so DLPack consumers and
+    ``ManagedDLTensor.shape`` see the same typed shape. Caller-owned multi-lane
+    tensors export one additional component axis; their ``shape`` property
+    continues to report the raw descriptor shape.
 
     ``manager_ctx`` is retained by this object and by any capsule it exports, but a
     capsule is destroyed as soon as a consumer takes ownership of it — which is
@@ -586,10 +590,9 @@ class ManagedDLTensor:
         managed = ManagedDLTensor(tensor, manager_ctx=owner)
         view = np.from_dlpack(managed)  # `managed` must outlive `view`
 
-    For ovstage read/map groups the ``manager_ctx`` does not own the backing
-    allocation, so the view stays valid while the owning group is alive — but a
-    consumer view does **not** keep that group alive. Bind the group for as long
-    as you use the view::
+    For ovstage read/map groups, keep the group or this producer alive while
+    using a consumer view, and observe the release/unmap limits above. A consumer
+    view does **not** keep the group alive. For example::
 
         group = read.fetch_next()
         arr = np.from_dlpack(group.dlpack(0))  # `group` must outlive `arr`
@@ -937,7 +940,8 @@ def make_dltensor(
     express, matching an explicitly authored multi-lane ``DLTensor`` descriptor.
     A fixed-size ovstage write may also accept the numpy shape directly as a
     convenience layout (for example, ``(N, 4, 4)`` with ``lanes=1``); subsequent
-    raw reads/maps normalize it to ``shape=(N,)``, ``lanes=16``.
+    reads and maps expose ``shape=(N, 4, 4)``, ``lanes=1`` when the stored
+    attribute has MATRIX semantic.
 
     Any *non-numpy* object exposing the DLPack protocol (warp / torch / cupy / jax,
     CPU **or** CUDA) is ingested zero-copy via :meth:`DLTensor.from_dlpack` instead,
@@ -1002,6 +1006,44 @@ def make_dltensor(
     # is built rather than later, at whichever read first tries to decode it.
     _check_lane_count(tensor.dtype, "cannot describe numpy array as DLTensor")
     return tensor
+
+
+def typed_tensor_to_write(source: DLTensor) -> DLTensor:
+    """Convert a known OVStage read/map descriptor to canonical write input.
+
+    This copies metadata only; payload, device and byte offset are preserved.
+    It does not infer component types for arbitrary multidimensional arrays.
+    Preserve the attribute semantic and array kind when submitting the write.
+    The returned descriptor retains ``source``, but cannot extend native group
+    storage lifetime. Copy payload before releasing a pinned read when writing
+    back to the same storage; wait for completion before releasing input data.
+    Compact component axes and a nonnegative, whole-element row stride are
+    required. Outer slices and broadcasts are preserved.
+    """
+    if source.ndim not in (1, 2, 3) or not source.shape or source.dtype.lanes != 1:
+        raise ValueError("expected a scalar-lane typed read/map tensor of rank 1..3")
+    if source.shape[0] < 0:
+        raise ValueError("negative leading tensor dimension")
+    components = 1
+    for axis in range(source.ndim - 1, 0, -1):
+        extent = int(source.shape[axis])
+        if extent <= 0 or extent > 255 // components:
+            raise ValueError("component count must be in [1, 255]")
+        if source.strides and source.strides[axis] != components:
+            raise ValueError("component axes must be compact")
+        components *= extent
+    row_stride = int(source.strides[0]) if source.strides else components
+    if row_stride < 0 or row_stride % components:
+        raise ValueError("row stride must span a whole number of logical elements")
+    result = DLTensor.from_buffer_copy(source)
+    layout = (ctypes.c_int64 * 2)(source.shape[0], row_stride // components)
+    result.ndim = 1
+    result.dtype.lanes = components
+    result.shape = ctypes.cast(layout, ctypes.POINTER(ctypes.c_int64))
+    result.strides = ctypes.cast(ctypes.byref(layout, ctypes.sizeof(ctypes.c_int64)), ctypes.POINTER(ctypes.c_int64))
+    result._layout_storage = layout
+    result._source = source
+    return result
 
 
 def dltensor_to_numpy(tensor: DLTensor, *, readonly: bool = False):

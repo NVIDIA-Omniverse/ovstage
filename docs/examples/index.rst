@@ -130,3 +130,17 @@ referenced by the ovstage skills.
       ``examples/python/usd-export``
 
       :doc:`Read the guide → <../scene/exporting_to_usd>`
+
+.. toctree::
+   :maxdepth: 1
+
+   population
+   usd_export
+   cuda_tensor_writes
+
+Transforms
+----------
+
+The ``examples/python/transforms`` and ``examples/c/transforms`` projects show
+local and world transform writes, hierarchy computation, and derived matrix
+reads. See :doc:`/scene/transforms` for the walkthrough and code snippets.

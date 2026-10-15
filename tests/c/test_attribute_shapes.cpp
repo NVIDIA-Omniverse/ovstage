@@ -172,7 +172,10 @@ TEST_F(ShapesTest, ScalarAndFixedLane)
         ovstage_read_group_t group{};
         ASSERT_EQ(ovstage_fetch_read_next(stage_, read, OVSTAGE_TIMEOUT_INFINITE, &group), OVSTAGE_OK);
         ASSERT_EQ(group.data.tensor_count, 1u);
-        EXPECT_EQ(group.data.tensors[0].dtype.lanes, 3u);
+        EXPECT_EQ(group.data.tensors[0].dtype.lanes, 1u);
+        EXPECT_EQ(group.data.tensors[0].ndim, 2);
+        EXPECT_EQ(group.data.tensors[0].shape[0], 3);
+        EXPECT_EQ(group.data.tensors[0].shape[1], 3);
         float out[9] = {};
         std::memcpy(out, group.data.tensors[0].data, sizeof(out));
         const float expected[9] = { 1, 0, 0, 0, 1, 0, 0, 0, 1 };

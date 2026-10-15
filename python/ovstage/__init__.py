@@ -19,7 +19,7 @@ Example::
     import ovstage
     from ovstage import OrdinalRange
 
-    with ovstage.PathDictionary() as paths, ovstage.Stage("demo") as stage:
+    with ovstage.Stage("demo") as stage, ovstage.PathDictionary(stage) as paths:
         plist = paths.create_path_list_from_strings(["/World/Cube"])
         attr = paths.intern_token("density")
         query = stage.query_from_path_list(plist)
@@ -39,6 +39,7 @@ Example::
 """
 
 import sys as _sys
+from pathlib import Path as _Path
 
 from . import _src
 
@@ -51,7 +52,9 @@ from ._src.bindings import (
     OVSTAGE_TIMEOUT_INFINITE,
     OVX_API_ERROR,
     OVX_API_SUCCESS,
+    BuildInfo,
     flush_log,
+    get_build_info,
     library_version,
     set_log_callback,
 )
@@ -64,6 +67,7 @@ from ._src.dlpack import (
     ManagedDLTensor,
     dltensor_to_numpy,
     make_dltensor,
+    typed_tensor_to_write,
     numpy_to_dldatatype,
 )
 from ._src.path_dictionary import OvxError, PathDictionary, PathList
@@ -71,6 +75,8 @@ from ._src.stage import Hierarchy, Map, OrdinalQuery, Query, Read, Stage
 from ._src.types import (
     AttributeMeta,
     AttributeSemantic,
+    CloneOperation,
+    CloneResult,
     ErrorCode,
     Filter,
     FilterOp,
@@ -82,11 +88,14 @@ from ._src.types import (
     LogSeverity,
     MapGroup,
     Operation,
+    OrdinalAdmissionPolicy,
     OrdinalRange,
     OvstageError,
     Predicate,
     PopulationDomain,
+    Placement,
     PrimMode,
+    AttributeMode,
     QueryResult,
     ReadGroup,
     Scope,
@@ -98,12 +107,20 @@ from ._src.types import (
 # __version__ mirrors the installed wheel's distribution version. The build injects
 # an auto-generated ``_version.py`` carrying the exact distribution version string;
 # import it so ``ovstage.__version__`` always agrees with ``pip show ovstage`` / the
-# dist filename. A source / editable checkout has no ``_version.py`` (or a malformed
-# one), so fall back to the source default rather than breaking ``import ovstage``.
+# dist filename. A source / editable checkout has no ``_version.py``, so derive
+# its version from the same VERSION.md used by the native build.
 try:
     from ._version import version as __version__
-except Exception:
-    __version__ = "0.2.1"
+except ModuleNotFoundError as _exc:
+    if _exc.name != f"{__name__}._version":
+        raise
+    _version_path = _Path(__file__).resolve().parents[2] / "VERSION.md"
+    try:
+        __version__ = _version_path.read_text(encoding="utf-8").strip()
+    except OSError as _version_error:
+        raise ImportError(
+            f"ovstage package is missing both ovstage._version and its fallback VERSION.md at {_version_path}"
+        ) from _version_error
 
 # ``from ._src import instancing, population`` above only *binds* the module objects
 # as attributes of this package; it does not register them as submodules, so
@@ -129,21 +146,26 @@ __all__ = [
     "OvstageError",
     "ErrorCode",
     "FilterOp",
+    "Placement",
     "PrimMode",
+    "AttributeMode",
     "AttributeSemantic",
     "HierarchyRelation",
     "HierarchyComputationModel",
     "Scope",
     "PopulationDomain",
+    "OrdinalAdmissionPolicy",
     "OrdinalRange",
     "Predicate",
     "Filter",
     "Operation",
+    "CloneOperation",
     "WriteDesc",
     "ReadGroup",
     "MapGroup",
     "AttributeMeta",
     "QueryResult",
+    "CloneResult",
     "HierarchyItem",
     "HierarchyResult",
     "HierarchyComputationModelDesc",
@@ -154,10 +176,13 @@ __all__ = [
     "DLDeviceType",
     "DLDataTypeCode",
     "make_dltensor",
+    "typed_tensor_to_write",
     "dltensor_to_numpy",
     "numpy_to_dldatatype",
     "instancing",
     "population",
+    "BuildInfo",
+    "get_build_info",
     "library_version",
     "set_log_callback",
     "flush_log",

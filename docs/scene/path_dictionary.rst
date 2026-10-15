@@ -11,41 +11,35 @@
 Path Dictionary
 ===============
 
-The OVX path dictionary is the shared interning layer that maps strings —
-attribute names and prim paths — to stable, trivially comparable handles used
-across OV libraries. Interning a string returns an ``ovx_token_t``; a prim path
-returns an ``ovx_primpath_t``; a set of paths becomes an immutable
-``ovx_primpath_list_t`` that you pass to ovstage queries.
+The :class:`ovstage.PathDictionary` maps strings and prim paths to reusable
+identifiers. Registering a string this way is called interning. Use the
+stage's dictionary so the identifiers your application creates match those
+used by ovstage.
 
-For handle-compatible sharing, obtain ovstage's own dictionary rather than
-creating a separate one, so handles minted by your application and by ovstage
-compare directly:
+Create :class:`PathDictionary(stage) <ovstage.PathDictionary>` to borrow the instance-owned dictionary.
+In C, obtain it with :c:func:`ovstage_get_path_dictionary()`.
 
-* **C** — ``ovstage_get_path_dictionary``.
-* **Python** — ``ovstage.PathDictionary(stage)`` borrows the instance-owned dictionary.
-
-Handle Types
-------------
+Names, Paths, and Lists
+-----------------------
 
 .. list-table::
    :header-rows: 1
 
-   * - Handle
-     - Interns
-     - Notes
-   * - ``ovx_token_t``
-     - A string (e.g. an attribute name).
-     - Same string always interns to the same token; compare tokens by value.
-   * - ``ovx_primpath_t``
-     - A single prim path.
-     - Same path always interns to the same handle.
-   * - ``ovx_primpath_list_t``
-     - An ordered set of prim paths.
-     - Immutable after creation; equal list handles imply the same paths in the same order.
+   * - Python method
+     - Result
+   * - :meth:`intern_token(name) <ovstage.PathDictionary.intern_token>`
+     - An integer :term:`token <Token>` for a string, such as an attribute name.
+   * - :meth:`intern_path(path) <ovstage.PathDictionary.intern_path>`
+     - An integer identifier for a :term:`prim <Prim>` path.
+   * - :meth:`create_path_list_from_strings(paths) <ovstage.PathDictionary.create_path_list_from_strings>`
+     - An immutable, ordered :class:`ovstage.PathList` for a query.
 
-The ``OVX_INVALID_*`` sentinels are all ``0`` and are never returned on success.
-Because identical inputs intern to identical handles, consumers use O(1) handle
-equality instead of string comparison at every boundary.
+Within one dictionary, interning the same string or prim path returns the same
+identifier. Compare those identifiers directly rather than resolving their strings.
+Path lists are different: creating the same ordered list twice can return different
+handles. Do not compare path-list handles to determine whether their contents match. The C types are
+``ovx_token_t``, ``ovx_primpath_t``, and ``ovx_primpath_list_t`` respectively;
+their ``OVX_INVALID_*`` values are 0 and are not successful results.
 
 Interning and Resolving
 -----------------------
@@ -71,6 +65,23 @@ Intern a string to a token, then resolve the token back to its string:
          :end-before: // [/snippet:intern-and-resolve]
          :exclude-pattern: ^\s*//\s*\[/?snippet:
          :dedent:
+
+Constructing Prim Paths
+-----------------------
+
+In Python, use :meth:`intern_path() <ovstage.PathDictionary.intern_path>` with
+an absolute path such as ``/World/Box``. Use ``/`` for the root.
+
+In C, :c:func:`path_dictionary_create_paths_from_tokens()` also accepts component
+names: tokens for ``World`` and ``Box`` produce ``/World/Box``. Do not include
+separators in the names. Within one dictionary, this returns the same handle as
+:c:func:`path_dictionary_create_paths_from_strings()`, regardless of call order.
+Python exposes only string-based path construction.
+
+For the root in C, set its ``num_tokens_per_path`` entry to zero. Supply a
+non-null ``tokens_per_path`` array; no component tokens are read for that entry.
+:c:func:`path_dictionary_get_tokens_from_paths()` returns zero components for
+``/``.
 
 Building a Path List and Opening a Query
 ----------------------------------------
@@ -99,12 +110,11 @@ strings and open a query over those prims:
          :dedent:
 
 Attribute Arguments: String or Token
--------------------------------------
+------------------------------------
 
-APIs that take an attribute accept either an already-interned token (the hot
-path — no lookup) or a plain string (interned at call time). In C this is the
-``ovx_string_or_token_t`` dual-mode argument; in Python you can pass an ``int``
-token or a ``str``:
+Attribute arguments accept a string or an integer token. Reusing an interned
+token avoids a string lookup on each call. In C, ``ovx_string_or_token_t`` holds
+either form. These snippets show both:
 
 .. tab-set::
 
@@ -129,46 +139,41 @@ token or a ``str``:
 Ownership and Lifetime
 ----------------------
 
-* **The dictionary is owned by its producing subsystem.** When you borrow
-  ovstage's dictionary, do not free its handle; ovstage owns it.
-* **Tokens and paths are dictionary-lifetime.** They are interned and are never
-  freed individually.
-* **Dictionary string pointers are borrowed.** In C, an ``ovx_string_t``
-  returned by the dictionary points into dictionary-owned storage; copy it if it
-  must outlive the dictionary (refer to :doc:`/concepts/string_handling`).
-* **Path lists are explicitly refcounted.** ``create_path_list_from_*`` returns
-  a list owned by the caller; pair each create with exactly one release. A path
-  list handed back inside a read result is a *borrow* — do not release it.
-* **In Python, the created list releases itself.** ``create_path_list`` /
-  ``create_path_list_from_strings`` return an :class:`ovstage.PathList` — an
-  ``int`` subclass that *is* the handle, so it passes into every slot that takes
-  a path list unchanged — which owns the create reference and releases it on
-  ``with``-exit, on ``release()``, or (as a safety net, with a
-  ``ResourceWarning``) when garbage-collected. Borrowed lists from read results
-  stay plain ``int``, so the finalizer never releases a reference you do not own.
-  Prefer creating one list outside a per-frame loop and reusing it.
+* Each stage owns its dictionary. Python requires :class:`PathDictionary(stage) <ovstage.PathDictionary>`;
+  the wrapper does not own the stage. Do not destroy the native dictionary separately.
+* Path lists belong to that stage. To use the same selection on another stage,
+  recreate the list in its dictionary. Release list references before destroying
+  their stage; neither a list reference nor another live stage keeps them valid.
+* Tokens and individual path identifiers last for the dictionary's lifetime;
+  do not release them individually.
+* :meth:`create_path_list() <ovstage.PathDictionary.create_path_list>` and :meth:`create_path_list_from_strings() <ovstage.PathDictionary.create_path_list_from_strings>` return an owned
+  :class:`ovstage.PathList`. Use a ``with`` block or call :meth:`release() <ovstage.PathList.release>`. The object
+  is also an ``int`` and can be passed wherever a list handle is accepted.
+  Reuse a list outside a per-frame loop when its paths do not change.
+* Lists borrowed from read results remain plain integers. Do not release them.
+* An unreleased Python ``PathList`` releases its reference on garbage collection
+  and emits ``ResourceWarning``. Explicit release avoids relying on that cleanup.
+
+In C, release each created path-list reference through the dictionary exactly
+once. Returned ``ovx_string_t`` values borrow dictionary storage; copy any text
+that must outlive the dictionary. See :doc:`/concepts/string_handling`.
 
 Errors
 ------
 
-Every C path-dictionary call returns ``ovx_api_result_t { status, error }``; on
-``OVX_API_ERROR`` the error string must be released with
-``path_dictionary_release_error``. In Python, path-dictionary failures raise
-``ovstage.OvxError``. Resolving ``OVX_INVALID_PRIMPATH`` or an unknown or
-expired prim-path handle through the dictionary ovstage hands out — whether via
-``path_dictionary_get_tokens_from_paths`` in C or
-``PathDictionary.path_to_string`` in Python — reports an actionable
-``OVX_API_ERROR`` (``OvxError``) rather than a successfully processed
-zero-token path or an empty string. The absolute root is a valid handle and
-still succeeds. ``path_dictionary_get_tokens_from_paths`` decomposes a path into
-component tokens rather than returning a path string, so in C the root reports
-one processed path with zero tokens; joining those tokens is the caller's step.
-``PathDictionary.path_to_string`` performs that join and spells the root ``/``
-(matching ``SdfPath``), so in Python an empty string is never a successful
-result. Refer to :doc:`/concepts/error_handling`.
+Python dictionary failures raise :class:`ovstage.OvxError`. Invalid, unknown,
+or expired path identifiers fail rather than resolving to an empty string.
+:meth:`ovstage.PathDictionary.path_to_string()` returns ``/`` for the valid
+absolute root.
 
-Where to Go Next
-----------------
+In C, dictionary calls return ``ovx_api_result_t``. On ``OVX_API_ERROR``, release
+the error string with :c:func:`path_dictionary_release_error() <path_dictionary_release_error>`.
+:c:func:`path_dictionary_get_tokens_from_paths() <path_dictionary_get_tokens_from_paths>` returns component tokens, not a joined
+path string. The root succeeds as one processed path with zero tokens; callers
+join the components themselves. See :doc:`/concepts/error_handling`.
+
+Further Reading
+---------------
 
 - :doc:`/scene/queries` — resolve a path list into per-attribute prim groups.
 - :doc:`/scene/writing_attributes` / :doc:`/scene/reading_attributes` — use tokens as attribute keys.

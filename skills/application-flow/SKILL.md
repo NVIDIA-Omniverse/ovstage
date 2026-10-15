@@ -51,15 +51,20 @@ Resolve inputs in this order: existing repository files and referenced snippets,
 - Use an ovstage checkout that contains the `include/` headers and the referenced example/snippets.
 - Read the relevant `> **Source:**` snippet before writing or explaining API usage.
 - Understand the async **submit/observe** model (`cpu-ahead-gpu-async`): state-mutating and
-  data-producing calls are enqueues; nothing is done until you `wait_op` / `fetch_*`.
+  data-producing calls are enqueues; confirm completion with `wait_op` / `fetch_*`
+  and check the result before relying on it.
 - Remember this build is **latest-snapshot only for payloads**. Exact change membership is
   retained across a bounded set of completed write-floor epochs; query
   `ovstage_get_oldest_preserved_ordinal` before consuming an older range.
 
 ## Instructions
 
-1. **Create the instance** (`ovstage_create_instance`) and obtain its instance-owned path
-   dictionary (`ovstage_get_path_dictionary`).
+1. **Configure process state when needed:** for a static loader with a non-default
+   binary root, call `ovstage_initialize` with
+   `ovstage_config_entry_binary_package_root_path()` before any other ovstage call.
+   Use the package `bin/` directory and check initialization succeeds (see
+   `project-setup-c`, Instance configuration). Then **create the instance**
+   (`ovstage_create_instance`) and obtain its instance-owned path dictionary (`ovstage_get_path_dictionary`).
 2. **Establish identity:** intern the attribute name → `ovx_token_t`, build a prim-path list,
    and open a query over it (`ovstage_query_from_path_list`).
 3. **Write** attribute values at an `ordinal` (`ovstage_write_attribute`); observe the
@@ -69,7 +74,8 @@ Resolve inputs in this order: existing repository files and referenced snippets,
 5. **Read:** `ovstage_read_attributes` over an ordinal range → `ovstage_fetch_read_next` →
    consume `group.data` tensors.
 6. **Release in reverse:** the read group, the read handle, the path-list reference, then
-   destroy the instance.
+   destroy the instance. Balance any successful explicit `ovstage_initialize` with
+   `ovstage_shutdown` after instance teardown.
 7. **Layer in the focused skills** as concerns arise: tensor data (`dlpack-tensor-exchange`),
    submit/observe & concurrency (`cpu-ahead-gpu-async`), error reporting (`error-handling`),
    string/token identity (`string-handling`, `path-dictionary`).
@@ -94,9 +100,12 @@ This skill has no scripts.
   change/deletion membership — that surface is part of the API contract. **In the current
   build**, payload reads are latest-snapshot only and do not provide historical payload
   versions. At or above the reported inclusive retention frontier, a range selects exact
-  changed/deleted membership. It returns current payload/delete state only when the selected
-  key has no retained successor after the range end; otherwise it returns
-  `OVSTAGE_ERROR_OUT_OF_RANGE`. Below that frontier, membership may be coalesced or discarded.
+  changed/deleted membership; a snapshot selects all queried paths. Reads require selected
+  changes through the requested end to be sealed. They return `OVSTAGE_ERROR_OUT_OF_RANGE`
+  if history records a later change for a selected `(attribute, path)`, because older values
+  are not retained. End `UINT64_MAX` requests current values; a selected unsealed change still returns `WRITE_FLOOR_VIOLATION`.
+  Below the frontier, membership may be coalesced or discarded, so a successful
+  snapshot read does not guarantee the requested earlier state.
   Do not treat an ordinal range as a historical-payload event log.
 - **USD population not covered here.** Ingesting existing USD uses the population API
   (`ovstage_population.h`); this skill documents the direct write/read lifecycle.
@@ -110,18 +119,26 @@ prims/attributes through the (instance-owned) path dictionary, writes attribute 
 asynchronous submit/observe model. (ovrtx's renderer lifecycle — Camera / RenderProduct /
 `step()` / render output — does not apply.)
 
-Two cross-cutting rules shape every stage:
+These cross-cutting rules shape every stage:
 
-- **Async enqueue / observe.** Enqueue is synchronous and cheap and returns an `op_index`; the
-  CPU can run ahead. Same-ordinal ops execute in submission order; different-ordinal ops are
-  independent. Block or poll with `ovstage_wait_op`. (→ `cpu-ahead-gpu-async`)
+- **Async enqueue / observe.** Enqueue is synchronous and returns an `op_index`
+  before completion is confirmed; the CPU can run ahead. Same-ordinal ops execute
+  in submission order; different-ordinal ops are independent. Block or poll with
+  `ovstage_wait_op`. (→ `cpu-ahead-gpu-async`)
 - **Ordinals + write floor.** Writes carry an `ordinal`. Advancing the **write floor** seals
   everything at/below it; reads target sealed data at/below the floor, while queries resolve
   against the latest committed state.
+- **Strict admission: one committed modification per cell and ordinal.** With
+  `STRICTLY_INCREASING`, write, map publication, clone and delete must clear
+  applicable floors and retained changes to each affected cell and prim lifecycle.
+  Disjoint cells may share an ordinal. For optional policies, see
+  [Ordinal Admission Policies](../../docs/scene/writing_attributes.rst). Always
+  observe completion; WRITE/MAP enqueue can succeed before value admission fails.
 
 ## Lifecycle
 
 ```
+0. Configure / initialize if needed → project-setup-c (static loader: before any ovstage call)
 1. Create instance                 → project-setup-c
 2. Get path dictionary             → path-dictionary
 3. Identify prims + attributes     → path-dictionary, string-handling
@@ -130,6 +147,7 @@ Two cross-cutting rules shape every stage:
 5. Advance the write floor (seal)   → cpu-ahead-gpu-async
 6. Read / fetch                     → dlpack-tensor-exchange
 7. Release + destroy instance       → error-handling (status checks throughout)
+8. Shutdown explicit initialization → project-setup-c
 ```
 
 Optional: ingest existing USD via the population API (`ovstage_population.h`) instead of, or
@@ -137,7 +155,17 @@ before, direct writes.
 
 ## C — end-to-end
 
-The minimal example walks the whole lifecycle. After `ovstage_create_instance` (see
+For a static loader with a non-default binary root, begin with this tested
+initialization/teardown recipe; use the extracted package's `bin/` directory:
+
+> **Source:** `tests/c/test_static_config.cpp` snippet `initialize-static-loader-c`
+
+Insert the write/read lifecycle while the instance is alive, then release its
+resources, destroy it, and balance the explicit initialization with
+`ovstage_shutdown`. Shared-loader consumers using defaults can create the
+instance directly.
+
+The minimal example walks the data lifecycle. After `ovstage_create_instance` (see
 `project-setup-c`), compose these snippets in order — get the path dictionary + intern a
 token, build a path list + open a query, form the attribute argument, then write → seal →
 read:
@@ -173,6 +201,7 @@ intern token / `path_dictionary_create_path_list_from_strings` → `ovstage_quer
 
 | Stage | Function(s) | Detail skill |
 |-------|-------------|--------------|
+| Configure / initialize / shutdown | `ovstage_initialize`, `ovstage_config_entry_binary_package_root_path`, `ovstage_shutdown` | `project-setup-c` |
 | Create / destroy instance | `ovstage_create_instance` / `ovstage_destroy_instance` | `project-setup-c` |
 | Path dictionary (identity) | `ovstage_get_path_dictionary`, `path_dictionary_create_tokens_from_strings`, `path_dictionary_create_path_list_from_strings` | `path-dictionary`, `string-handling` |
 | Query target prims | `ovstage_query_from_path_list` | `path-dictionary` |
@@ -186,12 +215,14 @@ intern token / `path_dictionary_create_path_list_from_strings` → `ovstage_quer
 - **Read fails with `OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION` after a write** — the selected state is
   not sealed; call `ovstage_advance_write_floor` to/above its ordinal. Also remember that enqueue
   success means *accepted*, not *executed* (wait/fetch first). See `cpu-ahead-gpu-async`.
-- **Fixed range fails with `OVSTAGE_ERROR_OUT_OF_RANGE`** — a selected `(attribute, path)` has a
-  retained successor after the range end, so latest-only storage cannot represent that window.
-  Widen/rebase the range, repoll from a newer cursor, or explicitly request latest state.
-  Advancing the floor alone does not resolve it.
-- **Write rejected (`OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION`)** — you wrote at an ordinal at or
-  below the current write floor. Write above the floor, then advance the floor afterward.
+- **Read fails with `OVSTAGE_ERROR_OUT_OF_RANGE`** — a selected `(attribute, path)` has a
+  recorded change after the requested end, and older values are not retained. If newer values
+  are acceptable, move the end forward or use `UINT64_MAX` (Python: `(1 << 64) - 1`) for current
+  values; a selected unsealed change still returns `WRITE_FLOOR_VIOLATION`. Advancing the floor alone does not restore older values.
+- **Write rejected (`OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION`)** — the ordinal conflicts with an
+  applicable floor or the configured admission policy for an affected cell or prim
+  lifecycle. The strict policy requires a newer ordinal for a second modification
+  of the same cell. Disjoint cells may share an ordinal.
 - **Expecting historical payloads from an ordinal range** — unsupported in this
   latest-snapshot build. Ranges at or above the reported retention frontier provide exact
   changed-prim membership; representable ranges carry current payload/delete state, while a
@@ -206,7 +237,12 @@ intern token / `path_dictionary_create_path_list_from_strings` → `ovstage_quer
 ## Python
 
 The Python bindings expose the same lifecycle — `Stage` + `PathDictionary` context
-managers, async ops returning handles with `.wait()`, write → advance write floor → read. See
+managers, async ops returning handles whose `.wait()` returns the handle (and raises on
+failure), write → advance write floor → read. A mutation's `Operation.ok` checks
+only enqueue acceptance; retain the operation and call `wait()` to observe its
+execution. Use query/read/map context managers for resource lifetimes and explicit
+wait/fetch/commit calls for results; cleanup and finalizers do not replace error
+checks. See
 `project-setup-python` for the package surface. The verified example walks it end to end:
 
 > **Source:** `examples/python/minimal/main.py` snippet `setup`
@@ -220,6 +256,28 @@ managers, async ops returning handles with `.wait()`, write → advance write fl
 The public Python test asserts the same round-trip against the produced package:
 
 > **Source:** `tests/python/test_minimal.py` snippet `write-read-roundtrip`
+
+## Per-Tick Change Feeds
+
+A consumer that polls once per tick keeps one whole-stage query (`HAS(usd-path)`) alive across
+ticks and reads explicit ranges `[tick, tick]` against it; a range that selects no change is a
+successful zero-group read, not an error. A filter query keeps the membership it resolved when it
+ran, so open a fresh query when newly created prims must enter the feed. Seal with `SCOPE_INCLUDE`
+only when the tick wrote nothing structural (no new prims, prim types, applied schemas, or
+deletes): an INCLUDE seal leaves every unlisted column's floor where its last covering seal put it
+(here, the previous `SCOPE_ALL` seal). A selected structural change at or before the requested
+end and above its floor fails with `OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION` until a covering seal
+lands. An earlier snapshot that selects the changed path fails with `OVSTAGE_ERROR_OUT_OF_RANGE`
+regardless of sealing, because the earlier value is unavailable. Derived transforms such as
+`omni:fabric:worldMatrix` are read-only output: poll them with a latest read after the seal and
+follow `docs/scene/transforms.rst` for the freshness contract rather than treating the range
+feed as their change log.
+
+The public tests assert these behaviors against the produced package:
+
+> **Source:** `tests/c/test_change_feed.cpp` snippets `empty-change-range-c`, `include-seal-change-range-c`, `frozen-vs-fresh-query-c`
+
+> **Source:** `tests/python/test_change_feed.py` snippets `empty-change-range`, `include-seal-change-range`, `frozen-vs-fresh-query`
 
 ## References
 

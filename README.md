@@ -7,7 +7,7 @@
 
 **ovstage** is a C and Python library providing a shared, high-performance, vectorized, GPU-capable scene data substrate for [USD](https://openusd.org) scene data for use in Omniverse Libraries spanning physics, rendering, sensors, animation, and more. 
 
-It provides C and Python APIs for reading, writing, querying, and managing simulation data such as transforms, velocities, materials, hierarchy, and metadata across CPU and GPU memory, with zero-copy data paths and DLPack tensor interchange. Currently, zero-copy applies to CUDA source-tensor writes; payload reads and map/unmap buffers are CPU-resident.
+It provides C and Python APIs for reading, writing, querying, and managing simulation data such as transforms, velocities, materials, hierarchy, and metadata across CPU and GPU memory, with zero-copy data paths and DLPack tensor interchange. Reads and maps use CPU buffers by default. The experimental [device-placement extension](docs/concepts/dlpack_tensors.rst#experimental-device-placement) also supports CUDA buffers; a read of a copy already current on the requested device avoids migration.
 
 **ovstage** is suited for developers looking to build simulation and visualization applications, tools or workflows based on Omniverse Libraries, such as [ovphysx](https://github.com/NVIDIA-Omniverse/PhysX/tree/main/ovphysx) and [ovrtx](https://github.com/NVIDIA-Omniverse/ovrtx).
 
@@ -32,7 +32,7 @@ Sources live under [`examples/`](examples/) and are the source of truth for the 
     * Apply changes from timesampled data in USD to the entire stage
 * Export selected runtime state to USD:
     * Select candidates with the same predicate graphs as generic population, then author sparse `OVER` layers or durable `DEF` prims through explicit projection rules
-    * Target one-shot saved files or reusable destinations that ovstage opens and owns, without exposing OpenUSD C++ types in the C ABI
+    * Target one-shot saved files, reusable destinations, or host-owned in-memory layer/stage identifiers without exposing OpenUSD C++ types in the C ABI
     * Use synchronous export directly or the optional per-instance asynchronous scheduler
 * Efficient cloning of stage subtrees
 * Stage hierarchy lookups
@@ -43,6 +43,19 @@ Sources live under [`examples/`](examples/) and are the source of truth for the 
 
 ovstage is distributed as a C package (.zip file) available in the Releases page in this repo, and as Python wheels available via pypi.org.
 These packages include a number of pre-packaged dependencies.
+
+`ovstage.__version__` reports the installed Python package version without
+loading the native runtime. For the exact native build, including its build
+number and Git revision, use `ovstage.get_build_info()` in Python or
+`ovstage_get_build_info()` in C. The C package and Python wheel also include the
+same details in `ovstage-build-info.json` for inspection without running code.
+The shared and static loaders report their loader build, while a directly linked
+runtime reports its runtime build. If a loader client selects a separately built
+runtime, that runtime reports its own values through its callback log and crash
+metadata. The callback record is emitted at `INFO`, so Python clients must request
+at least `LogSeverity.INFO` (or enable `omni.ovstage=info`) to receive it. The JSON
+copy is schema-versioned diagnostic metadata, not a stable API or a deployment
+validation contract.
 
 In addition to these pre-packaged dependencies, on Windows, ovstage depends on [Microsoft's VC runtime redistributable libraries](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist?view=msvc-170), with a minimum version of 14.38 (as included in Visual Studio 2022 17.8). 
 These libraries can be installed by an end user (using the linked Microsoft resources) or can be included by an application. The use of this version of the MSVC runtime libraries makes our binaries compatible with the vcruntime140.dll pre-packaged in Python distributions for Windows as old as Python 3.11. Older Python versions include older vcruntime140.dll, and are therefore not guaranteed to work.
@@ -142,12 +155,12 @@ This model is appropriate when producers and consumers are tightly coupled and b
 - **Use asynchronous, ordinal-keyed execution** - mutating and data-producing calls enqueue work, return an `op_index`, and can expose typed handles that feed later enqueues.
 - **Advance visibility explicitly** - writes carry an ordinal, and callers advance the write floor so consumers read the latest committed stage state.
 - **Read latest committed payloads** - this release retains the current committed snapshot for payload reads; older ordinal payloads are not read back.
-- **Track change membership** - consumers can ask what changed since an ordinal and receive exact changed-prim membership within the reported retention frontier plus latest committed data, avoiding full-scene diffs (expressed as an ordinal-range read; see `ovstage_ordinal_range_t`). Callers query the frontier rather than assuming a fixed retention depth; older markers may be coalesced per attribute and prim, so this is not a historical-payload event log. Because only the latest payload is retained, a fixed range whose selected `(attribute, path)` changed again after the range end returns `OVSTAGE_ERROR_OUT_OF_RANGE` instead of membership and data — end the range at the newest change, or use a snapshot read, when that matters.
+- **Track change membership** - consumers can ask what changed since an ordinal and receive exact changed-prim membership within the reported retention frontier plus latest committed data, avoiding full-scene diffs (expressed as an ordinal-range read; see `ovstage_ordinal_range_t`). Callers query the frontier rather than assuming a fixed retention depth; older markers may be coalesced per attribute and prim, so this is not a historical-payload event log. Because only the latest payload is retained, a fixed range whose selected `(attribute, path)` changed again after the range end returns `OVSTAGE_ERROR_OUT_OF_RANGE` instead of membership and data. A snapshot whose end is below `UINT64_MAX` applies the same check to every queried path. When newer values are acceptable, end the read at the newest change, or at `UINT64_MAX` for current values.
 - **Keep tensor data CPU- or GPU-native** - exchange payloads as DLPack `DLTensor` values for zero-copy CPU/GPU interop.
 - **Map attributes for direct producer writes** - use map/unmap flows when a producer wants to fill ovstage-owned storage directly.
-- **Reuse prim identity across libraries** - exchange tokens and prim-path lists through the shared path dictionary instead of string lookups at every boundary.
-- **Use built-in USD metadata** - `usd-path`, `usd-schemas`, `usd-prim-type`, `usd-parent`, and `usd-children` are auto-maintained and usable in filter predicates. (`usd-active` appears in the header contract but is not supported — it returns `NOT_SUPPORTED` — and is subject to removal in a future release.)
-- **Export selected runtime state to USD** - select candidates with shared population predicates, project them through explicit authoring rules, then use a one-shot saved file or an explicitly saved reusable destination that ovstage opens and owns.
+- **Reuse prim identity across libraries** - exchange tokens and prim-path lists through the owning Stage’s path dictionary instead of string lookups at every boundary.
+- **Use built-in USD metadata** - `usd-path`, `usd-schemas`, `usd-prim-type`, `usd-ancestor-types`, `usd-parent`, and `usd-children` are auto-maintained and usable in filter predicates. (`usd-active` appears in the header contract but is not supported — it returns `NOT_SUPPORTED` — and is subject to removal in a future release.)
+- **Export selected runtime state to USD** - select candidates with shared population predicates, project them through explicit authoring rules, then use a one-shot saved file, an explicitly saved reusable destination, or a host-owned in-memory layer/stage target.
 
 ### Single Parse, Shared Runtime State
 
@@ -186,11 +199,12 @@ The full documentation site is available at **<https://nvidia-omniverse.github.i
 
 - [Python getting started](https://nvidia-omniverse.github.io/ovstage/python_api/getting_started.html)
 - [C getting started](https://nvidia-omniverse.github.io/ovstage/c_api/getting_started.html)
+- [Benchmarking](https://nvidia-omniverse.github.io/ovstage/guides/benchmarking.html) with the bundled `benchmark.ovstage`
 
 Reference links in this source tree:
 
 - **Overview:** [`OVERVIEW.md`](OVERVIEW.md)
-- **Public C API:** [`include/ovstage/ovstage.h`](include/ovstage/ovstage.h) (data plane), [`include/ovstage/ovstage_types.h`](include/ovstage/ovstage_types.h) (backend-owned types), [`include/ovstage/ovstage_api/`](include/ovstage/ovstage_api/) (API types and utilities), [`include/ovstage/ovalign.h`](include/ovstage/ovalign.h) (alignment helpers), [`include/ovstage/ovstage_instancing.h`](include/ovstage/ovstage_instancing.h) (high-level instancing queries; included from `ovstage.h`), [`include/ovstage/ovstage_population.h`](include/ovstage/ovstage_population.h) (USD-to-ovstage population; included from `ovstage.h`), [`include/ovstage/ovstage_population_export.h`](include/ovstage/ovstage_population_export.h) (selected ovstage-to-USD authoring)
+- **Public C API:** [`include/ovstage/ovstage.h`](include/ovstage/ovstage.h) (data plane), [`include/ovstage/ovstage_types.h`](include/ovstage/ovstage_types.h) (backend-owned types), [`include/ovstage/ovstage_api/`](include/ovstage/ovstage_api/) (API types and utilities; experimental extensions under `experimental/`), [`include/ovstage/ovstage_instancing.h`](include/ovstage/ovstage_instancing.h) (high-level instancing queries; included from `ovstage.h`), [`include/ovstage/ovstage_population.h`](include/ovstage/ovstage_population.h) (USD-to-ovstage population; included from `ovstage.h`), [`include/ovstage/ovstage_population_export.h`](include/ovstage/ovstage_population_export.h) (selected ovstage-to-USD authoring)
 - **Path dictionary API:** [`include/ovx/path_dictionary/`](include/ovx/path_dictionary/) (shared OVX path-dictionary C API headers), [`include/ovx/types.h`](include/ovx/types.h) and [`include/ovx/string_types.h`](include/ovx/string_types.h) (shared OVX handle and string types)
 - **DLPack header:** [`include/dlpack/dlpack.h`](include/dlpack/dlpack.h)
 - **Examples index:** [`examples/README.md`](examples/README.md)

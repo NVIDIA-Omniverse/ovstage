@@ -9,142 +9,255 @@
 .. its affiliates is strictly prohibited.
 
 Error Handling and Diagnostics
-==============================
+======================================
 
-Most synchronous ovstage calls return an ``ovstage_api_status_t``:
-``OVSTAGE_OK`` (0) is success and any non-zero value is an error. Asynchronous
-enqueues instead return an ``ovstage_enqueue_result_t``, and completion or
-per-op failures surface later through ``ovstage_wait_op``. Distinguish enqueue
-success from execution success: ``OVSTAGE_OK`` at enqueue means *accepted*, not
-*completed*.
+Check synchronous return values immediately. For asynchronous calls, check both
+submission and completion. A successful submission does not mean the operation
+succeeded.
+
+Checking Errors
+-----------------------
+
+Python raises :class:`ovstage.OvstageError` for stage errors and
+:class:`ovstage.OvxError` for path-dictionary errors. Both derive from ``RuntimeError``
+and carry a numeric ``code`` and a message. Some invalid Python arguments raise ``TypeError`` or ``ValueError``
+before calling the native API. On success, :meth:`wait() <ovstage.Operation.wait>` returns the operation or
+handle it was called on.
+
+In C, check the status returned by the call. After :c:func:`ovstage_wait_op()`,
+also inspect every :term:`operation ID <Operation ID>` in ``error_op_ids``. Retrieve its message
+before the next wait on the same thread, which invalidates the list and messages.
+Release operation tracking only after reading the diagnostics.
+
+The boundary where a failure is discovered affects its reported code. A rejected
+enqueue can return a specific status such as ``WRITE_FLOOR_VIOLATION`` or
+``OUT_OF_RANGE`` directly. For an accepted operation that fails during execution,
+``wait_op`` and mutation ``wait()`` generally report ``OP_FAILED``; inspect the
+diagnostic for the underlying reason.
+
+Reads can validate an already-ready query at enqueue, or defer validation until
+their producer runs. A fetch that waits for a failed producer can report
+``OP_FAILED``; a fetch after that producer has completed can expose its specific
+recorded status. Resolve the query first when using ``OUT_OF_RANGE`` to choose
+a current-state fallback, and still handle deferred producer failures.
+
+The snippets below show Python catching a failed write and the C++ helper used
+by the C examples to wait, check errors, and release operation tracking.
+
+.. tab-set::
+
+   .. tab-item:: Python
+
+      .. filtered-literalinclude:: ../../examples/python/minimal/main.py
+         :language: python
+         :start-after: # [snippet:error-handling]
+         :end-before: # [/snippet:error-handling]
+         :exclude-pattern: ^\s*#\s*\[/?snippet:
+         :dedent:
+
+   .. tab-item:: C
+
+      The synchronous status helper used by ``waitOp()`` is:
+
+      .. filtered-literalinclude:: ../../examples/c/minimal/main.cpp
+         :language: cpp
+         :start-after: // [snippet:check-sync-error]
+         :end-before: // [/snippet:check-sync-error]
+         :exclude-pattern: ^\s*//\s*\[/?snippet:
+         :dedent:
+
+      The wait helper checks both the returned status and failed operation IDs:
+
+      .. filtered-literalinclude:: ../../examples/c/minimal/main.cpp
+         :language: cpp
+         :start-after: // [snippet:enqueue-wait-error]
+         :end-before: // [/snippet:enqueue-wait-error]
+         :exclude-pattern: ^\s*//\s*\[/?snippet:
+         :dedent:
 
 Status Codes
-------------
+--------------------
+
+Use :class:`ovstage.ErrorCode` names, not numeric values. C uses the corresponding
+constants in :c:type:`ovstage_api_status_t`: ``OVSTAGE_OK`` for ``ErrorCode.OK``,
+and ``OVSTAGE_ERROR_*`` for the other members.
 
 .. list-table::
    :header-rows: 1
+   :widths: 42 58
 
-   * - Code
-     - Value
+   * - Status
      - Meaning
-   * - ``OVSTAGE_OK``
-     - 0
-     - Success.
-   * - ``OVSTAGE_ERROR_INVALID_ARGUMENT``
-     - 1
-     - A required argument was invalid.
-   * - ``OVSTAGE_ERROR_INVALID_HANDLE``
-     - 2
-     - A handle did not refer to a live object.
-   * - ``OVSTAGE_ERROR_NOT_FOUND``
-     - 3
+   * - ``ErrorCode.OK``
+     - The call succeeded. For an enqueue, this means it was accepted.
+   * - ``ErrorCode.INVALID_ARGUMENT``
+     - An argument is invalid.
+   * - ``ErrorCode.INVALID_HANDLE``
+     - The handle is invalid or has been released.
+   * - ``ErrorCode.NOT_FOUND``
      - The requested item was not found.
-   * - ``OVSTAGE_ERROR_PRIM_NOT_FOUND``
-     - 4
-     - In INSERT (create-only) mode, a prim already exists at the target path. (A missing item is ``OVSTAGE_ERROR_NOT_FOUND`` above.)
-   * - ``OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION``
-     - 5
-     - A write/apply targeted an ordinal at or below the floor, or a read would serve state above it: the current recorded state for a snapshot read, or a selected in-range change for an explicit range. The requested end ordinal is not itself compared with the floor.
-   * - ``OVSTAGE_ERROR_NOT_SUPPORTED``
-     - 6
-     - The operation is not supported by this build.
-   * - ``OVSTAGE_ERROR_QUEUE_FULL``
-     - 7
+   * - ``ErrorCode.PRIM_NOT_FOUND``
+     - Despite its name, this reports an existing prim rejected by ``PrimMode.INSERT``.
+   * - ``ErrorCode.WRITE_FLOOR_VIOLATION``
+     - A mutation conflicts with an applicable watermark or retained value/prim-lifecycle
+       change under the configured admission policy, or a read selects an unsealed
+       change at or before its requested end. The end itself is not compared with
+       the watermark.
+   * - ``ErrorCode.NOT_SUPPORTED``
+     - This build does not support the operation or requested data.
+   * - ``ErrorCode.QUEUE_FULL``
      - The submission queue is full.
-   * - ``OVSTAGE_ERROR_END_OF_ITERATION``
-     - 8
-     - No further groups to fetch.
-   * - ``OVSTAGE_ERROR_OUT_OF_MEMORY``
-     - 9
-     - Allocation failed.
-   * - ``OVSTAGE_ERROR_LAYOUT_CHANGED``
-     - 10
-     - The underlying column layout changed.
-   * - ``OVSTAGE_ERROR_TIMEOUT``
-     - 11
-     - Not ready within the timeout (a wait signal, not a failure).
-   * - ``OVSTAGE_ERROR_OP_FAILED``
-     - 12
-     - The op executed but failed.
-   * - ``OVSTAGE_ERROR_OUT_OF_RANGE``
-     - 13
-     - A fixed range selected a key whose retained same-key successor cannot be represented by latest-only storage.
-   * - ``OVSTAGE_ERROR_INTERNAL``
-     - 99
+   * - ``ErrorCode.END_OF_ITERATION``
+     - There are no more results to fetch.
+   * - ``ErrorCode.OUT_OF_MEMORY``
+     - An allocation or size calculation failed recoverably.
+   * - ``ErrorCode.LAYOUT_CHANGED``
+     - The attribute layout changed during a map operation.
+   * - ``ErrorCode.TIMEOUT``
+     - The wait or fetch did not finish within its timeout.
+   * - ``ErrorCode.OP_FAILED``
+     - An asynchronous operation failed. Inspect its diagnostic.
+   * - ``ErrorCode.OUT_OF_RANGE``
+     - A selected attribute on a queried path has a recorded change after the
+       requested end. The older value is unavailable even after sealing the later
+       change. Request a newer end or current state; see :doc:`/scene/reading_attributes`.
+   * - ``ErrorCode.INTERNAL``
      - An internal error occurred.
 
-Turning Codes into Strings
---------------------------
+:meth:`ovstage.Read.fetch_next()` and :meth:`ovstage.Map.fetch_next()` return
+``None`` at the end of iteration rather than raising an exception.
 
-Three diagnostic accessors exist, with distinct return types and lifetimes:
+See :doc:`overview` for diagrams explaining :term:`watermark <Watermark>` and range-read
+errors. A watermark advance to a lower ordinal has no effect; it does not move
+the watermark backwards or report a watermark violation.
+
+Recovering from a Failed Write
+--------------------------------------
+
+A failed batch can leave some :term:`changes <Change>` applied:
+
+* Successfully completed entries remain applied when a later entry fails.
+  The API does not return a list of completed entries. Repair a batch that may
+  have partly succeeded using a newer :term:`ordinal <Ordinal>`.
+* If no entry completed, a corrected retry at the same ordinal may be accepted,
+  subject to the current watermark and other write rules. This includes a
+  one-entry write whose change was not applied successfully.
+* A failed write can leave a :term:`prim <Prim>` or :term:`attribute <Attribute>` visible to queries.
+  Visibility alone does not prove a change was recorded. ``PrimMode.INSERT`` can reject
+  this existing target; ``PrimMode.UPSERT`` can repair it.
+
+Reserved metadata entries can complete before ordinary attribute entries
+during execution and remain committed if a later entry fails. Allocating ordinary attribute storage
+alone does not count as a successful write.
+
+Under ``STRICTLY_INCREASING``, replaying completed cells at their recorded
+ordinal is rejected. Disjoint unfinished cells may still admit a same-ordinal
+retry; ``NONDECREASING`` and ``FLOOR_ONLY`` may also allow replay of completed
+cells. Every retry must satisfy current watermarks, the selected policy, and
+stage state. Failure does not reserve an ordinal for later retry. See
+:ref:`ordinal-admission-policies`.
+
+.. note::
+
+   A successful repair can record attribute changes without recording creation
+   of a prim left present by the earlier failure. Do not infer creation events
+   from query visibility. The :meth:`ovstage.Stage.write_attributes()` reference
+   describes the full recovery contract.
+
+In C, a synchronous recoverable allocation failure returns
+``OVSTAGE_ERROR_OUT_OF_MEMORY``. A failure during an enqueued write is reported
+as ``OVSTAGE_ERROR_OP_FAILED`` through the wait, with the allocation error in
+the operation diagnostic.
+
+.. warning::
+
+   If an entry was applied successfully but the runtime cannot record its
+   committed prims or attributes, ordinal ownership, and change records
+   consistently, the implementation terminates the process. This is not a returned status or a
+   Python exception.
+
+Diagnostic Messages
+---------------------------
+
+Python exceptions carry the error message. In C, use the accessor that matches
+the failure:
 
 .. list-table::
    :header-rows: 1
+   :widths: 45 55
 
    * - Accessor
-     - Returns
-     - Use
-   * - ``ovstage_get_error_string(instance, code)``
-     - static ``const char*`` (never ``NULL``)
-     - Human-readable text for a status code. Vtable-dispatched, so it needs a live instance.
-   * - ``ovstage_get_last_op_error(instance, op_id)``
-     - ``ovx_string_t`` (``{NULL,0}`` if the id is unknown or did not fail)
-     - The message for a specific failed op. Transient — copy it to retain (refer to :doc:`string_handling`).
-   * - ``ovstage_get_last_error(void)``
-     - ``ovx_string_t``
-     - A free function readable even when ``ovstage_create_instance`` itself failed.
+     - Result and lifetime
+   * - :c:func:`ovstage_get_error_string()`
+     - Static, non-null ``const char*`` for a status code. Requires a live instance.
+   * - :c:func:`ovstage_get_last_op_error()`
+     - Borrowed ``ovx_string_t`` for a failed ID from the last wait. Copy before another wait on
+       the same thread or releasing operation tracking.
+   * - :c:func:`ovstage_get_last_error()`
+     - Borrowed ``ovx_string_t``, available without a live instance, including after
+       instance creation fails. Copy it before subsequent calls replace it.
 
-Checking a Synchronous Call
----------------------------
+An unknown or non-failed ID returns an empty view from
+:c:func:`ovstage_get_last_op_error() <ovstage_get_last_op_error>`. See :doc:`string_handling` for copying returned
+strings and :doc:`async_model` for timeouts.
 
-.. filtered-literalinclude:: ../../examples/c/minimal/main.cpp
-   :language: cpp
-   :start-after: // [snippet:check-sync-error]
-   :end-before: // [/snippet:check-sync-error]
-   :exclude-pattern: ^\s*//\s*\[/?snippet:
-   :dedent:
+Map Commit Failures
+-------------------
 
-Inspecting Per-Op Errors After a Wait
--------------------------------------
+A rejected :c:func:`ovstage_unmap_group <ovstage_unmap_group>` enqueue leaves the map and group unchanged.
+Except for :ref:`availability-event record failures <ovstage-placement-failures>`,
+after acceptance, execution failure makes the map terminal; final unmap reports
+that failure while releasing it. Repair uses a new map or write, not another
+commit attempt in the failed session. A failed write does not commit new prims
+or attributes, schema or semantic changes, hierarchy connections, or value and
+prim-lifecycle change records. It also records no new ordinal ownership. Groups
+committed earlier remain committed, including their structural changes.
+Successful final unmap commits only remaining groups and does not repeat changes
+from earlier commits.
 
-After a wait, inspect ``ovstage_op_wait_result_t.error_op_ids`` /
-``error_op_id_count`` and call ``ovstage_get_last_op_error`` for each failed id
-*immediately* — the message is invalidated by the next wait on the same thread,
-so copy it if you need to keep it.
+Map commits are not transactional and provide no rollback guarantee. A failed
+write may have modified some stored rows; these partial changes can be observable
+even though the write was not recorded as successful. Do not infer which rows
+completed from those changes or treat final unmap as an atomic commit of the
+whole session.
 
-.. filtered-literalinclude:: ../../examples/c/minimal/main.cpp
-   :language: cpp
-   :start-after: // [snippet:enqueue-wait-error]
-   :end-before: // [/snippet:enqueue-wait-error]
-   :exclude-pattern: ^\s*//\s*\[/?snippet:
-   :dedent:
+An unplaced map uses CPU storage, so any such unmap that still has payload to
+commit rejects a non-zero ``cuda_stream`` or ``cuda_event``. That rejection is
+an accepted failure and is therefore terminal for the session: finalize with
+:c:func:`ovstage_unmap_attribute <ovstage_unmap_attribute>` and start a new map to retry. A cleanup-only close
+of :c:func:`ovstage_unmap_attribute <ovstage_unmap_attribute>` -- every group already committed by
+:c:func:`ovstage_unmap_group <ovstage_unmap_group>` -- has no payload and never inspects the sync, so this
+is not a general argument check.
 
-Errors in Python
-----------------
+.. _ovstage-placement-failures:
 
-Python raises exceptions instead of returning codes:
-``ovstage.OvstageError`` for stage operations and ``ovstage.OvxError`` for
-path-dictionary operations. Both subclass ``RuntimeError`` and carry a numeric
-``code`` and a message; asynchronous errors are raised from ``.wait()``.
+Placement Availability Failures
+-------------------------------
 
-.. filtered-literalinclude:: ../../examples/python/minimal/main.py
-   :language: python
-   :start-after: # [snippet:error-handling]
-   :end-before: # [/snippet:error-handling]
-   :exclude-pattern: ^\s*#\s*\[/?snippet:
-   :dedent:
+The experimental placement extension has a post-commit exception: if CUDA
+refuses to record ``availability_event``, an otherwise successful write or map
+commit reports ``OP_FAILED`` while its values, change records, and ordinal
+ownership remain committed. Retrying must satisfy the configured admission
+policy; ``STRICTLY_INCREASING`` requires a newer ordinal for those cells.
+A failed event record on ``unmap_group`` leaves the session open, while final
+``unmap_attribute`` still consumes its handle. A placed read fails instead of
+returning payload. An operation completed during enqueue can report this
+failure synchronously after its effects have occurred.
 
-Notes
------
+The event remains untouched and cannot prove device completion. After observing
+the failure, retain write sources until synchronizing the specific placement
+stream, or the recording device for a default/per-thread stream. An ordinary
+synchronous rejection owes no event record; do not blindly wait on the event
+after rejection. See :ref:`ovstage-placement-synchronization` and the
+:class:`ovstage.Placement` reference for ordering, lifetime, and allocation-failure
+details. Event completion alone never replaces checking operation status.
 
-- ``OVSTAGE_ERROR_TIMEOUT`` from ``ovstage_wait_op`` is "not ready yet," not a
-  failure; ``wait_result.lowest_pending_op_id`` reports the lowest still-pending
-  op in the chain.
-- ``ovstage_advance_write_floor`` never raises ``WRITE_FLOOR_VIOLATION`` —
-  backwards advances clamp rather than error.
+Query Refresh Failures
+----------------------
 
-Where to Go Next
-----------------
-
-- :doc:`string_handling` — printing and copying the ``ovx_string_t`` values these accessors return.
-- :doc:`async_model` — the enqueue/wait lifecycle that surfaces per-op errors.
+In this implementation, a failed query refresh after a structural change marks
+all ready query handles on the stage as failed, including unrelated queries.
+Release and recreate those handles; retrying them does not restore readiness.
+The refresh failure is not reported on the operation that caused the change,
+which can still report success. It first surfaces when an affected handle is
+used, currently without a diagnostic message.

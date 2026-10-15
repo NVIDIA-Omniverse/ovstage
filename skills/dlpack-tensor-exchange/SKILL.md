@@ -50,15 +50,17 @@ Resolve inputs in this order: existing repository files and referenced snippets,
   those rows directly or through `index_map`.
 - Sparsity: dense, or `index_map` (gather/reorder/dedup) or `mask` (per-element validity) —
   the two are mutually exclusive.
-- The shipped headers (`ovstage_api/ovstage_api_types.h` for the data structs, the bundled
-  `<dlpack/...>` for `DLTensor`/`DLDataType`/`DLDevice`) are the authoritative contract.
+- The shipped headers (`ovstage_api/ovstage_api_types.h` for the data structs,
+  `ovstage_api/experimental/ovstage_placement_extension.h` for the experimental
+  `ovstage_placement_t`, the bundled `<dlpack/...>` for `DLTensor`/`DLDataType`/`DLDevice`)
+  are the authoritative contract.
 
 ## Prerequisites
 
 - Use an ovstage checkout that contains the `include/` headers and the referenced example/snippets.
 - Read the relevant `> **Source:**` snippet before writing or explaining API usage.
 - Understand the async enqueue/observe model first (see `cpu-ahead-gpu-async`): tensor ops
-  are **enqueues** — the data is not produced/consumed until you wait or fetch.
+  are **enqueues** — wait or fetch to confirm production/consumption and check errors.
 - For GPU-resident data, know your CUDA event/stream ownership: **GPU synchronization
   between producer and consumer is the caller's responsibility** (ovstage coordinates via
   `cuda_sync`, it does not manage your streams).
@@ -69,19 +71,27 @@ Resolve inputs in this order: existing repository files and referenced snippets,
    `fetch_read_next`), or mapped staging write (`map_attribute` / `fetch_map_next` / `unmap_*`).
 2. Describe data with a `DLTensor`: `data` pointer, `device` (`{kDLCPU,0}` or
    `{kDLCUDA, ord}`), `ndim`, `dtype` (`{code, bits, lanes}` — `lanes` is the tuple width, e.g.
-   3 for a float3), `shape`, `strides`, `byte_offset`. Fixed-size read and map tensors use
-   the canonical transport layout: `ndim = 1`, `shape = [data_rows]`, and `dtype.lanes`
-   holds the complete tuple width.
+   3 for a float3 canonical write), `shape`, `strides`, `byte_offset`. Read and
+   map tensors use scalar lanes and type-aware trailing component dimensions:
+   scalars `[N]`, tuples `[N, C]`, and semantic square matrices `[N, S, S]`.
+   Their strides count scalar elements; per-prim arrays use the same trailing axes.
 3. **Write (copy-in):** put the tensor(s) in `ovstage_write_data_t.tensors` (client-managed —
-   must stay valid until the op completes) **or** `.managed_tensors` (storage takes ownership
-   via the `DLManagedTensorVersioned` deleter); exactly one is non-NULL. Set `tensor_count`
-   (1 for fixed-size).
+   must stay valid until the op completes, or until the placement's `availability_event` has
+   completed when one is supplied, or, if that event could not be recorded, until the
+   synchronization `ovstage_placement_t` describes for that case) **or** `.managed_tensors`
+   (storage takes ownership via the `DLManagedTensorVersioned` deleter, which may run after
+   the op completes when an availability event is supplied); exactly one is non-NULL. Set
+   `tensor_count` (1 for fixed-size).
 4. **GPU-resident write:** set `write_data.cuda_sync.wait_event` to an event recorded *after*
    your producing kernel — ovstage waits on it before copying in — and `.stream` to the CUDA
-   stream it was recorded on (`0` = default stream). Leave `cuda_sync` `{0, 0}` for CPU or
-   already-synchronized data.
-5. **Read (copy-out):** after `fetch_read_next`, if `group.data.cuda_sync.wait_event` is
-   non-zero, wait on it (e.g. `cuStreamWaitEvent`) before touching `tensors[i].data`. Treat the
+   stream it was recorded on (`0` = none, `1` = the default stream, `>1` = a specific
+   `cudaStream_t`). Leave `cuda_sync` `{0, 0}` for CPU or already-synchronized data.
+5. **Read (copy-out):** read groups report `group.data.cuda_sync = {0, 0}`.
+   Unplaced reads and placed reads without an availability event are ready on a
+   successful fetch. With `placement.availability_event`, successfully fetch a
+   group first, then wait on that event or order its consumer on the placement
+   stream before accessing the payload. Stream `2` is the worker's per-thread
+   default stream; use the event to order work on the caller's thread. Treat the
    data as valid only for the current snapshot — copy/retain it to use beyond the immediate
    read. Release the group with `release_group`. Releasing the *read* does not reclaim a
    group: an unreleased group stays pinned for the life of the stage and keeps failing later
@@ -89,11 +99,15 @@ Resolve inputs in this order: existing repository files and referenced snippets,
    the context manager so an exception in the processing body cannot strand it:
 
    > **Source:** `tests/python/test_read_groups.py` snippet `read-group-context-manager`
-6. **Mapped staging write:** `fetch_map_next` hands back a writable `ovstage_map_group_t`;
-   write your values into `group.data.tensors[i].data` (CPU or via a GPU kernel), then commit
-   with `unmap_group` (per group) or `unmap_attribute` (commit remaining + release the
-   handle), passing a write-done `ovstage_cuda_sync_t` whose `wait_event` ovstage waits on
-   before sealing.
+6. **Mapped staging write:** `fetch_map_next` hands back a writable `ovstage_map_group_t`
+   after setup is Ready. Setup does not commit values, new prims or attributes, schemas,
+   hierarchy connections, or change records, and it records no new ordinal ownership.
+   Fill the CPU tensors, then commit with `unmap_group` (per group) or `unmap_attribute`
+   (commit remaining + release the handle), and wait for
+   completion. Each successful commit applies the group's values and any structural changes
+   and records them once; final unmap never commits earlier groups again. Pass a zero
+   write-done `ovstage_cuda_sync_t` for these CPU buffers. Advance the write floor separately before
+   reading committed values back.
 7. **Sparsity:** when `index_map` or `mask` is set, use `count` (logical element count) with
    `index_map[i]` (gather) or `mask` (validity); they are mutually exclusive. `index_map`
    selects *source rows*, `mask` selects *target elements* — to write a subset of a query's
@@ -118,16 +132,31 @@ This skill has no scripts.
 
 - The referenced snippets remain the source of truth; update or add tested snippets before documenting new API usage.
 - **Map/unmap is staging-backed in the current implementation, not a true storage map.**
-  `fetch_map_next` returns a newly allocated, write-only buffer; it is not a view of the
+  `fetch_map_next` returns a session-owned, write-only buffer; it is not a view of the
   attribute's current value and is not initialized from existing storage. `unmap_group` or
-  `unmap_attribute` copies/scatters the staged bytes into backing storage, then releases the
-  staging allocation. Treat map/unmap as a write-only replacement path and account for the
-  extra allocation and commit copy.
+  `unmap_attribute` copies/scatters the staged bytes into backing storage. Stop accessing
+  the buffer after an accepted commit submission, even if the session retains its
+  allocation until final unmap. Treat map/unmap as a write-only replacement path and
+  account for the staging allocation and commit copy.
+- **Failed map execution is terminal.** Final unmap releases the failed session and reports
+  its error; repair requires a new map or write. A failed write does not commit new prims or
+  attributes or record new ordinal ownership or change records. Earlier successful groups
+  remain committed. The exception is a placed write or map commit whose `availability_event`
+  CUDA refuses to record: it reports `OVSTAGE_ERROR_OP_FAILED` after committing, so its
+  changes and ordinal ownership stay recorded, and an `unmap_group` session stays open.
+  Storage changes may remain after failure: neither individual commits nor final session
+  closure promise rollback or atomicity.
+- **Unplaced maps and reads return CPU payloads.** The experimental `Placement`
+  extension also selects CUDA buffers (fixed-size attributes only for maps).
+  Inspect `DLTensor.device`, use a matching
+  consumer, and obey the availability-event and lifetime rules in
+  [device placement](../../docs/concepts/dlpack_tensors.rst#experimental-device-placement).
+  Never launch a CUDA kernel against a CPU map buffer.
 - **CPU DLTensor write/read is snippet-backed** (the minimal example), and this build adds
   snippet-backed **CPU map/unmap** (`map-unmap-cpu`, the public map test) and **Python CUDA
-  ingest with warp** (`gpu-warp-ingest`, write-flavors — GPU-gated at runtime). The **C-side
-  GPU-resident write (`cuda_sync` sync) remains described from the headers only** — the C
-  examples stay CPU-only, so the headers are the contract for that path.
+  ingest with warp** (`gpu-warp-ingest`, write-flavors — GPU-gated at runtime).
+  The C CUDA ingest example is in `examples/c/write-flavors/cuda_ingest.cpp`;
+  `tests/c/test_placement.cpp` covers the experimental placement extension.
 - **Latest-snapshot build:** returned tensor data is valid only for the latest committed
   snapshot. To use it later you must take explicit ownership (copy / retain / transfer) — do
   not hold a borrowed pointer across further commits.
@@ -135,20 +164,20 @@ This skill has no scripts.
   not own or synchronize your streams.
 - **Python `managed_tensors` transfer is not exposed** — DLPack ingest/export (incl. CUDA) is
   supported (see the Python section), but the Python write path uses only the client-managed
-  `tensors` field: the caller keeps the source object alive until the op completes, rather than
-  handing ownership to storage via `managed_tensors`.
-- **Fixed-size shape is normalized, not preserved.** Compact convenience write shapes are
-  accepted, but trailing component dimensions are folded into `dtype.lanes`; raw C reads and
-  maps return the canonical 1-D row layout. This statement does not cover array/ragged
-  attributes, whose tensor shapes describe per-prim elements.
+  `tensors` field: the caller keeps the source object alive until the op completes (until the
+  placement's availability event completes, when one is supplied, or, if that event could not
+  be recorded, until the synchronization `Placement` describes), rather than handing ownership
+  to storage via `managed_tensors`.
+- **Fixed-size shape is reconstructed, not retained.** Compact convenience write shapes are
+  folded into storage lanes. Reads and maps reconstruct component axes from width and semantic.
+  Array/ragged values apply those axes per tensor.
 - **⚠️ Draft — API in flux.** Treat exact symbols/usage as provisional against the headers.
 
 ## Overview
 
-ovstage exchanges attribute values as **DLPack `DLTensor`s**, with a map/unmap write path that
-follows a zero-copy programming model. Zero-copy is the intended direction, but the current
-build is staging-backed: map hands back a write-only buffer that is copied into backing storage
-at unmap, not a direct view. One data shape is reused throughout:
+ovstage exchanges attribute values as **DLPack `DLTensor`s**. The map/unmap write path
+provides write-only staging that is applied to attribute storage at successful unmap.
+One data shape is reused throughout:
 
 - **`ovstage_data_t`** (reads and map groups) and **`ovstage_write_data_t`** (writes) both
   carry: an array of `DLTensor`s (`tensors` + `tensor_count`), optional sparsity
@@ -156,43 +185,49 @@ at unmap, not a direct view. One data shape is reused throughout:
 - **`tensor_count` depends on attribute kind:** fixed-size attributes use a single tensor
   with all transported data rows stacked along the leading dimension; array (ragged)
   attributes use one tensor per transported data row.
-- **Fixed-size tensors are lane-canonical on read and map:** the leading dimension is the
-  transported data-row count and `dtype.lanes` is the full tuple width. Logical elements
-  select rows directly or through `data.index_map`. Writes may use this canonical layout or
-  a compact convenience shape; convenience trailing dimensions are folded and are not
-  retained as schema metadata.
+- **Reads and maps share typed shapes:** the leading dimension is the
+  transported data-row count. Both expose scalar lanes, with a component axis for tuples
+  or two square axes for known MATRIX values. Logical elements select rows directly or
+  through `data.index_map`. Input trailing dimensions are not retained as schema metadata.
 - **Three paths:** *copy-in* (`write_attribute`, implementation copies/scatters your tensors
   into storage), *copy-out* (`read_attributes` → `fetch_read_next`, you read from the
   returned tensors), and *mapped staging* (`map_attribute` → `fetch_map_next`, you fill a
   write-only staging buffer that is copied/scattered into backing storage by `unmap_*`).
 - **`cuda_sync` semantics** (`ovstage_cuda_sync_t { uintptr_t stream; uintptr_t wait_event; }`,
-  where `wait_event` is a `CUevent` and `stream` a `CUstream` as `uintptr_t`; `stream` 0 = no
-  sync / default, 1 = default stream, >1 = a specific stream): `{0, 0}` means CPU-resident or
-  already-synchronized; a non-zero `wait_event` on a **read** means *wait before access*; on a
-  **write/unmap** it is the event ovstage *waits on* (relative to `stream`) before sealing your data.
+  where `wait_event` is a `cudaEvent_t` and `stream` a `cudaStream_t`, both as `uintptr_t`;
+  `stream` 0 = none, 1 = default stream, >1 = a specific stream): `{0, 0}` means CPU-resident
+  or already-synchronized; a non-zero `wait_event` on a **read** means *wait before access*; on
+  a **write/unmap** it is the event ovstage *waits on* (relative to `stream`) before applying
+  your data. Advancing the write floor seals committed values separately.
 
 ### Fixed-size canonical and convenience layouts
 
-For fixed-size attributes (`is_array = false`), use the canonical layout when shape stability
-matters across a raw C API round trip. Convenience layouts are accepted on copy-in, but only
-their leading dimension is the source data-row count; all trailing component dimensions are
-folded into the canonical lane width. In this table, `N` is the source/transported data-row
+For fixed-size attributes (`is_array = false`), both canonical lane-based and convenience
+layouts are accepted on copy-in. Trailing component dimensions are folded into storage lanes;
+the read shape is reconstructed from component count and semantic. In this table, `N` is the source/transported data-row
 count. When `data.index_map` is present, `N` may differ from the logical prim count: it can
 be smaller when rows are shared or larger when a query touches only part of a transported
 bucket. Without `index_map`, `N` must equal the logical prim count. A flat `(N * L,)`,
 `lanes = 1` tensor is not a convenience encoding of `N` rows of width `L`; use `(N, L)` or
 canonical lanes.
 
-| Value per data row | Canonical write / raw read / raw map | Accepted convenience write | Python DLPack export |
+| Value per data row | Canonical write | Accepted convenience write | Raw read/map / Python DLPack export |
 |---|---|---|---|
-| scalar | `shape = [N]`, `lanes = 1` | same | `(N,)` |
-| point/vector/color (`float3`) | `shape = [N]`, `lanes = 3` | `shape = [N, 3]`, `lanes = 1` | `(N, 3)` |
-| matrix (`matrix4d`) | `shape = [N]`, `lanes = 16` | `shape = [N, 4, 4]`, `lanes = 1`, or `shape = [N, 4]`, `lanes = 4` | `(N, 16)` |
+| scalar | `shape = [N]`, `lanes = 1` | same | `[N]`, lanes 1 / `(N,)` |
+| point/vector/color (`float3`) | `shape = [N]`, `lanes = 3` | `shape = [N, 3]`, `lanes = 1` | `[N,3]`, lanes 1 / `(N, 3)` |
+| matrix (`matrix4d`) | `shape = [N]`, `lanes = 16` | `shape = [N, 4, 4]`, `lanes = 1`, or `shape = [N, 4]`, `lanes = 4` | `[N,4,4]`, lanes 1 / `(N, 4, 4)` |
 
-The original convenience shape is not preserved: a matrix written as `(N, 4, 4)` is read and
-mapped by the raw API as `shape = [N]`, `lanes = 16`. Python's DLPack protocol export adds
-exactly one trailing axis for the lane width, so it produces `(N, 16)`, not `(N, 4, 4)`.
-Array/ragged attributes are outside this fixed-size layout rule.
+The original convenience shape is not stored. A known matrix reads and maps as
+`(N, S, S)` for S=2,3,4; a generic tuple retains one component axis, including
+12-component tuples. Array/ragged reads and maps apply the same rule per tensor.
+
+To forward a known read/map descriptor as canonical write input, use C
+`ovstage_tensor_to_write()` from `ovstage_tensor_utils.h` or Python
+`typed_tensor_to_write()`. These copy metadata only and preserve compact component
+axes and outer row strides. Preserve semantic, array kind, and prim/data mappings.
+Copy a pinned read payload before releasing it when rewriting the same storage;
+keep all write inputs alive until completion. Do not infer vector-array types
+from arbitrary multidimensional scalar arrays.
 
 ## C — write and read (copy-in / copy-out)
 
@@ -201,6 +236,8 @@ it by advancing the write floor, and reads the column back from `group.data.tens
 — the end-to-end CPU shape for both directions:
 
 > **Source:** `examples/c/minimal/main.cpp` snippet `minimal-write-read`
+
+> **Source:** `tests/c/test_minimal.cpp` snippet `write-read-roundtrip-c`
 
 The public test asserts the three column shapes round-trip — a 1-lane scalar, a fixed
 multi-lane tuple (lanes in the dtype, not the shape), and a ragged per-prim array:
@@ -214,60 +251,61 @@ stamps it and the read recovers it — the public test asserts the round-trip:
 > **Source:** `tests/c/test_attributes.cpp` snippet `semantic-roles-c`
 
 The public contract test also authors a matrix with the convenience input layout
-`shape = [3, 4, 4]`, `lanes = 1`, then observes the canonical raw read layout
-`shape = [3]`, `lanes = 16`:
+`shape = [3, 4, 4]`, `lanes = 1`, then observes the type-aware raw read layout
+`shape = [3, 4, 4]`, `lanes = 1`:
 
 > **Source:** `tests/c/test_minimal.cpp` snippet `canonical-fixed-shapes-c`
 
 > **Source:** `tests/python/test_minimal.py` snippet `canonical-fixed-shapes`
 
-For **GPU-resident** data the only additions are the device and a producing event (the rest
-of the call is identical to the snippet above):
-
-```c
-DLTensor t{};
-t.data   = d_ptr;                  // CUDA device pointer
-t.device = { kDLCUDA, /*ordinal*/ 0 };
-t.ndim   = 1;
-t.dtype  = { kDLFloat, 32, 1 };    // {code, bits, lanes}; lanes = tuple width
-t.shape  = shape;
-t.strides = strides;
-
-ovstage_write_data_t w{};
-w.tensors      = &t;
-w.tensor_count = 1;
-w.cuda_sync.wait_event = my_kernel_done_event;  // ovstage waits on this before copy-in ({0,0} if CPU/synced)
-w.is_array     = false;                 // explicit fixed-size attribute kind
-// ovstage_write_attribute(stage, query, attrArg, /*ordinal*/ ord, w, OVSTAGE_PRIM_MODE_UPSERT)
-```
+For **GPU-resident** data the call is the `minimal-write-read` / `write-read-roundtrip-c`
+setup above with three field changes and nothing else: `tensor.data` is the CUDA device
+pointer instead of a host pointer, `tensor.device = { kDLCUDA, /*device ordinal*/ 0 };`
+says so, and the write carries the producer's completion event,
+`write.cuda_sync.wait_event = (uintptr_t)producer_event;` — a `cudaEvent_t` recorded after
+the producing kernel, which ovstage waits on before copy-in (leave `cuda_sync = {0, 0}` for
+CPU-resident or already-synchronized data). See
+`examples/c/write-flavors/cuda_ingest.cpp` for the C form. The Python/warp form is:
 
 > **Source:** `examples/python/write-flavors/main.py` snippet `gpu-warp-ingest`
 
-> The runnable GPU ingest is Python/warp — the C examples stay CPU-only. On read, mirror
-> this: if `group.data.cuda_sync.wait_event` is non-zero, wait on it before reading
-> `tensors[i].data`.
+> Read groups return zero `cuda_sync`. For a placed read with an availability event,
+> fetch successfully before waiting on that event or ordering the consumer on the
+> placement stream; see step 5 above. Keep the group alive until the consumer finishes.
 
 ## C — mapped staging write (map / unmap)
 
-For GPU kernels (or DMA) that need ovstage to allocate a writable destination buffer, use the
-map iterator. In the current implementation this is staging-backed rather than a direct view
-of backing storage. The flow:
+Use the map iterator when ovstage should allocate the writable destination buffer. The
+unplaced calls return CPU staging rather than a view of attribute storage. The flow:
 
 1. `ovstage_map_attribute(stage, query, &desc, ordinal, element_sizes, element_count, &map)`
    — `desc` is an `ovstage_map_desc_t` (`attribute`, `dtype` (required when *creating* the
    column; `dtype.lanes` = tuple width), `semantic`, `prim_mode`). For fixed-size attributes
    pass `element_sizes = NULL`, `element_count = 0`; for array attributes pass the per-prim
-   element counts so storage can pre-allocate the ragged backing.
+   element counts so ovstage can allocate the ragged staging.
 2. `ovstage_fetch_map_next(stage, map, timeout, &map_group)` — iterate writable groups (same
    fetch-with-timeout contract as `fetch_read_next`); write your values into
-   `map_group.data.tensors[i].data`. A fixed-size map group uses the same canonical
-   `shape = [data_rows]`, full-`dtype.lanes` layout as a raw read.
+   `map_group.data.tensors[i].data` plus `byte_offset`. A fixed-size map group uses
+   the same scalar-lane typed dimensions as a raw read; strides count scalars.
 3. Commit: `ovstage_unmap_group(stage, map, &map_group, write_done_sync)` per group, then
    `ovstage_unmap_attribute(stage, map, write_done_sync)` to commit any remainder and release
-   the handle. `write_done_sync` is an `ovstage_cuda_sync_t` whose `wait_event` ovstage waits
-   on before sealing your writes (`{0, 0}` if the writes are already complete/CPU).
+   the handle. Wait for each operation to observe its result. `write_done_sync` is an
+   `ovstage_cuda_sync_t` that coordinates producer completion; pass `{0, 0}` for these CPU
+   buffers. If all groups are committed, final unmap only closes the session.
 
 All map/unmap ops are ordinal-keyed at the session's `ordinal`, like `write_attribute`.
+Ready exposes staging only; it does not commit values, new prims or attributes, schemas,
+hierarchy connections, or change records, and it records no new ordinal ownership.
+Successful group or final commits apply each group's values and any structural changes and
+record them once. A later failure does not undo groups committed earlier, and final unmap
+does not retry a failed session. See `docs/concepts/error_handling.rst` for the
+failure and repair contract.
+
+Readback still requires advancing the relevant write floor after commit. Successful unmap
+invalidates affected derived transforms without promising synchronous recomputation; use
+the supported flow in `docs/scene/transforms.rst`. A pending or failed parent map adds no
+committed hierarchy parent. A committed child may compute as a current root while its parent
+is absent and reconnect after that parent's successful commit.
 
 > **Source:** `tests/c/test_map_attribute.cpp` snippet `map-unmap-cpu-c`
 >
@@ -308,20 +346,24 @@ Two caveats:
 | `ovstage_read_group_t { …; data; meta; is_delete; is_array; semantic }` | one read result group; data in `.data` |
 | `ovstage_map_group_t { prims; data; meta }` | one writable map group; fill `.data.tensors[i].data` |
 | `ovstage_map_desc_t { attribute; dtype; semantic; prim_mode }` | descriptor for a map session |
-| `ovstage_cuda_sync_t { uintptr_t stream; uintptr_t wait_event; }` | GPU sync; `{0,0}` = CPU/synced; `wait_event` (a `CUevent`) = event to wait on before access; `stream` 0/1 = default, >1 = specific `CUstream` |
-| `map_attribute` / `fetch_map_next` / `unmap_group` / `unmap_attribute` | staging-backed write iterator; commit occurs at unmap |
+| `ovstage_cuda_sync_t { uintptr_t stream; uintptr_t wait_event; }` | GPU sync; `{0,0}` = CPU/synced; `wait_event` (a `cudaEvent_t`) = event to wait on before access; `stream` 0 = none, 1 = default stream, >1 = a specific `cudaStream_t` |
+| `map_attribute` / `fetch_map_next` / `unmap_group` / `unmap_attribute` | staging write iterator; each successful unmap commits only groups not already committed |
 
 ## Troubleshooting
 
-- **Garbage / race on GPU data** — you didn't honor the `cuda_sync`. On read, wait on
-  `group.data.cuda_sync.wait_event` before access; on write/unmap, pass a `cuda_sync` whose
-  `wait_event` was recorded after your kernel so ovstage doesn't seal before your writes finish.
+- **Garbage / race on GPU data** — check both handoffs. On read, successfully fetch
+  before waiting on the placement availability event; the returned `cuda_sync` is zero.
+  On write/unmap, provide the producer's `cuda_sync.wait_event` recorded after its
+  kernel. Observe operation errors separately from event completion.
 - **Use-after-free of read data** — returned tensors are valid only for the latest snapshot.
   Copy (or otherwise take ownership of) the bytes if they must outlive the read; don't hold
   the borrowed pointer across further commits.
 - **`tensors` vs `managed_tensors`** — set exactly one. Use `tensors` for client-owned memory
-  that stays valid until the op completes; use `managed_tensors` to hand lifetime to storage
-  (deleter invoked when no longer needed).
+  that stays valid until the op completes (with a placement `availability_event`, until that
+  event completes, or, if the event could not be recorded, until the synchronization
+  `ovstage_placement_t` describes); use `managed_tensors` to hand lifetime to storage (deleter
+  invoked once no work of the op reads the tensor, which with an availability event can be
+  after the op completes).
 - **`index_map` and `mask` both set** — they're mutually exclusive; pick gather (`index_map`)
   or validity (`mask`), and set `count` when either is present.
 - **`count = 0` used to mean "no elements"** — it means *every prim the query covers*, so a
@@ -347,12 +389,16 @@ Two caveats:
   lengthening the map (or switching to `mask` to select target prims), not raising `count`.
 - **Wrong `tensor_count`** — fixed-size attributes require `tensor_count == 1` (transported
   data rows are stacked along the leading dim); per-row tensors are for array/ragged attributes.
-- **Convenience input shape did not round-trip** — expected for fixed-size attributes. Inspect
-  the raw result as `shape = [data_rows]` with the complete tuple width in `dtype.lanes`;
-  use the canonical input form when the same descriptor must be reusable without normalization.
+- **Convenience input shape did not round-trip exactly** — the input axes are not retained.
+  Reads and maps reconstruct type-aware axes from component width and semantic.
+  Use `.reshape(-1)` explicitly for flat NumPy buffer indexing.
 - **Creating a mapped attribute fails** — a new column needs `desc.dtype`; a zero-initialized
-  dtype only works when the existing schema is unambiguous. Changing an existing prim/name's
-  dtype or semantic fails — delete the attribute first, then map/write the new schema.
+  dtype only works when the existing schema is unambiguous. An omitted semantic adopts an
+  unambiguous compatible identity. Specify both dtype and semantic when target prims have
+  multiple same-name identities. Conflicting with existing storage or an authored role on a
+  target prim/name fails — delete the attribute first and map/write the new schema at a later
+  ordinal, or set `attribute_mode` to `OVSTAGE_ATTRIBUTE_MODE_FORCE` (Python `AttributeMode.FORCE`;
+  a map also needs `dtype`) to replace that schema as one change at the same ordinal.
 - **Mapped values start empty or unspecified instead of matching the attribute** — expected
   in the current implementation: mapping allocates write-only staging and does not load the
   existing payload. Populate every value you intend to commit before unmapping.
@@ -370,13 +416,13 @@ surface and `error-handling` (Python) for the exception types.
   (`DLDevice{kDLCPU, 0}`) aliasing the array's buffer. Keep the array alive until the op completes
   — the returned `Operation` holds it for you until `.wait()`. For fixed-size attributes, a
   NumPy `(N, 3)` point array or `(N, 4, 4)` matrix array is a convenience write layout; the
-  raw result is normalized to `(N,)` with 3 or 16 lanes.
+  raw read and map results share typed shapes with scalar lanes.
 - **Read:** `ReadGroup.array(i)` returns a zero-copy **read-only** NumPy view (CPU). Its
   `WRITEABLE` flag is `False` and cannot be re-enabled, so direct writes through the returned
   array are rejected. Copy it if you need a mutable array.
 - **Map:** `MapGroup.array(i)` returns a zero-copy **writable** NumPy view (CPU) — fill it in
-  place, then commit via `unmap_group` / `unmap_attribute`. Both views are valid only until the
-  group/result is released.
+  place, then commit via `unmap_group` / `unmap_attribute`. Stop using the map view when
+  submitting its group commit or final unmap. Read views expire when their group is released.
 
 **DLPack protocol (numpy / warp / torch / cupy / jax; CPU or CUDA):**
 
@@ -395,12 +441,14 @@ surface and `error-handling` (Python) for the exception types.
   `ndim=1`, and compact `strides=[1]`.
 - **Read / map (export):** `ReadGroup.dlpack(i)` / `MapGroup.dlpack(i)` return a `ManagedDLTensor`
   implementing `__dlpack__` / `__dlpack_device__`, so `np.from_dlpack(group.dlpack(i))`,
-  `wp.from_dlpack(...)`, `torch.from_dlpack(...)` consume it zero-copy (CPU **or** CUDA). A read
+  `wp.from_dlpack(...)`, `torch.from_dlpack(...)` consume it zero-copy on a compatible
+  device. Unplaced reads/maps return CPU buffers; placement can select CUDA. Honor
+  availability events before consuming payloads and keep groups alive through device work. A read
   group exports read-only; a writable map group exports writable (NumPy ≥ 2.1 honors the flag).
-  Each vector dtype is exported by adding exactly one trailing lane axis. Thus a canonical
-  fixed-size matrix tensor `shape = [N]`, `lanes = 16` exports as `(N, 16)`, not as the
-  convenience input shape `(N, 4, 4)`. Borrowed lifetime: valid only until the group/result is
-  released — copy it to outlive the read.
+  Native read and map tensors already have scalar lanes and typed dimensions,
+  so a matrix4d exports its existing `(N,4,4)` shape. The views borrow storage: release ends a read view's
+  lifetime; stop using a map view when submitting its group commit or final unmap. Copy
+  values needed beyond the owning group's or session's lifetime.
 
 GPU synchronization remains the caller's responsibility (record/await via `cuda_sync` per the
 residency model above; DLPack ingest does not synchronize your streams for you). See
@@ -409,8 +457,8 @@ types.
 
 > **Source:** `examples/python/minimal/main.py` snippets `minimal-write-read`, `dlpack-interchange`
 
-The public test asserts the three column shapes round-trip — scalar, fixed multi-lane
-(lanes in the dtype), and ragged per-prim array:
+The public test asserts the three column kinds round-trip — scalar, fixed tuple, and ragged
+per-prim array:
 
 > **Source:** `tests/python/test_attribute_shapes.py` snippets `attribute-shapes-fixed`, `attribute-shapes-ragged`
 
@@ -431,3 +479,5 @@ through a `DLTensor` (lanes fold into the flat element count on read):
 - `application-flow` skill — where tensor exchange sits in the end-to-end lifecycle.
 - `path-dictionary` / `string-handling` skills — identifying the prims and attribute a tensor write/read targets.
 - Keep related skills, docs, and snippets synchronized when changing the workflow.
+
+> **Source:** `tests/python/test_map_attribute.py` snippet `typed-write-adapter-outer-stride` verifies zero-copy folding, outer stride preservation, and rejection of noncompact component axes.

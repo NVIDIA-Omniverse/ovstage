@@ -116,7 +116,7 @@ Animate a prim by writing its local ``omni:xform`` (a 4×4 matrix, ``MATRIX``
 semantic) straight into the table over successive ordinals, advancing the floor
 each step. This guide reads back only the local value it writes; it does not
 validate a hierarchy-derived world transform. See :doc:`/scene/transforms`
-before using this attribute to publish effective world transforms:
+before using this attribute to write effective world transforms:
 
 .. tab-set::
 

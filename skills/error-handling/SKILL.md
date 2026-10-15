@@ -120,7 +120,7 @@ most recent thread-local error is also available as an `ovx_string_t` via
 | `OVSTAGE_ERROR_INVALID_HANDLE` (2) | stale/invalid handle |
 | `OVSTAGE_ERROR_NOT_FOUND` (3) | token/path/list not found |
 | `OVSTAGE_ERROR_PRIM_NOT_FOUND` (4) | INSERT mode and prim already exists |
-| `OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION` (5) | write at/below the floor, or latest state / a selected in-range change above it |
+| `OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION` (5) | mutation blocked by a floor or the configured admission policy, or read selecting an unsealed change at/before its end |
 | `OVSTAGE_ERROR_NOT_SUPPORTED` (6) | unsupported operation |
 | `OVSTAGE_ERROR_QUEUE_FULL` (7) | backpressure: submit queue full |
 | `OVSTAGE_ERROR_END_OF_ITERATION` (8) | no more groups to iterate |
@@ -128,7 +128,7 @@ most recent thread-local error is also available as an `ovx_string_t` via
 | `OVSTAGE_ERROR_LAYOUT_CHANGED` (10) | layout changed during map |
 | `OVSTAGE_ERROR_TIMEOUT` (11) | fetch/wait did not complete within timeout |
 | `OVSTAGE_ERROR_OP_FAILED` (12) | an enqueued op failed; see `ovstage_get_last_op_error` |
-| `OVSTAGE_ERROR_OUT_OF_RANGE` (13) | requested ordinal range cannot be materialized from retained payloads |
+| `OVSTAGE_ERROR_OUT_OF_RANGE` (13) | older values requested by the read are no longer available |
 | `OVSTAGE_ERROR_INTERNAL` (99) | internal error |
 
 ## C — synchronous calls
@@ -167,7 +167,7 @@ reports the lowest still-pending id in the waited op's dependency chain.
 A concrete asserted failure: an op that runs and fails surfaces through `error_op_ids`
 with the wait itself still returning `OVSTAGE_OK`, and the reason lives in the per-op
 error string. The public test drives a clone onto an already-existing target and checks
-both the failure and the "already exists" reason:
+the failure, the "already exists" reason, and that the colliding target path is named:
 
 > **Source:** `tests/c/test_error_handling.cpp` snippet `clone-target-exists-error-c`
 
@@ -180,20 +180,37 @@ The Python bindings turn return-code failures into **exceptions** (both subclass
   / `ovstage_get_last_op_error`).
 - **`ovstage.OvxError`** — raised by `PathDictionary` operations.
 
+`Operation.ok` reports enqueue acceptance only, even when execution later fails.
+Retain mutation operations until `wait()` observes their completion. Use
+query/read/map context managers for handle lifetimes and explicitly observe
+their wait/fetch/commit results; finalizers are not an error-reporting mechanism.
+
 Synchronous calls raise on failure. For **async** ops, the enqueue returns a handle object
-(`Query` / `Read` / `Map`) whose **`.wait(timeout)` raises `OvstageError`** if the op (or a
-dependency) failed — the equivalent of inspecting `error_op_ids` in C.
+(`Query` / `Read` / `Map`; mutations return an `Operation`, `Stage.clone_async` a
+`CloneOperation`) whose **`.wait(timeout)` raises `OvstageError`** if the op (or a
+dependency) failed — the equivalent of inspecting `error_op_ids` in C. For a failed clone the
+two error views are mutually exclusive in Python: `.wait()` (and `CloneOperation.result()`)
+raise `OP_FAILED` plus the message and release the op together with its report, so to observe
+the clone's own code (for example `NOT_FOUND` / `PRIM_NOT_FOUND` / `WRITE_FLOOR_VIOLATION`) call
+`Stage.fetch_clone_result(op)` *instead*, before any wait. Only the C sequence `ovstage_wait_op`
+→ `ovstage_fetch_clone_result` → `ovstage_release_op` yields both. On success `.wait()`
+returns the object it was called on (`Operation.wait()` returns the `Operation`), so the
+follow-on call chains — `group = read.wait().fetch_next()` — inside the handle's `with`
+block; chaining on the temporary leaks the handle. The public test asserts the contract:
+
+> **Source:** `tests/python/test_minimal.py` snippet `wait-chaining`
 
 > **Source:** `examples/python/minimal/main.py` snippet `error-handling`
 
 An op that ran and failed raises `OvstageError` from `.wait()` with the op-level code
-`ErrorCode.OP_FAILED` and the reason in `.message`. The public test asserts this on a
-clone onto an already-existing target:
+`ErrorCode.OP_FAILED` and the reason — including the colliding target path — in
+`.message`. The public test asserts this on a clone onto an already-existing target:
 
 > **Source:** `tests/python/test_error_handling.py` snippet `clone-target-exists-error`
 
 A timeout surfaces as the `OVSTAGE_ERROR_TIMEOUT` code (`timeout=0` polls,
-`OVSTAGE_TIMEOUT_INFINITE` blocks, other finite values wait up to the timeout).
+`OVSTAGE_TIMEOUT_INFINITE` blocks, other finite values wait up to the timeout). A timed-out
+`.wait()` does not consume the op: it stays waitable and its input buffers stay pinned.
 
 ## Key Types / Functions
 
@@ -220,15 +237,18 @@ A timeout surfaces as the `OVSTAGE_ERROR_TIMEOUT` code (`timeout=0` polls,
   chain, not just that single op.
 - Treat `OVSTAGE_ERROR_TIMEOUT` as "not ready yet," distinct from `OVSTAGE_ERROR_OP_FAILED`
   ("the op ran and failed").
-- `OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION` means a write or delete targeted an ordinal at or
-  below the effective write floor, a latest read targets current recorded state above it, or
-  an explicit range selects an in-range change above it. The effective floor starts at 0, so
-  advance it to cover positive-ordinal state before reading. `advance_write_floor` itself never
+- `OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION` means a mutation conflicts with an effective floor
+  or the configured admission policy for affected cells or prim lifecycle, or a read selects
+  an unsealed change at or before its end. Snapshots select all queried paths; change ranges
+  select `(attribute, path)` pairs changed in the requested interval. See
+  [Ordinal Admission Policies](../../docs/scene/writing_attributes.rst) when diagnosing
+  retained-history conflicts. The effective floor starts at 0. `advance_write_floor` itself never
   raises this: backwards advances clamp via `max(...)` rather than rejecting.
-- `OVSTAGE_ERROR_OUT_OF_RANGE` on an explicit range means a selected `(attribute, path)` also
-  has a retained change after the range end, so the payload for that fixed range is no longer
-  available. Widen/rebase the range or request current state. Sealing the later change alone does
-  not resolve this error.
+- `OVSTAGE_ERROR_OUT_OF_RANGE` means a selected `(attribute, path)` has a recorded change
+  after the requested end, sealed or not, and older values are not retained. For each attribute,
+  the read checks for the write-floor violation above first. If newer values are acceptable,
+  move the end forward or use `UINT64_MAX` (Python: `(1 << 64) - 1`) to request current values,
+  but a selected unsealed change still returns `WRITE_FLOOR_VIOLATION`. Sealing alone does not restore older values.
 - Call `ovstage_release_op` once an op is known complete; afterwards the `op_id` must not
   be reused with `ovstage_wait_op` or `ovstage_get_last_op_error`.
 

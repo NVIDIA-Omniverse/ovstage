@@ -238,7 +238,8 @@ def Xform "World"
     // [/snippet:export-typed-hierarchy-to-usd-c]
 
     EXPECT_GE(report.prims_exported, 3u);
-    EXPECT_EQ(report.api_schemas_applied, 2u);
+    // Each prim's physics schema, and the MaterialBindingAPI RENDERING gives it.
+    EXPECT_EQ(report.api_schemas_applied, 4u);
     EXPECT_GE(report.attributes_exported, 4u);
     std::ifstream stream(destination.identifier(), std::ios::binary);
     const std::string text((std::istreambuf_iterator<char>(stream)), std::istreambuf_iterator<char>());

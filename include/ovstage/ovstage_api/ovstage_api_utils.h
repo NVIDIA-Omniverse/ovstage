@@ -24,7 +24,9 @@
  * slots (`ovstage_get_version`, `ovstage_get_error_string`,
  * `ovstage_get_last_op_error`) and the resources
  * slot (`ovstage_get_path_dictionary`). Higher-level extension APIs live in
- * sibling headers such as `ovstage_instancing.h`.
+ * sibling headers such as `ovstage_instancing.h`, and the wrappers for the
+ * experimental device-placement extension in
+ * `experimental/ovstage_placement_extension.h`.
  */
 
 #ifndef OVSTAGE_API_UTILS_H
@@ -230,7 +232,7 @@ static inline ovstage_enqueue_result_t ovstage_write_attributes(
 }
 
 /* ───────────────────────────────────────────────────────────────────────────
- * Map / unmap zero-copy write
+ * Map / unmap writable staging buffers
  * ─────────────────────────────────────────────────────────────────────────── */
 
 static inline ovstage_enqueue_result_t ovstage_map_attribute(

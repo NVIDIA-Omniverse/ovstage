@@ -9,13 +9,13 @@
 
 /**
  * @file ovstage_types.h
- * @brief Backend-owned ovstage data-plane types.
+ * @brief ovstage-specific data-plane types.
  *
  * @details
- * This header contains the type surface that is specific to the ovstage backend.
+ * This header contains the type surface that is specific to ovstage.
  * The generic vtable runtime types remain in `ovstage_api/ovstage_api_types.h`.
  *
- * @version 0.2.1
+ * @version 0.3.0
  * @date 2026-06-17
  */
 
@@ -38,15 +38,56 @@ typedef struct {
     const char* name;  /**< Optional instance name for debugging. May be NULL. */
 } ovstage_instance_desc_t;
 
+/**
+ * @brief Build information embedded in an OVStage native library.
+ *
+ * String fields are borrowed UTF-8 views. Their lengths exclude the trailing
+ * NUL terminator, and their storage remains valid for the lifetime of the
+ * loaded library. Future versions may append fields; use @ref struct_size to
+ * determine which fields are present.
+ */
+typedef struct ovstage_build_info_t {
+    uint32_t     struct_size;    /**< Size of this struct in bytes. */
+    uint32_t     build_number;   /**< Numeric CI/local build number. */
+    ovx_string_t build_string;   /**< Full version, build number, and source revision. */
+    ovx_string_t git_branch;     /**< Source branch used for the build. */
+    ovx_string_t git_hash;       /**< Source revision used for the build. */
+    ovx_string_t build_location; /**< Build-system/location identifier. */
+} ovstage_build_info_t;
+
 /* ═══════════════════════════════════════════════════════════════════════════════
  * Process configuration (ovstage_initialize)
  *
  * The typed key/value shape mirrors ovrtx_config_t so keys can be added without
  * an ABI break and so the signature does not churn as keys land. The static
  * loader (ovstage-static) consumes package-location keys, while the ovstage
- * shared library consumes runtime-behavior keys. Pass NULL (or a struct with
- * entry_count 0) to select defaults.
+ * shared library consumes runtime-behavior keys. NULL (or entry_count 0) uses
+ * defaults on the first process reference and inherits active settings later.
  * ═══════════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * @brief Admission of mutations against retained value and prim-lifecycle history.
+ *
+ * The policy is process-scoped and captured by each new instance. All modes
+ * enforce the operation's write floors and retain successful change history;
+ * they do not enable historical payload storage or relax type/INSERT checks.
+ * History comparisons apply to affected cells and prim lifecycles; disjoint
+ * cells may share an ordinal.
+ *
+ * NONDECREASING remains the default. STRICTLY_INCREASING is experimental
+ * and represents the intended direction for a future default; FLOOR_ONLY
+ * is retained for backward compatibility.
+ */
+typedef enum {
+    /** No override: inherit active process state; a fresh lifetime uses NONDECREASING. */
+    OVSTAGE_ORDINAL_ADMISSION_DEFAULT = 0,
+    /** Check write floors without rejecting retained value or lifecycle conflicts. */
+    OVSTAGE_ORDINAL_ADMISSION_FLOOR_ONLY = 1,
+    /** Reject ordinals older than intersecting retained changes; equal ordinals are allowed (the default). */
+    OVSTAGE_ORDINAL_ADMISSION_NONDECREASING = 2,
+    /** Reject ordinals older than or equal to intersecting retained changes. */
+    OVSTAGE_ORDINAL_ADMISSION_STRICTLY_INCREASING = 3
+} ovstage_ordinal_admission_policy_t;
 
 /** @brief Key-type tag for ovstage_config_entry_t; selects the valid key/value union members. */
 typedef enum {
@@ -74,6 +115,12 @@ typedef enum {
      * whose value is RUNTIME_DEFAULT is ignored.
      */
     OVSTAGE_CONFIG_RUNTIME_DEFAULT_HIERARCHY_COMPUTATION_MODEL,
+    /**
+     * ovstage_ordinal_admission_policy_t for data-plane mutation admission.
+     * Defaults to NONDECREASING on a fresh process-state lifetime.
+     * DEFAULT means no override, including while another policy is active.
+     */
+    OVSTAGE_CONFIG_RUNTIME_DEFAULT_ORDINAL_ADMISSION_POLICY,
     OVSTAGE_CONFIG_UINT64_COUNT
 } ovstage_config_uint64_t;
 /** @brief Double config keys. Value type: double. (None defined yet.) */
@@ -115,7 +162,8 @@ typedef struct {
 /**
  * @brief Process configuration passed to ovstage_initialize().
  *
- * NULL, or a non-NULL struct with entry_count 0, selects defaults.
+ * NULL, or entry_count 0, uses defaults on the first process reference and
+ * inherits active settings on subsequent initializations.
  */
 typedef struct {
     const ovstage_config_entry_t* entries;
@@ -165,12 +213,13 @@ typedef uint64_t ovstage_hierarchy_result_id_t;
 /**
  * @brief Public hierarchy computation model identifiers.
  *
- * Hierarchy computation models update hierarchy-derived stage data, such as
- * world transforms, visibility, and derived bounds/state owned by the backing
- * runtime. The enum values are stable API inputs for ovstage_compute_hierarchy.
+ * Hierarchy computation models update hierarchy-derived world transforms owned
+ * by the backing runtime. An explicit ovstage_compute_hierarchy call does not
+ * update derived visibility. The enum values are stable API inputs for
+ * ovstage_compute_hierarchy.
  *
- * Not every backend, platform, or build necessarily supports every concrete
- * model below. Call ovstage_get_hierarchy_computation_models to discover the
+ * Not every implementation, platform, or build supports every concrete model
+ * below. Call ovstage_get_hierarchy_computation_models to discover the
  * concrete models and selectors advertised by the current ovstage instance,
  * along with their display names and descriptions.
  *
@@ -212,12 +261,34 @@ typedef enum {
 
 #define OVSTAGE_INVALID_HIERARCHY_COMPUTATION_MODEL_ID OVSTAGE_HIERARCHY_COMPUTATION_MODEL_INVALID
 
-/** @brief Backend hierarchy relation to inspect for each input prim. */
+/** @brief Hierarchy relation to inspect for each input prim. */
 typedef enum {
     OVSTAGE_HIERARCHY_PARENT   = 0,  /**< Parent prim path; result count is 0 or 1. */
     OVSTAGE_HIERARCHY_CHILDREN = 1,  /**< Direct child prim paths. */
     OVSTAGE_HIERARCHY_SIBLINGS = 2,  /**< Other prims with the same direct parent. */
 } ovstage_hierarchy_relation_t;
+
+/**
+ * @brief Completion report of a finished ovstage_clone operation.
+ *
+ * Plain values copied out by ovstage_fetch_clone_result; nothing to release.
+ * `prims_cloned` sums the sizes of the targets' scene hierarchy subtrees after
+ * cloning, including each target root. It counts prims created or merged into and
+ * any prims already attached beneath them. A prim whose path lies beneath a target
+ * but remains detached from its scene hierarchy is not counted. For disjoint
+ * targets that merge into no existing prims, it equals
+ * `source_prim_count * target_count`. A zero-target clone reports
+ * `{ordinal, 0, source_prim_count, 0}`.
+ *
+ * @remark Target paths are expected to be disjoint and outside the source
+ *         subtree; a target nested under another target is counted as enumerated.
+ */
+typedef struct {
+    ovstage_ordinal_t ordinal;           /**< Ordinal the clone was recorded at. */
+    size_t            target_count;      /**< `num_target_paths` as submitted. */
+    size_t            source_prim_count; /**< Prims in the source subtree, root inclusive. */
+    size_t            prims_cloned;      /**< Prims in all target scene hierarchy subtrees after cloning. */
+} ovstage_clone_result_t;
 
 /**
  * @brief Per-input hierarchy result metadata.
@@ -239,8 +310,9 @@ typedef struct {
  * `items` has one entry for each input path in the submitted
  * `ovx_primpath_list_t`, in the same order. `paths` is a flattened array of
  * ovstage-owned string-or-token views referenced by item offsets/counts.
- * `ordinal` is the requested stage ordinal from ovstage_get_hierarchy. Both
- * arrays remain valid until ovstage_release_hierarchy_result.
+ * `ordinal` echoes the caller-supplied value from ovstage_get_hierarchy; it tags
+ * the result but does not identify a selected historical hierarchy snapshot.
+ * Both arrays remain valid until ovstage_release_hierarchy_result.
  */
 typedef struct {
     ovstage_hierarchy_result_id_t hierarchy_result_id;

@@ -12,6 +12,7 @@ import sys
 
 import numpy as np
 import pytest
+from ovstage._src import bindings
 
 from ovstage import (
     DLDataType,
@@ -21,6 +22,7 @@ from ovstage import (
     DLTensor,
     ManagedDLTensor,
     dltensor_to_numpy,
+    get_build_info,
     library_version,
     make_dltensor,
     numpy_to_dldatatype,
@@ -67,6 +69,75 @@ def test_library_version(ovstage_mod):
     assert isinstance(version, tuple)
     assert len(version) == 3
     assert all(isinstance(part, int) and part >= 0 for part in version)
+    build_info = get_build_info()
+    assert build_info.build_string.partition("+")[0] == ".".join(map(str, version))
+    assert build_info.build_number >= 0
+    assert build_info.git_hash
+
+
+def test_library_version_mismatch_is_not_cached(monkeypatch):
+    loader = bindings._LibraryLoader()
+    build_info = bindings.BuildInfo(
+        struct_size=ctypes.sizeof(bindings._ovstage_build_info_t),
+        build_number=123,
+        build_string="0.3.0+test.123.deadbeef.local",
+        git_branch="test",
+        git_hash="deadbeef",
+        build_location="local",
+    )
+    monkeypatch.setattr(loader, "open_loader", lambda: object())
+    monkeypatch.setattr(bindings, "_probe_version", lambda _lib: (9, 9, 9))
+    loader._build_info = build_info
+
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="build information mismatch"):
+            loader.load()
+        assert loader.version is None
+
+
+def test_invalid_build_info_is_not_cached(monkeypatch):
+    loader = bindings._LibraryLoader()
+    lib = type("_LibraryWithBuildInfo", (), {"ovstage_get_build_info": object()})()
+    build_info = bindings.BuildInfo(
+        struct_size=ctypes.sizeof(bindings._ovstage_build_info_t),
+        build_number=123,
+        build_string="0.3.0+test.123.deadbeef.local",
+        git_branch="test",
+        git_hash="deadbeef",
+        build_location="local",
+    )
+    attempts = iter((RuntimeError("invalid build information"), build_info))
+    monkeypatch.setattr(loader, "_open", lambda: lib)
+    monkeypatch.setattr(bindings, "_configure_prototypes", lambda _lib: None)
+
+    def read_build_info(_lib):
+        result = next(attempts)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    monkeypatch.setattr(bindings, "_read_build_info", read_build_info)
+
+    with pytest.raises(RuntimeError, match="invalid build information"):
+        loader.open_loader()
+    assert loader._lib is None
+    assert loader._build_info is None
+
+    assert loader.open_loader() is lib
+    assert loader.get_build_info() == build_info
+
+
+def test_older_library_without_build_info_remains_loadable(monkeypatch):
+    loader = bindings._LibraryLoader()
+    lib = object()
+    monkeypatch.setattr(loader, "_open", lambda: lib)
+    monkeypatch.setattr(bindings, "_configure_prototypes", lambda _lib: None)
+    monkeypatch.setattr(bindings, "_probe_version", lambda _lib: (0, 3, 0))
+
+    assert loader.load() is lib
+    assert loader.version == (0, 3, 0)
+    with pytest.raises(RuntimeError, match="does not export ovstage_get_build_info"):
+        loader.get_build_info()
 
 
 def test_dlpack_scalar_round_trip(ovstage_mod):
@@ -200,9 +271,7 @@ def test_dlpack_cleanup_survives_failing_deleter_callback(ovstage_mod):
     sys.unraisablehook = lambda _unraisable: None
     try:
         for _ in range(5):
-            tensor = ManagedDLTensor(
-                make_dltensor(backing), manager_ctx=backing, deleter_callback=boom
-            )
+            tensor = ManagedDLTensor(make_dltensor(backing), manager_ctx=backing, deleter_callback=boom)
             capsule = tensor.__dlpack__(max_version=(1, 0))
             del capsule
             del tensor
@@ -260,9 +329,7 @@ def test_dlpack_capsule_cleanup_survives_pending_exception(ovstage_mod):
     previous_hook = sys.unraisablehook
     sys.unraisablehook = lambda _unraisable: None
     try:
-        managed = ManagedDLTensor(
-            make_dltensor(np.zeros(4, np.float32)), manager_ctx=owner, readonly=True
-        )
+        managed = ManagedDLTensor(make_dltensor(np.zeros(4, np.float32)), manager_ctx=owner, readonly=True)
         with pytest.raises((TypeError, SystemError)):
             "".join([managed.__dlpack__(max_version=(1, 0))])
         del managed

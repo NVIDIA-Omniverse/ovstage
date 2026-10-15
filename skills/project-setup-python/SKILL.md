@@ -135,7 +135,8 @@ export LD_LIBRARY_PATH=/path/to/ovstage/build/output:$LD_LIBRARY_PATH
 
 `Stage` + `PathDictionary` (both context managers), then intern a token, build a path list,
 open a query, and write → advance write floor → read. Async ops return an `Operation`; call
-`.wait()`. The verified example composes the full flow:
+`.wait()` — it returns the object it was called on, so `read.wait().fetch_next()` chains. The
+verified example composes the full flow:
 
 > **Source:** `examples/python/minimal/main.py` snippet `setup`
 >
@@ -166,6 +167,9 @@ for `PathDictionary`, and `string-handling` (Python) for `str` vs. interned-toke
   numeric `code`; see the `error-handling` skill.
 - **Forgot to `.wait()`:** async ops (`write_attribute`, `advance_write_floor`,
   `read_attributes`) return handle objects; effects/errors are observed on `.wait()`.
+- **`ResourceWarning` from a chained `.wait()`:** chaining on an unbound temporary
+  (`stage.read_attributes(...).wait().fetch_next()`) drops the handle unreleased — bind it in
+  a `with` block first, then chain (`group = read.wait().fetch_next()`).
 
 ## References
 
