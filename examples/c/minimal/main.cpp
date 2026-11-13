@@ -26,10 +26,8 @@
 #include <string_view>
 
 // [snippet:check-sync-error]
-// Check a synchronous ovstage call: compare against OVSTAGE_OK and stringify
-// failures with ovstage_get_error_string (vtable-dispatched, so it takes the
-// instance). The examples fail fast -- print and exit; a real application
-// would propagate the error instead.
+/// Check a synchronous status from stage, using what to identify the failed call.
+/// Return on OVSTAGE_OK; otherwise print the status and available error text and exit the example.
 static void check(ovstage_instance_t* stage, ovstage_api_status_t status, const char* what)
 {
     if (status == OVSTAGE_OK)
@@ -53,9 +51,8 @@ static void checkOvx(path_dictionary_instance_t* dict, ovx_api_result_t result, 
 }
 
 // [snippet:enqueue-wait-error]
-// Wait for the operation and its dependencies, then inspect any errors.
-// Read messages before another wait and release tracking after completion.
-// This example exits on error; applications can propagate the error instead.
+/// Check submission of enq to stage, wait for the operation and its dependencies, and report errors using what as the call label.
+/// On success, release operation tracking before returning. This example prints failures and exits; applications can propagate errors instead.
 static void waitOp(ovstage_instance_t* stage, ovstage_enqueue_result_t enq, const char* what)
 {
     check(stage, enq.status, what);
@@ -65,7 +62,7 @@ static void waitOp(ovstage_instance_t* stage, ovstage_enqueue_result_t enq, cons
     {
         const ovx_string_t e = ovstage_get_last_op_error(stage, wait.error_op_ids[i]);
         std::fprintf(stderr, "ovstage %s op %llu failed: %.*s\n", what,
-                     (unsigned long long)wait.error_op_ids[i], (int)e.length, e.ptr ? e.ptr : "");
+                     (unsigned long long)wait.error_op_ids[i].raw_id, (int)e.length, e.ptr ? e.ptr : "");
     }
     if (wait.error_op_id_count != 0)
         std::exit(EXIT_FAILURE);
@@ -107,7 +104,7 @@ int main()
     // ovx_string_t is a non-owning (ptr, length) view; wrap it in string_view
     // for zero-copy use. Copy it if it must outlive the dictionary.
     std::string_view name{ resolved.ptr, resolved.length };
-    std::printf("attribute token %llu = '%.*s'\n", (unsigned long long)attr, (int)name.size(), name.data());
+    std::printf("attribute token %llu = '%.*s'\n", (unsigned long long)attr.raw_id, (int)name.size(), name.data());
     // [/snippet:string-view-from-ovx-string]
 
     // ---- 2. path list + query over three prims ----
@@ -125,9 +122,9 @@ int main()
     // [/snippet:path-list-query]
 
     // [snippet:string-or-token-arg]
-    // Attributes pass as ovx_string_or_token_t. We already hold an interned
-    // token, so set it (token != 0) and leave the string empty to skip a lookup.
-    ovx_string_or_token_t attrArg{ attr, {} };
+    // Attributes pass as ovx_token_or_string_t. We already hold an interned
+    // token, so use its ID and leave string.ptr null to skip a string lookup.
+    ovx_token_or_string_t attrArg{ attr, {} };
     // [/snippet:string-or-token-arg]
 
     // ---- 3. write one float per prim, seal ordinal 1, read it back ----
@@ -170,7 +167,7 @@ int main()
 
     // Read the values at ordinal 1 (a snapshot: no start ordinal). A later change
     // to this attribute would make this read fail with OUT_OF_RANGE; use
-    // UINT64_MAX as the end to read current values.
+    // OVSTAGE_ORDINAL_MAX as the end to read current values.
     ovstage_ordinal_range_t range{};
     range.end_ordinal = 1;
     range.has_start_ordinal = false;
@@ -180,19 +177,21 @@ int main()
 
     // Fetch the result data after the read completes. This uniform example
     // returns one group; general readers fetch until END_OF_ITERATION.
+    size_t fetchedGroupCount = 0;
     ovstage_read_group_t group{};
-    status = ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group);
+    status = ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group, 1, &fetchedGroupCount);
     check(stage, status, "fetch_read_next");
-    if (group.data.tensor_count != 1 || !group.data.tensors[0].data)
+    if (group.column_count != 1 || group.columns[0].data.tensor_count != 1 || !group.columns[0].data.tensors[0].data)
     {
         std::fprintf(stderr, "unexpected read layout\n");
         return EXIT_FAILURE;
     }
     // Borrow the returned floats while the group is alive. Releasing the group
     // invalidates this pointer; copy the values first if they must live longer.
-    const float* out = static_cast<const float*>(group.data.tensors[0].data);
-    std::printf("read back ordinal %llu: %.1f %.1f %.1f\n", (unsigned long long)group.ordinal, out[0], out[1], out[2]);
-    ovstage_release_group(stage, &group); // the tensor data is only valid until the group is released
+    const ovstage_read_column_t& column = group.columns[0];
+    const float* out = static_cast<const float*>(column.data.tensors[0].data);
+    std::printf("read back ordinal %lld: %.1f %.1f %.1f\n", (long long)column.ordinal, out[0], out[1], out[2]);
+    ovstage_release_groups(stage, &group, 1); // the tensor data is only valid until the group is released
     // [/snippet:minimal-write-read]
 
     // ---- 4. clone the subtree under one prim to two new targets ----

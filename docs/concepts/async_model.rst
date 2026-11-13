@@ -9,7 +9,7 @@
 .. its affiliates is strictly prohibited.
 
 Asynchronous Operations
-===============================
+=======================
 
 Asynchronous calls return without waiting for their work to complete. Check whether the call was
 accepted, then wait when you need its result. Work can finish before you call the
@@ -25,6 +25,8 @@ chain. Keep the handle in a ``with`` block while using it. A completed operation
 cannot be waited again. Submission or execution failures raise
 :class:`ovstage.OvstageError`. Use :meth:`ovstage.Stage.wait_op()` when
 you need to inspect completion without releasing the :term:`operation ID <Operation ID>`.
+
+Some submission calls block the caller before returning. ``write_attribute``, ``write_attributes``, ``delete_attributes``, and ``map_attribute`` wait until the query they use is ready. ``release_query`` and ``release_read`` are synchronous. See :doc:`/concepts/threading_lifetime` for details.
 
 A mutation's ``Operation.ok`` reports only enqueue acceptance, even if execution
 later fails. Retain it and call ``wait()``. Use query/read/map context managers
@@ -85,8 +87,19 @@ placement availability event, operation completion can precede device completion
 keep sources and result groups alive through their device work. See
 :ref:`ovstage-placement-synchronization`.
 
+Before advancing the watermark, check every required write and :ref:`repair any partial failure <ovstage-write-recovery>`. A successful advance does not report earlier write failures. See :doc:`overview` for the complete update sequence.
+
 Running producers ahead does not preserve earlier values for later reads.
 See :doc:`overview` for the historical-read limitations.
+
+Using ovstage with a Renderer
+-----------------------------
+
+An attached ovrtx renderer consumes completed ovstage updates. Finish the mutations for a render step, advance the write floor to cover them, and wait for that advance before rendering. After loading USD or applying structural USD changes, complete ``ovrtx_update_from_stage()`` before ``ovrtx_step_with_stage()``. See :doc:`/scene/population` for the population sequence.
+
+If a render operation fails because the stage has unsealed changes, finish the pending mutations, advance the write floor, wait for completion, and retry. Check completion through ``ovrtx_wait_op()``; accepting a render submission does not mean that rendering succeeded.
+
+Do not depend on overlapping rendering and stage mutations to make progress in a particular order. Complete each operation needed by the next step, and use finite wait timeouts where the calling thread must stay responsive.
 
 Reads During Rendering
 ----------------------
@@ -117,6 +130,8 @@ complete and release them through that handle. Before releasing the final
 handle, release all operations, query/read/map handles, and read results.
 For normal application cleanup, finish and release your work before destroying
 your :class:`ovstage.Stage`.
+
+Destroying the application's stage handle does not detach an already attached ovrtx renderer. Use the renderer's public detach or destruction API when you are finished with that attachment. The destroyed application handle remains invalid; do not use it to submit or wait for more work.
 
 Timeouts and Polling
 ----------------------------
@@ -157,3 +172,39 @@ operation tracking with :c:func:`ovstage_release_op()`.
 
 See :doc:`application_flow` for the write-and-wait sequence in Python and C, and
 :doc:`error_handling` for the error-checking helpers.
+
+.. _ordinal-bounds-and-initial-state:
+
+Ordinal bounds and initial state
+--------------------------------
+
+Ordinals are signed 64-bit integers. Use ``OVSTAGE_ORDINAL_MIN`` and
+``OVSTAGE_ORDINAL_MAX`` in C, or ``ovstage.ORDINAL_MIN`` and
+``ovstage.ORDINAL_MAX`` in Python, for the bounds (``INT64_MIN`` and
+``INT64_MAX``). Prefer these named bounds over integer literals or the
+underlying integer-type limits in application code.
+
+A new stage is empty and sealed through ``OVSTAGE_ORDINAL_MIN``, inclusively.
+Its global floor query returns ``OVSTAGE_ORDINAL_MIN``, and an empty snapshot
+at that ordinal succeeds. Writes at the minimum are rejected; the writable
+range is ``OVSTAGE_ORDINAL_MIN + 1`` through ``OVSTAGE_ORDINAL_MAX``.
+
+Negative ordinals and zero follow the same admission and sealing rules as
+positive ordinals. For example, a new stage can populate or write at zero,
+then seal through zero and read that data. The global floor query returns
+zero after that advance, and subsequent writes at or below zero fail.
+
+For current-value reads, use the maximum:
+
+.. code-block:: c
+
+   ovstage_ordinal_range_t current = {0};
+   current.end_ordinal = OVSTAGE_ORDINAL_MAX;
+
+.. code-block:: python
+
+   import ovstage
+
+   current = ovstage.OrdinalRange.latest(ovstage.ORDINAL_MAX)
+
+The maximum requests current values; selected changes must still be sealed.

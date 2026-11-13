@@ -64,6 +64,25 @@ def Xform "World"
 """
 
 
+def test_resolve_logical_paths(stage):
+    population.open_usd_from_string(stage, INSTANCING_USDA, ordinal=1, domains=PopulationDomain.RENDERING)
+    # [snippet:instancing-resolve-paths]
+    prototype = instancing.get_prototype_root(stage, "/World/InstanceA")
+    results = instancing.resolve_paths(stage, [
+        "/World/InstanceA/Box", "/World/Source/Box", "/World/InstanceA/Missing",
+        "/World/InstanceA", "/World/InstanceA/Box",
+    ])
+    assert results[0] == instancing.PathResolution(
+        instancing.PathKind.INSTANCE, "/World/InstanceA", prototype, prototype + "/Box")
+    assert results[1] == instancing.PathResolution(
+        instancing.PathKind.NON_INSTANCE, None, None, "/World/Source/Box")
+    assert results[2] == instancing.PathResolution(instancing.PathKind.NOT_FOUND, None, None, None)
+    assert results[3].backing_path == prototype
+    assert results[4] == results[0]
+    assert instancing.resolve_paths(stage, []) == []
+    # [/snippet:instancing-resolve-paths]
+
+
 def test_instancing_query_round_trip(stage):
     if not instancing.available():
         pytest.skip("libovstage was built without the instancing query API")
@@ -81,3 +100,25 @@ def test_instancing_query_round_trip(stage):
         "/World/InstanceA",
         "/World/InstanceB",
     ]
+
+
+def test_instancing_batch_query_round_trip(stage):
+    if not instancing.available():
+        pytest.skip("libovstage was built without the instancing query API")
+    if not population.available():
+        pytest.skip("libovstage was built without the population bridge")
+
+    population.open_usd_from_string(stage, INSTANCING_USDA, ordinal=1, domains=PopulationDomain.RENDERING)
+    stage.advance_write_floor(1).wait()
+    roots = instancing.get_prototype_roots(stage)
+    assert len(roots) == 1
+    requested = [roots[0], "/World/Unrelated", roots[0]]
+    result = instancing.get_instance_roots_batch(stage, requested)
+    assert result == [
+        ["/World/InstanceA", "/World/InstanceB"],
+        [],
+        ["/World/InstanceA", "/World/InstanceB"],
+    ]
+    assert result == [instancing.get_instance_roots(stage, root) for root in requested]
+    assert result[0] is not result[2]
+    assert instancing.get_instance_roots_batch(stage, []) == []

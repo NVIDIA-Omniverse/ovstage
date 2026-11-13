@@ -36,7 +36,7 @@ def export_runtime_data(directory: Path):
                                       tensors=np.array([2.5], dtype=np.float64), is_array=False).wait()
                 # Record the USD type so DEF exports can create a Sphere.
                 stage.write_attribute(query, "usd-prim-type", ordinal=1,
-                                      tensors=np.array([paths.intern_token("Sphere")], dtype=np.uint64),
+                                      tensors=np.array([paths.intern_token("Sphere").raw_id], dtype=np.uint64),
                                       is_array=False).wait()
         stage.advance_write_floor(ordinal=1).wait()
         # [/snippet:export-write-runtime]
@@ -225,12 +225,19 @@ def Xform "World"
         destination = Path(temp_dir, "destination.usda")
 
         with Stage("example.usd-export.source") as stage:
-            population.open_usd_from_string(
+            # RENDERING, and the physics properties of the prims that apply a physics API.
+            physics = population.Selector(
+                prim_predicate=population.PrimPredicate.has_applied_schema(
+                    "PhysicsCollisionAPI", "PhysicsRigidBodyAPI"
+                ),
+                property_predicate=population.PropertyPredicate.in_namespace("physics"),
+            )
+            population.open_usd_from_string_with_desc(
                 stage,
                 source,
-                ordinal=1,
-                time=math.nan,
-                domains=PopulationDomain.ALL,
+                1,
+                math.nan,
+                population.Desc(domains=PopulationDomain.RENDERING, selectors=[physics]),
             )
             stage.advance_write_floor(ordinal=1).wait()
 

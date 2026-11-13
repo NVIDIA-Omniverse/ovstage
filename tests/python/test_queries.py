@@ -14,7 +14,7 @@ from ovstage import ErrorCode, Filter, FilterOp, PathDictionary, PopulationDomai
 
 # A small scene mirroring examples/python/queries/queries.usda: two meshes under
 # a Group (Right carries an applied ShadowAPI schema), a Cube, and a prototype
-# referenced by two instanceable references (which land as XformInstance prims).
+# referenced by two instanceable references (which land as instance roots).
 QUERY_USDA = """#usda 1.0
 (
     defaultPrim = "World"
@@ -106,7 +106,7 @@ def _populate_query_scene(stage, paths):
     """Populate QUERY_USDA and write example:count to two prims. Returns the
     (usd-prim-type, example:count) tokens the filter/introspection cases use."""
     population.open_usd_from_string(
-        stage, QUERY_USDA, ordinal=1, time=population.DEFAULT_TIME, domains=PopulationDomain.ALL
+        stage, QUERY_USDA, ordinal=1, time=population.DEFAULT_TIME, domains=PopulationDomain.RENDERING
     )
     stage.advance_write_floor(ordinal=1).wait()
 
@@ -178,7 +178,7 @@ def test_query_predicate_matrix(stage):
         _, count_tok = _populate_query_scene(stage, paths)
 
         # [snippet:query-predicate-matrix]
-        # The support matrix is narrow: HAS works on any attribute; the value
+        # The support matrix is narrow: HAS and NOT_HAS work on any attribute; the value
         # operators pair only with the reserved metadata built-ins. Predicates in
         # one Filter AND together; values are always strings. Queries resolve
         # against the latest committed state, so no path list goes in.
@@ -197,6 +197,12 @@ def test_query_predicate_matrix(stage):
         assert matched("usd-schemas", FilterOp.CONTAINS, "ShadowAPI") == 1  # Right
         # HAS takes the interned token for a user attribute (no value test).
         assert matched(count_tok, FilterOp.HAS) == 2  # Anchor, Group/Left
+        # NOT_HAS leaves out every prim that has the attribute.
+        meshes_without_count = Filter([
+            Predicate("usd-prim-type", FilterOp.IN, ["Mesh"]),
+            Predicate(count_tok, FilterOp.NOT_HAS),
+        ])
+        assert _prim_count(stage, meshes_without_count) == 1  # Group/Right
         # [/snippet:query-predicate-matrix]
 
         # usd-active appears in the header contract but is not supported (a

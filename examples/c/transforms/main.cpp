@@ -82,8 +82,7 @@ int main(int argc, char** argv)
         supported = supported || models[i].model_id == model;
     if (!supported)
     {
-        std::fprintf(stderr, "CPU incremental hierarchy computation is unavailable\n");
-        std::exit(EXIT_FAILURE);
+        fail("CPU incremental hierarchy computation is unavailable");
     }
     ovstage_write_floor_desc_t watermark{};
     watermark.ordinal = 2;
@@ -116,22 +115,26 @@ int main(int argc, char** argv)
     bool found = false;
     for (;;)
     {
+        size_t fetchedGroupCount = 0;
         ovstage_read_group_t group{};
-        const auto status = ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group);
+        const auto status = ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group, 1, &fetchedGroupCount);
         if (status == OVSTAGE_ERROR_END_OF_ITERATION)
             break;
         check(stage, status, "fetch group");
-        const DLTensor& tensor = group.data.tensors[0];
+        if (group.column_count != 1)
+            fail("single-attribute read returned multiple columns");
+        const ovstage_read_column_t& column = group.columns[0];
+        const DLTensor& tensor = column.data.tensors[0];
         const auto* values = reinterpret_cast<const double*>(
             static_cast<const uint8_t*>(tensor.data) + tensor.byte_offset);
         for (uint32_t i = 0; i < group.prims.count; ++i)
         {
-            const uint32_t row = group.data.index_map ? group.data.index_map[i] : i;
+            const uint32_t row = column.data.index_map ? column.data.index_map[i] : i;
             std::printf("Wheel world x: %.1f\n", values[row * 16 + 12]);
             // Wheel world x: 4.0
             found = true;
         }
-        check(stage, ovstage_release_group(stage, &group), "release group");
+        check(stage, ovstage_release_groups(stage, &group, 1), "release group");
     }
     waitOp(stage, ovstage_release_read(stage, read), "release read");
     if (!found)

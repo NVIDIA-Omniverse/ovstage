@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.10,<3.14"
 dependencies = [
     "numpy==2.2.6",
-    "ovstage==0.3.0.1791986420",
+    "ovstage==0.4.0.1794520352",
     "usd-core==26.5",
 ]
 

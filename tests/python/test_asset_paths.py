@@ -11,8 +11,10 @@
 import numpy as np
 import pytest
 
+from ovstage import Token
 from ovstage import (AttributeSemantic, DLDataTypeCode, ErrorCode, OrdinalRange, OvstageError,
-                     PathDictionary, PopulationDomain, population)
+                     PathDictionary, PopulationDomain, population,
+)
 
 # The path does not resolve, so the resolved half must come back as token id 0.
 ASSET_USDA = """#usda 1.0
@@ -31,19 +33,20 @@ def Xform "World"
 
 def _pairs(rows) -> np.ndarray:
     """One 16-byte (authored, resolved) element per prim."""
-    return np.array(rows, dtype=np.uint64).reshape(len(rows), 2)
+    return np.array([[token.raw_id for token in row] for row in rows], dtype=np.uint64).reshape(len(rows), 2)
 
 
 def _check_asset_group(group):
     """An asset column is a fixed 16-byte id pair, not a ragged byte row."""
-    assert not group.is_array
-    assert group.semantic == AttributeSemantic.ASSET_PATH_ID
-    for row in range(group.tensor_count):
-        dtype = group.tensor(row).dtype
+    column = group.columns[0]
+    assert not column.is_array
+    assert column.semantic == AttributeSemantic.ASSET_PATH_ID
+    for row in range(column.tensor_count):
+        dtype = column.tensor(row).dtype
         assert dtype.code == DLDataTypeCode.kDLUInt
         assert dtype.bits == 64
         assert dtype.lanes == 1
-        assert group.tensor(row).shape_tuple[-1] == 2
+        assert column.tensor(row).shape_tuple[-1] == 2
 
 
 def _pairs_by_path(group, paths):
@@ -51,12 +54,13 @@ def _pairs_by_path(group, paths):
 
     Group indices address the group's path list, not the caller's path list.
     """
+    column = group.columns[0]
     list_paths = paths.get_path_strings(group.prim_list)
-    values = np.asarray(group.array(0)).reshape(-1, 2)
+    values = np.asarray(column.array(0)).reshape(-1, 2)
     out = {}
     for local in range(group.prim_count):
-        pair = values[group.data_row_index(local)]
-        out[list_paths[group.prim_index(local)]] = (int(pair[0]), int(pair[1]))
+        pair = values[column.data_row_index(local)]
+        out[list_paths[group.prim_index(local)]] = (Token(pair[0]), Token(pair[1]))
     return out
 
 
@@ -73,13 +77,14 @@ def test_native_asset_pairs_round_trip(stage):
         try:
             expected = {
                 "/World/A": (paths.intern_token("a.usd"), paths.intern_token("/abs/a.usd")),
-                "/World/B": (paths.intern_token("deliberately_longer_b.usd"), 0),
+                "/World/B": (paths.intern_token("deliberately_longer_b.usd"), Token(0)),
                 "/World/C": (paths.intern_token("c.usd"), paths.intern_token("/abs/c.usd")),
             }
             rows = [expected["/World/A"], expected["/World/B"], expected["/World/C"]]
             stage.write_attribute(query, "test:asset", ordinal=1, is_array=False,
                                   tensors=_pairs(rows),
-                                  semantic=AttributeSemantic.ASSET_PATH_ID).wait()
+                                  semantic=AttributeSemantic.ASSET_PATH_ID,
+            ).wait()
             stage.advance_write_floor(ordinal=1).wait()
 
             attr = paths.intern_token("test:asset")
@@ -92,7 +97,7 @@ def test_native_asset_pairs_round_trip(stage):
             read.release().wait()
 
             # A token id of 0 means no path; resolving it yields "".
-            assert paths.token_to_string(0) == ""
+            assert paths.token_to_string(Token(0)) == ""
         finally:
             stage.release_query(query).wait()
             paths.destroy_path_list(plist)
@@ -110,7 +115,8 @@ def test_asset_write_rejects_byte_rows(stage):
             with pytest.raises(OvstageError) as exc:
                 stage.write_attribute(query, "test:asset", ordinal=1, is_array=True,
                                       tensors=np.frombuffer(b"a.usd", dtype=np.uint8),
-                                      semantic=AttributeSemantic.ASSET_PATH_ID).wait()
+                                      semantic=AttributeSemantic.ASSET_PATH_ID,
+                ).wait()
             assert exc.value.code == ErrorCode.INVALID_ARGUMENT
             assert "ASSET_PATH_ID" in str(exc.value)
         finally:
@@ -133,16 +139,18 @@ def test_populated_scalar_asset_round_trip(stage):
             _check_asset_group(group)
             assert group.prim_count == 1
             authored, resolved = _pairs_by_path(group, paths)["/World"]
-            assert paths.token_to_string(authored) == "nonexistent-python-asset.usd"
-            assert resolved == 0
+            assert paths.token_to_string(Token(authored)) == "nonexistent-python-asset.usd"
+            assert resolved == Token(0)
             stage.release_group(group)
             read.release().wait()
 
             updated = (paths.intern_token("updated_python_asset.usd"),
-                       paths.intern_token("/abs/updated_python_asset.usd"))
+                       paths.intern_token("/abs/updated_python_asset.usd"),
+            )
             stage.write_attribute(query, "test:asset", ordinal=2, is_array=False,
                                   tensors=_pairs([updated]),
-                                  semantic=AttributeSemantic.ASSET_PATH_ID).wait()
+                                  semantic=AttributeSemantic.ASSET_PATH_ID,
+            ).wait()
             stage.advance_write_floor(ordinal=2).wait()
 
             read, group = _read_one_group(stage, query, attr, 2)

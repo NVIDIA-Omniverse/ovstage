@@ -58,6 +58,9 @@ class _TestHooksExtensionV1(ctypes.Structure):
 @lru_cache(maxsize=1)
 def _hooks() -> _TestHooksExtensionV1:
     lib = _b.load()
+    # ovstage_destroy_instance is a member of the lifecycle family vtable of the
+    # probe instance. The facade serves it by name.
+    api = _b.instance_api(lib)
     desc = _b.ovstage_instance_desc_t()
     desc.name = b"ovstage-python-test-hooks-extension-probe"
     inst = _b.ovstage_instance_p()
@@ -65,11 +68,11 @@ def _hooks() -> _TestHooksExtensionV1:
     if code != _b.OVSTAGE_OK:
         raise RuntimeError(f"ovstage_create_instance failed while probing test hooks (code {int(code)})")
     try:
-        if not inst or not inst.contents.vtable:
+        if not inst or not inst.contents.data_plane.vtable:
             raise RuntimeError("ovstage_create_instance returned an invalid instance while probing test hooks")
         extension = ctypes.c_void_p()
-        code = inst.contents.vtable.contents.query_extension(
-            inst.contents.context, _EXTENSION_NAME, ctypes.byref(extension)
+        code = inst.contents.data_plane.vtable.contents.query_extension(
+            inst.contents.data_plane.context, _EXTENSION_NAME, ctypes.byref(extension)
         )
         if code != _b.OVSTAGE_OK or not extension.value:
             raise RuntimeError("ovstage.test.hooks is not exposed by the loaded libovstage")
@@ -80,7 +83,8 @@ def _hooks() -> _TestHooksExtensionV1:
             raise RuntimeError(f"ovstage.test.hooks has unsupported version {hooks.header.version}")
         return hooks
     finally:
-        lib.ovstage_destroy_instance(inst)
+        if inst:
+            api.ovstage_destroy_instance(inst)
 
 
 def available() -> bool:

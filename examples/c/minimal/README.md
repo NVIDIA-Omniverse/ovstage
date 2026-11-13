@@ -65,17 +65,16 @@ aggregates them).
 
 ## Snippets
 
-The `[snippet:name]` markers in `main.cpp` fence regions referenced by the
-ovstage skills under `../../../skills/`; keep them intact when editing.
+The `[snippet:name]` markers in [main.cpp](main.cpp) identify the source regions described below and referenced by the [ovstage skills](../../../skills/). Keep the markers intact when editing.
 
-- `check-sync-error` — fail-fast check of a synchronous `ovstage_api_status_t`
-- `enqueue-wait-error` — drive an async enqueue to completion, report per-op errors, release the op
-- `intern-and-resolve` — path-dictionary intern + resolve back to a string
-- `string-view-from-ovx-string` — wrap `ovx_string_t` in `std::string_view`
-- `path-list-query` — build a prim-path list and open a query
-- `string-or-token-arg` — pass an attribute as `ovx_string_or_token_t` (token form)
-- `minimal-write-read` — write → advance write floor → read back
-- `clone-subtree-multienv` — clone one prim's subtree to several targets in one call
+- `check-sync-error` — `check()` accepts a synchronous status and a label identifying the call. It returns on `OVSTAGE_OK`; otherwise it prints the label, status code, and available error text, then exits the example.
+- `enqueue-wait-error` — `waitOp()` checks submission status, calls `ovstage_wait_op()`, and reports errors from the completed operations. On success it releases operation tracking with `ovstage_release_op()`; the example exits on failure.
+- `intern-and-resolve` — Gets the stage's path dictionary, interns `temperature` with `path_dictionary_create_tokens_from_strings()`, and resolves it with `path_dictionary_get_strings_from_tokens()`. The resulting token identifies the attribute; the resolved string contains its original name.
+- `string-view-from-ovx-string` — Constructs a `std::string_view` from the resolved string's pointer and length, then prints `temperature`. The view does not extend the string's validity; copy the text if it must outlive the dictionary.
+- `path-list-query` — Creates a path list for `/World/A`, `/World/B`, and `/World/C`, then calls `ovstage_query_from_path_list()` to select them. The surrounding program releases the query and path list after completing its reads and writes.
+- `string-or-token-arg` — Builds an `ovx_token_or_string_t` from the interned temperature token, leaving the string field empty. Later attribute calls use this argument to identify the same column.
+- `minimal-write-read` — Calls `ovstage_write_attribute()` with three float values at ordinal 1, waits, and advances the write floor. It then reads the column with `ovstage_read_attributes()`, prints the fetched values, and releases the read group before the surrounding cleanup releases the read handle.
+- `clone-subtree-multienv` — Calls `ovstage_clone()` to copy `/World/A` and its subtree to `/World/A_env0` and `/World/A_env1` at ordinal 2. It waits for completion and advances the write floor before printing the target names.
 
 ## Notes
 

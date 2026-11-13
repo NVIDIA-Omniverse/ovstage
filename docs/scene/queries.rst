@@ -217,6 +217,32 @@ the attribute's type, length, or value. An empty array still counts as present:
          :end-before: // [/snippet:query-required-attributes-c]
          :dedent:
 
+Leaving Out Prims That Have an Attribute
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Use ``NOT_HAS`` to leave out every prim that has an attribute. It combines with
+the other predicates like any predicate; with several ``NOT_HAS`` predicates, a
+prim that has any of their attributes is left out. These snippets select the
+meshes that do not have ``example:count``:
+
+.. tab-set::
+
+   .. tab-item:: Python
+
+      .. filtered-literalinclude:: ../../examples/python/queries/main.py
+         :language: python
+         :start-after: # [snippet:query-excluded-attribute]
+         :end-before: # [/snippet:query-excluded-attribute]
+         :dedent:
+
+   .. tab-item:: C
+
+      .. filtered-literalinclude:: ../../examples/c/queries/main.cpp
+         :language: cpp
+         :start-after: // [snippet:query-excluded-attribute-c]
+         :end-before: // [/snippet:query-excluded-attribute-c]
+         :dedent:
+
 Listing the Matched Paths
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -288,7 +314,7 @@ stage dictionary as ``paths`` and imports ``OrdinalRange`` from ``ovstage``.
 The C helper ``tokenName()`` resolves a token through that dictionary.
 The snapshot uses end ordinal 2, after the example has advanced the
 :term:`watermark <Watermark>`. A later recorded schema change makes this snapshot
-unavailable; use ``UINT64_MAX`` (``(1 << 64) - 1`` in Python) for current values:
+unavailable; use ``OVSTAGE_ORDINAL_MAX`` (``ovstage.ORDINAL_MAX`` in Python) for current values:
 
 .. tab-set::
 
@@ -307,8 +333,7 @@ unavailable; use ``UINT64_MAX`` (``(1 << 64) - 1`` in Python) for current values
 Supported Predicates
 --------------------
 
-The current implementation supports these combinations. The operator names are
-members of ``FilterOp`` in Python.
+The supported (attribute, operator) pairs are a closed list. The operator names are members of ``FilterOp`` in Python.
 
 .. list-table::
    :header-rows: 1
@@ -317,9 +342,13 @@ members of ``FilterOp`` in Python.
    * - Attribute
      - Operator
      - Matches
-   * - Any supported attribute
+   * - Any attribute name except ``usd-active``
      - ``HAS``
      - Prims where the attribute is present; no value comparison.
+   * - Any attribute name except ``usd-active``
+     - ``NOT_HAS``
+     - Prims where the attribute is absent; the complement of ``HAS``. Every prim
+       has ``usd-path``, so ``NOT_HAS`` on it matches no prims.
    * - ``usd-path``
      - ``IN``
      - Any of the exact paths listed. Use several values to check a set of candidate paths.
@@ -350,10 +379,12 @@ For applied schemas and ancestor types, one ``CONTAINS`` predicate with several
 names matches any;
 use separate predicates to require all of them.
 
-Other combinations fail with ``ErrorCode.NOT_SUPPORTED``. In particular, the
-current query implementation cannot compare an ordinary attribute's value,
-such as ``mass > 10``. Read the values and filter them in your application.
-``usd-active`` is unsupported even with ``HAS``.
+Every other pair is unsupported. This includes ``LT``, ``LE``, ``GT``, and ``GE`` on every attribute, ``IN``, ``CONTAINS``, and ``PREFIX`` on ordinary attributes, and any operator other than ``HAS`` or ``NOT_HAS`` on an attribute not listed above. In particular, a query cannot compare an ordinary attribute's value, such as ``mass > 10``. Read the values and filter them in your application. ``usd-active`` is unsupported even with ``HAS`` or ``NOT_HAS``. An empty attribute name is ``INVALID_ARGUMENT``. A supported value predicate with an empty value list matches no prims.
+
+Check unsupported-predicate errors at the point appropriate to your language:
+
+* **C:** :c:func:`ovstage_query()` rejects the submission immediately with ``status == OVSTAGE_ERROR_NOT_SUPPORTED`` and no valid operation id. Check that status before waiting or using the query handle.
+* **Python:** :meth:`ovstage.Stage.query()` returns a ``Query`` that stores the rejected submission. Call :meth:`ovstage.Query.wait()` to raise ``OvstageError`` with ``ErrorCode.NOT_SUPPORTED`` before using the query. The query call itself does not raise this native rejection; Python argument-validation errors can still be immediate.
 
 :meth:`query.result().attributes <ovstage.Query.result>` lists discovered attribute tokens. Resolve them
 with the path dictionary. The ``attrs=`` argument to :meth:`Stage.query() <ovstage.Stage.query>` limits

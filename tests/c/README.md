@@ -36,13 +36,17 @@ ovstage skills. Built with CMake + GoogleTest and run via `ctest`, against the
 - `test_attributes.cpp` — asserts POINT / COLOR / MATRIX / TOKEN_ID semantic
   metadata round-trip (`semantic-roles-c`).
 - `test_map_attribute.cpp` — asserts CPU map/unmap writes existing and new
-  attributes (`map-unmap-cpu-c`).
+  attributes (`map-unmap-cpu-c`) and reserved-metadata round trips
+  (`map-reserved-metadata-c`).
 - `test_write_modes.cpp` — asserts UPSERT vs INSERT admission
   (`upsert-vs-insert-c`).
 - `test_sparse_writes.cpp` — asserts sparse `index_map` + `mask` writes
   (`sparse-index-map-and-mask-c`).
 - `test_delete.cpp` — asserts attribute delete and whole-prim tombstones
   (`delete-attribute-then-prim-c`).
+- `test_read_patterns.cpp` — asserts the `"*"` and `"prefix*"` attribute selectors in
+  `read_attributes`: selection order, names added once, invalid forms, and the
+  rejection of names with `*` in other operations (`read-attribute-patterns-c`).
 
 Build + run directly, or via the cross-platform `../run_public_tests.py`:
 

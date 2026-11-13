@@ -63,8 +63,7 @@ static ovx_primpath_list_t queryFromPaths(ovstage_instance_t* stage, path_dictio
     ovx_string_t strings[4];
     if (count > 4)
     {
-        std::fprintf(stderr, "queryFromPaths supports at most 4 paths\n");
-        std::exit(EXIT_FAILURE);
+        fail("queryFromPaths supports at most 4 paths");
     }
     for (size_t i = 0; i < count; ++i)
         strings[i] = ovxStr(paths[i]);
@@ -129,18 +128,23 @@ static void readLatestRows(ovstage_instance_t* stage, path_dictionary_instance_t
 
     for (;;)
     {
+        size_t fetchedGroupCount = 0;
         ovstage_read_group_t group{};
-        const ovstage_api_status_t fetched = ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group);
+        const ovstage_api_status_t fetched =
+            ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group, 1, &fetchedGroupCount);
         if (fetched == OVSTAGE_ERROR_END_OF_ITERATION)
             break; // the normal end of the group stream
         check(stage, fetched, "fetch_read_next");
-        if (!group.is_delete && group.data.tensor_count == 1 && group.data.tensors[0].data)
+        if (group.column_count != 1)
+            fail("single-attribute read returned multiple columns");
+        const ovstage_read_column_t& column = group.columns[0];
+        if (!column.is_delete && column.data.tensor_count == 1 && column.data.tensors[0].data)
         {
-            const float* rows = static_cast<const float*>(group.data.tensors[0].data);
+            const float* rows = static_cast<const float*>(column.data.tensors[0].data);
             for (uint32_t local = 0; local < group.prims.count; ++local)
             {
                 const ovx_primpath_t path = primAt(dict, group.prims, local);
-                const uint32_t row = group.data.index_map ? group.data.index_map[local] : local;
+                const uint32_t row = column.data.index_map ? column.data.index_map[local] : local;
                 for (size_t i = 0; i < pathCount; ++i)
                 {
                     if (orderPaths[i] == path)
@@ -151,8 +155,8 @@ static void readLatestRows(ovstage_instance_t* stage, path_dictionary_instance_t
                 }
             }
         }
-        ovstage_api_status_t status = ovstage_release_group(stage, &group);
-        check(stage, status, "release_group");
+        ovstage_api_status_t status = ovstage_release_groups(stage, &group, 1);
+        check(stage, status, "release_groups");
     }
     enq = ovstage_release_read(stage, read);
     waitOp(stage, enq, "release_read");
@@ -267,8 +271,7 @@ int main()
         const auto operation = ovstage_clone(stage, literal_to_ovx_string("/World/Proto/Rig"), targets, 2, 4);
         if (operation.status != OVSTAGE_ERROR_INVALID_ARGUMENT)
         {
-            std::fprintf(stderr, "Expected duplicate targets to be rejected\n");
-            std::exit(EXIT_FAILURE);
+            fail("Expected duplicate targets to be rejected");
         }
         // Submission failed, so there is no pending operation to wait for or release.
         std::printf("Duplicate targets rejected before cloning.\n");
@@ -307,8 +310,7 @@ int main()
         check(stage, ovstage_release_op(stage, operation.op_index), "release failed clone operation");
         if (status != OVSTAGE_ERROR_NOT_FOUND)
         {
-            std::fprintf(stderr, "Expected a missing-source clone failure\n");
-            std::exit(EXIT_FAILURE);
+            fail("Expected a missing-source clone failure");
         }
         std::printf("Clone source was not found.\n");
         // Clone source was not found.
@@ -576,20 +578,25 @@ int main()
             std::vector<float> saved;
             for (;;)
             {
+                size_t fetchedGroupCount = 0;
                 ovstage_read_group_t group{};
-                const auto status = ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group);
+                const auto status =
+                    ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group, 1, &fetchedGroupCount);
                 if (status == OVSTAGE_ERROR_END_OF_ITERATION)
                     break;
                 check(stage, status, "fetch group");
-                const DLTensor& tensor = group.data.tensors[0];
+                if (group.column_count != 1)
+                    fail("single-attribute read returned multiple columns");
+                const ovstage_read_column_t& column = group.columns[0];
+                const DLTensor& tensor = column.data.tensors[0];
                 const auto* values = reinterpret_cast<const float*>(
                     static_cast<const uint8_t*>(tensor.data) + tensor.byte_offset);
                 for (uint32_t i = 0; i < group.prims.count; ++i)
                 {
-                    const uint32_t row = group.data.index_map ? group.data.index_map[i] : i;
+                    const uint32_t row = column.data.index_map ? column.data.index_map[i] : i;
                     saved.push_back(values[row]); // Copy the value before releasing its group.
                 }
-                check(stage, ovstage_release_group(stage, &group), "release group");
+                check(stage, ovstage_release_groups(stage, &group, 1), "release group");
             }
             waitOp(stage, ovstage_release_read(stage, read), "release read");
             // Copied values remain valid after both groups and the read are released.
@@ -613,23 +620,28 @@ int main()
 
             for (;;)
             {
+                size_t fetchedGroupCount = 0;
                 ovstage_read_group_t group{};
-                const auto status = ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group);
+                const auto status =
+                    ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group, 1, &fetchedGroupCount);
                 if (status == OVSTAGE_ERROR_END_OF_ITERATION)
                     break;
                 check(stage, status, "fetch group");
+                if (group.column_count != 1)
+                    fail("single-attribute read returned multiple columns");
+                const ovstage_read_column_t& column = group.columns[0];
                 // Raw tensor shape is (N, 3), with scalar float32 lanes.
-                const DLTensor& tensor = group.data.tensors[0];
+                const DLTensor& tensor = column.data.tensors[0];
                 const auto* values = reinterpret_cast<const float*>(
                     static_cast<const uint8_t*>(tensor.data) + tensor.byte_offset);
                 for (uint32_t i = 0; i < group.prims.count; ++i)
                 {
-                    const uint32_t row = group.data.index_map ? group.data.index_map[i] : i;
+                    const uint32_t row = column.data.index_map ? column.data.index_map[i] : i;
                     const float* vector = values + row * 3;
                     // Use vector[0..2] here, while the group still owns the buffer.
                     (void)vector;
                 }
-                check(stage, ovstage_release_group(stage, &group), "release group");
+                check(stage, ovstage_release_groups(stage, &group, 1), "release group");
             }
             waitOp(stage, ovstage_release_read(stage, read), "release read");
             // [/snippet:read-fixed-vectors-c]
@@ -649,26 +661,31 @@ int main()
             std::vector<float> saved;
             for (;;)
             {
+                size_t fetchedGroupCount = 0;
                 ovstage_read_group_t group{};
-                const auto status = ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group);
+                const auto status =
+                    ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group, 1, &fetchedGroupCount);
                 if (status == OVSTAGE_ERROR_END_OF_ITERATION)
                     break;
                 check(stage, status, "fetch group");
-                if (group.is_delete)
+                if (group.column_count != 1)
+                    fail("single-attribute read returned multiple columns");
+                const ovstage_read_column_t& column = group.columns[0];
+                if (column.is_delete)
                 {
                     // Deletions carry no value tensor; still release their group.
-                    check(stage, ovstage_release_group(stage, &group), "release deletion group");
+                    check(stage, ovstage_release_groups(stage, &group, 1), "release deletion group");
                     continue;
                 }
-                const DLTensor& tensor = group.data.tensors[0];
+                const DLTensor& tensor = column.data.tensors[0];
                 const auto* values = reinterpret_cast<const float*>(
                     static_cast<const uint8_t*>(tensor.data) + tensor.byte_offset);
                 for (uint32_t i = 0; i < group.prims.count; ++i)
                 {
-                    const uint32_t row = group.data.index_map ? group.data.index_map[i] : i;
+                    const uint32_t row = column.data.index_map ? column.data.index_map[i] : i;
                     saved.push_back(values[row]); // Copy the value before releasing its group.
                 }
-                check(stage, ovstage_release_group(stage, &group), "release group");
+                check(stage, ovstage_release_groups(stage, &group, 1), "release group");
             }
             waitOp(stage, ovstage_release_read(stage, read), "release read");
             std::sort(saved.begin(), saved.end());
@@ -690,8 +707,7 @@ int main()
             const ovstage_ordinal_t requestedStart = 14;
             if (requestedStart < oldest)
             {
-                std::fprintf(stderr, "Change records for this interval are no longer exact\n");
-                std::exit(EXIT_FAILURE);
+                fail("Change records for this interval are no longer exact");
             }
             // A subsequent range read can still fail if a newer write replaced its values.
             // [/snippet:read-retained-records-c]

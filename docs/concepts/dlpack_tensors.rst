@@ -25,7 +25,7 @@ Passing Attribute Values
 --------------------------------
 
 Pass tensors to :meth:`ovstage.Stage.write_attribute()` and read them through
-:class:`ovstage.ReadGroup` or :class:`ovstage.MapGroup`. They associate tensor
+:class:`ovstage.ReadColumn` or :class:`ovstage.MapGroup`. They associate tensor
 values with :term:`prims <Prim>`. On writes, set ``is_array`` explicitly. Shape and tensor
 count do not determine whether an attribute is array-valued.
 
@@ -252,6 +252,22 @@ release of the group. Release the read handle separately when finished fetching.
          :exclude-pattern: ^\s*//\s*\[/?snippet:
          :dedent:
 
+.. _ovstage-write-pointer-aliasing:
+
+Source and Destination Aliasing
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The caller must ensure that destination writes do not overwrite or invalidate
+source memory before it is consumed. Retaining a Python object or transferring
+a managed tensor's lifetime does not by itself make source/destination aliasing
+safe. Do not rely on an implicit input snapshot. See
+:c:type:`ovstage_write_data_t`.
+
+If the input may overlap storage affected by the write, copy it into independent
+memory before submission. Keep that copy valid for the input lifetime described
+above, including the placement availability-event rules. Repeated ``index_map``
+entries that read the same independent source row remain supported.
+
 .. _ovstage-device-placement:
 
 Experimental Device Placement
@@ -277,9 +293,14 @@ Placement selects a device's copy of an attribute; it does not pin that attribut
 to one device permanently. Writes and map commits produce values on the selected
 device. Reads use the copy already current there, or materialize one if needed.
 A read of an already-current copy avoids migration. Inspect each returned
-``DLTensor.device`` and use a consumer for that device. ``group.array()`` is
+``DLTensor.device`` and use a consumer for that device. ``column.array()`` is
 CPU-only; CUDA buffers require a CUDA-capable DLPack consumer. Keep each group
 alive through its consumer's device work before releasing it or committing a map.
+
+CUDA reads support ragged numeric arrays, including empty arrays with zero
+length. Each nonempty GPU array payload is 32-byte aligned. Keep its read group
+alive until the consumer's device work has finished. Arrays follow the same
+placement ownership and availability rules as fixed-size attributes.
 
 For a complete producer-to-consumer sequence in C and Python, see
 :doc:`/scene/device_placement`.
@@ -332,9 +353,9 @@ Placement does not guarantee asynchronous transfers in every case. A write
 staged between devices drains its staging buffer before returning completion.
 Ragged writes use the default stream rather than the requested placement stream;
 their availability event is already signalled when the operation completes.
-CUDA maps support fixed-size attributes only; array-valued CUDA maps return
-``NOT_SUPPORTED``. Map commit scatter uses the mapped device's default stream
-and is drained before operation completion. An availability event does not make
+CUDA maps support fixed-size attributes only; array-valued CUDA maps and maps of
+the reserved metadata names return ``NOT_SUPPORTED``. Map commit scatter uses the
+mapped device's default stream and is drained before operation completion. An availability event does not make
 that scatter asynchronous with respect to completion, although submission still
 enqueues the operation.
 Staged host rows with negative or zero/broadcast strides are not supported.
@@ -463,7 +484,7 @@ Writing through Mapped Buffers
 
 Mapping without placement gives you writable CPU **staging buffers**.
 The experimental :ref:`ovstage-device-placement` also supports CUDA map buffers
-for fixed-size attributes. They need not share memory
+for fixed-size attributes other than the reserved metadata. They need not share memory
 with the final attribute storage; unmap may copy or scatter the values.
 The call order is:
 
@@ -492,6 +513,39 @@ one; specify dtype and semantic when targets have multiple same-name identities.
 Changes to unrelated prims do not by themselves invalidate the map.
 Finish unmapping before advancing the watermark to or beyond the map's ordinal.
 
+The recorded reserved metadata (``usd-prim-type``, ``usd-schemas`` and
+``usd-ancestor-types``) maps like any recorded column. Its staging buffer holds
+interned token ids -- one per prim for ``usd-prim-type``, one ragged row per prim
+for the two array names, sized by ``element_sizes`` and cleared by an empty row --
+and each unmap lowers them to the prim's type, applied-schema and ancestor-type
+tags exactly as a copy-in write does, so reads, filters and change ranges observe
+the mapped value. Such a map is host-resident: pass no ``dtype`` or
+``(kDLUInt, 64, 1)`` and no semantic, do not place it on a CUDA device, and do not
+map it through a query that names a prim twice. Release outstanding reads of the
+mapped prims before committing, as for a copy-in write of these names. A staged
+row whose ids name nothing fails the commit before any tag changes and ends the
+session.
+
+.. tab-set::
+
+   .. tab-item:: Python
+
+      .. filtered-literalinclude:: ../../tests/python/test_map_attribute.py
+         :language: python
+         :start-after: # [snippet:map-reserved-metadata]
+         :end-before: # [/snippet:map-reserved-metadata]
+         :exclude-pattern: ^\s*#\s*\[/?snippet:
+         :dedent:
+
+   .. tab-item:: C
+
+      .. filtered-literalinclude:: ../../tests/c/test_map_attribute.cpp
+         :language: cpp
+         :start-after: // [snippet:map-reserved-metadata-c]
+         :end-before: // [/snippet:map-reserved-metadata-c]
+         :exclude-pattern: ^\s*//\s*\[/?snippet:
+         :dedent:
+
 In Python, groups fetched through a ``Map`` retain that map. Keep the group or
 its DLPack producer alive while using a view. Stop accessing the group and all
 previously obtained views as soon as its group commit or final unmap submission
@@ -502,16 +556,22 @@ returned cannot check whether they are still valid.
 
    Prefer :meth:`mapping.fetch_next() <ovstage.Map.fetch_next>`, :meth:`mapping.groups() <ovstage.Map.groups>`, and :meth:`mapping.unmap() <ovstage.Map.unmap>`
    on the Python ``Map`` object. The lower-level Stage methods also accept the
-   map's integer ID: :meth:`stage.fetch_map_next(mapping.handle) <ovstage.Stage.fetch_map_next>` returns a group
+   map's typed ``MapHandle``: :meth:`stage.fetch_map_next(mapping.handle) <ovstage.Stage.fetch_map_next>` returns a group
    that does not retain the ``Map``, and
    :meth:`stage.unmap_attribute(mapping.handle) <ovstage.Stage.unmap_attribute>` does not mark the Python ``Map``
-   or its groups as unusable. Passing the ``Map`` object instead of its integer
-   ID preserves that lifetime tracking.
+   or its groups as unusable. Passing the ``Map`` object instead of its raw
+   handle preserves that lifetime tracking.
 
 A successful transform unmap makes derived transforms need updating; use the
 computation sequence in :doc:`/scene/transforms`. A pending or failed map does
-not supply a committed parent. Children reconnect when that parent is later
-committed successfully. For failed-map cleanup, see :doc:`error_handling`.
+not supply a committed parent. Children created by writes, maps, or clones, and
+children that USD population created under a parent that was not a prim yet,
+reconnect when that parent is later committed successfully; a child that
+attached to the nearest existing ancestor moves under the new parent (see
+:doc:`/scene/cloning`). A reconnection that USD population would make while a
+fetched read group covers a prim it would give ``omni:fabric:worldMatrix`` waits
+for a retry after the group is released (see :doc:`/scene/transforms`). For
+failed-map cleanup, see :doc:`error_handling`.
 
 The snippets below map an existing scalar attribute on two prims, write 10 and
 20, and finish the map before advancing the watermark to 2. Mapped buffers are

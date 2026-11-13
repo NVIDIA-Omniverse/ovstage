@@ -6,6 +6,13 @@
  * reads USD (files or inline USDA) and mirrors it into an ovstage instance
  * so renderers like ovrtx (via ovrtx_attach_ovstage) can consume it.
  *
+ * This header holds the population functions of the population family. The
+ * export functions of the family live in ovstage_population_export.h. The
+ * population types of the family are defined in ovstage_population_types.h:
+ * the domains, the selector and the descriptor, the op id, the USD reference
+ * handle, the default time and its helper, and the results. The population
+ * family vtable is defined in ovstage_ext_vtables.h.
+ *
  * Ordinal ownership. The application — typically a frame coordinator —
  * owns ordinal lifecycle: it supplies ordinals for population and advances the
  * write floor after the producers for a tick have completed. The population API
@@ -16,10 +23,9 @@
  * Every population entry point that carries an `ordinal` requires the same
  * ordinal discipline as `ovstage_write_attributes`: it must be greater than the
  * effective write floor at execution time, or the writes are rejected with
- * `OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION`. A newly created instance starts with a
- * write floor of 0, so the first population must use an ordinal of at least 1;
- * 0 is never a usable write ordinal. (0 remains valid wherever an ordinal is
- * *read* — it is a real ordinal value, not a sentinel.)
+ * `OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION`. A newly created instance is sealed
+ * through `OVSTAGE_ORDINAL_MIN`; population may use any greater ordinal,
+ * including negative values and zero, subject to the admission policy.
  *
  * Wait for population to complete before applying direct writes that override
  * populated values, and use a newer ordinal for those writes. Use increasing
@@ -83,225 +89,47 @@
  * naming a dictionary follows the dictionary's keys, so a key added since the
  * populate gains an attribute and a key removed loses one.
  *
- * ovrtx pairing contract. An ovstage_population_open_usd_* call or
- * ovstage_population_repopulate_usd_with_desc or
- * ovstage_population_apply_usd_changes call performs a wholesale or
- * structural stage mutation. A consumer attached in borrow mode
- * (for example, a renderer attached with `ovrtx_attach_ovstage`) must re-anchor
- * its derived state from the shared stage before its next render: the
- * canonical sequence is
- *     `ovstage_population_open_usd_*` /
- *     `ovstage_population_repopulate_usd_with_desc` /
- *     `ovstage_population_apply_usd_changes` -> wait_op ->
- *     `ovstage_advance_write_floor` -> `ovrtx_update_from_stage` ->
- *     `ovrtx_step_with_stage`.
- * `ovstage_population_apply_usd_time` is time-only and does not require
- * the consumer to rebuild; the consumer's incremental update path is
- * sufficient.
+ * ovrtx pairing contract. After ovstage_population_open_usd_*, ovstage_population_repopulate_usd_with_desc, or ovstage_population_apply_usd_changes, wait for population completion, advance the write floor and wait for that advance, then complete ovrtx_update_from_stage before ovrtx_step_with_stage. ovstage_population_apply_usd_time is a time-only update; complete it and the write-floor advance before rendering.
  */
 
 #ifndef OVSTAGE_POPULATION_H
 #define OVSTAGE_POPULATION_H
 
 #include "ovstage_api/ovstage_api.h"
-#include "ovstage_population_predicate.h"
-
-#include <math.h>
+#include "ovstage_ext_vtables.h"
+#include "ovstage_population_types.h"
 
 #ifdef __cplusplus
 extern "C"
 {
 #endif
 
-    /** Coarse population domains for the canonical population entry points.
-     *  Bitmask — OR values together.
-     *
-     *  `OVSTAGE_POPULATION_DOMAIN_NONE` (0) selects no data domain: a `domains`
-     *  argument of 0 populates nothing at all. Pass
-     *  `OVSTAGE_POPULATION_DOMAIN_ALL` to populate all domains. */
-    typedef enum
-    {
-        OVSTAGE_POPULATION_DOMAIN_NONE      = 0u,
-        /** Meshes, lights, materials, and cameras. */
-        OVSTAGE_POPULATION_DOMAIN_RENDERING = 1u << 0,
-        /** Colliders, rigid bodies, joints, articulations, and the physics
-         *  schema attributes/relationships authored on them. Every prim it
-         *  populates also carries its composed USD type name as
-         *  `usd-metadata:typeName`. */
-        OVSTAGE_POPULATION_DOMAIN_PHYSICS   = 1u << 1,
-        OVSTAGE_POPULATION_DOMAIN_ALL       = OVSTAGE_POPULATION_DOMAIN_RENDERING |
-                                              OVSTAGE_POPULATION_DOMAIN_PHYSICS,
-    } ovstage_population_domain_t;
-
-    /** One population selector: which prims are populated, and which of their
-     *  properties and metadata. */
-    typedef struct ovstage_population_selector_t
-    {
-        /** Which prims this selector populates. */
-        ovstage_population_prim_predicate_t     prim_predicate;
-
-        /** Which properties of those prims are populated. */
-        ovstage_population_property_predicate_t property_predicate;
-
-        /** Metadata to populate for each selected prim, as paths: a metadata field
-         *  name, extended with a `:`-joined key path to reach inside a dictionary
-         *  field. A path naming a dictionary rather than a single value populates
-         *  every value beneath it, one attribute each. Populated as
-         *  `usd-metadata:<path>`. */
-        const ovx_string_t* prim_metadata_paths;
-        size_t              prim_metadata_path_count;
-
-        /** Metadata to populate for each selected property, as paths -- same addressing
-         *  and dictionary flattening as `prim_metadata_paths`. Applies to every property
-         *  `property_predicate` selects; use a further selector to populate a field for
-         *  some properties only. Populated as `<property>:usd-metadata:<path>`. */
-        const ovx_string_t* property_metadata_paths;
-        size_t              property_metadata_path_count;
-    } ovstage_population_selector_t;
-
-    /** A complete description of what to populate.
-     *
-     *  Zero-initialize, then set the fields you need. A desc with no selectors and
-     *  `domains` set is exactly equivalent to passing that `domains` to the entry
-     *  point without a desc; a desc with neither populates nothing.
-     *
-     *  Descs are supplied as an array and compose: `domains` is OR-ed across every
-     *  desc, and their selectors are combined in array order.
-     *
-     *  The array, and everything it points at, must stay valid only until the call
-     *  returns: the description is copied as the operation is enqueued. */
-    typedef struct ovstage_population_desc_t
-    {
-        /** Bitmask of `ovstage_population_domain_t` — built-in domains to populate
-         *  alongside this desc's selectors. `0` for selectors only. */
-        uint32_t domains;
-
-        /** The selectors that make up this description. May be `NULL` when `domains`
-         *  alone is wanted. */
-        const ovstage_population_selector_t* selectors;
-        size_t                               selector_count;
-
-        /** Stage metadata to populate onto the root prim, as paths: a stage
-         *  metadata field name, extended with a `:`-joined key path to reach inside a
-         *  dictionary field — `customLayerData:myTool:version`. A path naming a
-         *  dictionary rather than a single value populates every value beneath it, one
-         *  attribute each. A path that does not resolve populates nothing. */
-        const ovx_string_t* stage_metadata_paths;
-        size_t              stage_metadata_path_count;
-    } ovstage_population_desc_t;
-
-    /** Opaque id of an enqueued population operation, returned by the async
-     *  entry points and passed to `ovstage_population_wait_op`. Zero is never a
-     *  live op id. */
-    typedef uint64_t ovstage_population_op_id_t;
-
-#define OVSTAGE_POPULATION_INVALID_OP_ID ((ovstage_population_op_id_t)0)
-
-    /** Opaque handle to a USD reference added by
-     *  `ovstage_population_add_usd_reference_from_file` / `_from_string`, passed to
-     *  `ovstage_population_remove_usd_reference` to take it back out. Reserved synchronously
-     *  by the add call (so it is valid immediately, before the op runs) and freed
-     *  by `ovstage_population_remove_usd_reference`, `_reset_usd`, or a fresh `_open_usd_*`.
-     *  Zero is never a live handle. */
-    typedef uint64_t ovstage_population_usd_reference_handle_t;
-
-#define OVSTAGE_POPULATION_INVALID_USD_REFERENCE_HANDLE ((ovstage_population_usd_reference_handle_t)0)
-
-    /** The `time` value that selects USD's *default* time code rather than a
-     *  numeric one.
-     *
-     *  Every population entry point taking a `time` takes it in seconds. Passing
-     *  this instead evaluates each property at USD's default time code.
-     *
-     *  The value is a NaN.
-     *
-     *  **Never compare a time against it with `==`.** A NaN is not equal to
-     *  itself, so `time == OVSTAGE_POPULATION_DEFAULT_TIME` is false even for the
-     *  default time. Use `ovstage_population_is_default_time` instead. */
-#define OVSTAGE_POPULATION_DEFAULT_TIME NAN
-
-    /** Test whether a `time` selects USD's default time code.
-     *
-     *  Use this rather than `time == OVSTAGE_POPULATION_DEFAULT_TIME`, which is
-     *  false even for the default time.
-     *
-     *  @param time  A time in seconds, as passed to a population entry point.
-     *  @return `true` if @p time selects the default time code, `false` if it
-     *   names a numeric time. */
-    static inline bool ovstage_population_is_default_time(double time)
-    {
-        return isnan(time) != 0;
-    }
-
-    /** Result of enqueuing a population operation.
-     *
-     *  Population runs asynchronously: `status` reports only that the operation
-     *  was accepted (`OVSTAGE_OK`) and the work runs on a background worker —
-     *  call `ovstage_population_wait_op(op_id)` to await completion and obtain
-     *  the outcome (with detail via `ovstage_population_get_last_error`).
-     *  `op_index` identifies the operation for `ovstage_population_wait_op`, or is
-     *  `OVSTAGE_POPULATION_INVALID_OP_ID` if nothing was enqueued. */
-    typedef struct ovstage_population_enqueue_result_t
-    {
-        ovstage_api_status_t           status;
-        ovstage_population_op_id_t op_index;
-    } ovstage_population_enqueue_result_t;
-
-    /** Output of `ovstage_population_wait_op`.
-     *
-     *  Because a single wait covers all operations up to and including the awaited
-     *  op, more than one op can have failed within that range. `error_op_ids`
-     *  lists those failed op ids. Each failure is reported exactly once — by the
-     *  first `ovstage_population_wait_op` call (on any thread) whose range covers
-     *  it — so a later wait does not re-report it. For each id, retrieve the
-     *  human-readable detail with `ovstage_population_get_last_op_error`.
-     *
-     *  The array (and the strings from `ovstage_population_get_last_op_error`) live
-     *  in the calling thread's storage and stay valid only until that same thread's
-     *  next `ovstage_population_wait_op` call, which overwrites them; copy anything
-     *  you need to keep before calling again. Calls on different threads use
-     *  independent buffers and do not clobber each other.
-     *
-     *  `lowest_pending_op_id` is meaningful only when the wait returns
-     *  `OVSTAGE_ERROR_TIMEOUT`: it is the lowest op id in the awaited range that
-     *  had not completed when the timeout elapsed (useful for partial-progress
-     *  reporting). It is `OVSTAGE_POPULATION_INVALID_OP_ID` otherwise. */
-    typedef struct ovstage_population_op_wait_result_t
-    {
-        const ovstage_population_op_id_t* error_op_ids;
-        size_t                            error_op_id_count;
-        ovstage_population_op_id_t        lowest_pending_op_id;
-    } ovstage_population_op_wait_result_t;
-
     /** Reserved prim attributes.
      *
-     *  Every populated prim with a USD type name, other than an instance root (below),
-     *  carries it as `usd-prim-type`,
-     *  whatever put the prim in scope and whatever its properties are. A prim to
+     *  Every populated prim with a USD type name, an instance root included, carries it
+     *  as `usd-prim-type`, whatever put the prim in scope and whatever its properties are. A prim to
      *  which USD gives no type name is still populated but carries no `usd-prim-type`.
      *
      *  Every populated prim carries `usd-schemas` with the prim's applied API schema
      *  names; a prim with none carries an empty set. A `HAS` predicate on it therefore
      *  matches every populated prim; use `CONTAINS` to select prims by a schema. An
      *  instance of a multiple-apply schema, such as `CollectionAPI:lightLink`, also adds
-     *  the schema's bare name, `CollectionAPI`.
+     *  the schema's bare name, `CollectionAPI`. The set lists every applied API schema,
+     *  whichever domain or selector populated the prim. A name in it does not mean the
+     *  schema's properties were populated.
      *
      *  Every populated prim with a known USD type carries the types it derives from as
      *  `usd-ancestor-types`, excluding its own type. A typeless prim, or a type no loaded
      *  schema declares, carries none. Use `CONTAINS` to select prims by a base type, such
      *  as every `Boundable` prim.
      *
-     *  An instance root is the exception, in every domain. Its `usd-prim-type` is
-     *  `XformInstance`, or `ScopeInstance` when it is a `Scope`, whatever its authored type.
-     *  Its `usd-schemas` also carries `GeomInstanceAPI`, and `GeomInstanceRootAPI` when it is
-     *  outside a prototype; no USD schema applies these names. Its `usd-ancestor-types` is
-     *  `Xformable` alone. Where PHYSICS or a selector populates it, its authored type is
-     *  `usd-metadata:typeName`.
-     *  This does not apply when PHYSICS or a selector populates an instanceable prim
-     *  authored below a `PointInstancer`, such as one inside its prototypes scope: it keeps
-     *  its authored type and applied schemas, even alongside RENDERING, and carries neither
-     *  instance tag. Without RENDERING it receives its normal USD ancestors; with RENDERING,
-     *  population does not synthesize `usd-ancestor-types` at these authored paths.
+     *  An instance root's type does not identify it as an instance root; the instancing
+     *  queries do. Where RENDERING populates it, its `usd-schemas` also carries
+     *  `GeomInstanceAPI`, and `GeomInstanceRootAPI` when it is outside a prototype (no USD
+     *  schema applies these names), and its `usd-ancestor-types` is `Xformable` alone.
+     *  An instanceable prim authored below a `PointInstancer`, such as one inside its
+     *  prototypes scope, carries neither instance tag, even alongside RENDERING; with
+     *  RENDERING, population does not synthesize `usd-ancestor-types` at these authored paths.
      *  It still links its prototype, so the instancing queries list it as an instance root.
      *  RENDERING renders a `PointInstancer`'s prototypes from copies it makes under the
      *  instancer and populates no instance data at the authored path.
@@ -315,9 +143,7 @@ extern "C"
      *   `usd-schemas`. When RENDERING is selected, it provides `usd-ancestor-types` for
      *   every prim, and its sets differ in a few cases, such as `Imageable` on a typeless
      *   prim. Its `usd-schemas` carries further names no USD schema applies, such as
-     *   `PrimvarsAPI`. With RENDERING alone, a `Scope` and a non-`Scope` instance root
-     *   sharing a prototype may both carry the instance type of the first one encountered.
-     *   The population documentation lists these cases. These are temporary limitations. */
+     *   `PrimvarsAPI`. The population documentation lists these cases. These are temporary limitations. */
 
     /** Populated value types.
      *
@@ -397,9 +223,9 @@ extern "C"
 
     /** Populated ancestors.
      *
-     *  A prim that `OVSTAGE_POPULATION_DOMAIN_PHYSICS` or a desc's selectors put in
-     *  scope is populated together with every one of its ancestor prims, so a consumer
-     *  can walk the prim tree down to it however sparse the selection is.
+     *  A prim that a desc's selectors put in scope is populated together with every one
+     *  of its ancestor prims, so a consumer can walk the prim tree down to it however
+     *  sparse the selection is.
      *
      *  An ancestor that no selector matches on its own merit carries none of the data a
      *  selected prim does — no attributes, relationships, or metadata — only the reserved
@@ -429,10 +255,9 @@ extern "C"
 
     /** Transform attributes.
      *
-     *  For every prim that `OVSTAGE_POPULATION_DOMAIN_PHYSICS` or a desc's selectors
-     *  put in scope, and that is USD-xformable, population also *derives* the prim's
-     *  local transform. The attributes and their types are a contract consumers can rely
-     *  on:
+     *  For every prim that a desc's selectors put in scope, and that is USD-xformable,
+     *  population also *derives* the prim's local transform. The attributes and their
+     *  types are a contract consumers can rely on:
      *
      *    - `omni:xform` — `float64`, 16 lanes, `OVSTAGE_SEMANTIC_MATRIX`. The 4x4
      *      row-major local transform: the prim's USD transform ops composed into a
@@ -520,6 +345,46 @@ extern "C"
         const ovx_string_t* paths,
         size_t              path_count);
 
+    /* ═══════════════════════════════════════════════════════════════════════════
+     * The population functions
+     *
+     * The population functions below that take a stage are `static inline`
+     * wrappers. Each wrapper has two forms. The pair form,
+     * `ovstage_population_<name>_ex`, takes the population instance,
+     * `&stage->ext_instances.population`. It rejects a NULL population instance
+     * with `OVSTAGE_ERROR_INVALID_ARGUMENT` and records no error string. Then it
+     * calls its member through the population instance and passes the context
+     * of that instance first,
+     * `population->vtable-><member>(population->context, ...)`. The instance
+     * form, `ovstage_population_<name>`, takes the `ovstage_instance_t*` and
+     * calls the pair form on its population instance, so a NULL stage gets the
+     * same answer. C++ overloads `ovstage_population_<name>` for both receivers. ovstage_ext_vtables.h
+     * defines the population vtable. A member takes the context of its family
+     * first, then the other parameters of its function. An implementation that
+     * does not serve a function points its member at a stub that answers
+     * `OVSTAGE_ERROR_NOT_SUPPORTED` and leaves the outputs unchanged.
+     * ═══════════════════════════════════════════════════════════════════════════ */
+
+    /** @brief The pair form of ovstage_population_open_usd_from_file: the same call
+     *         on the population instance, `&stage->ext_instances.population`. C++
+     *         overloads ovstage_population_open_usd_from_file for this receiver. */
+    static inline ovstage_population_enqueue_result_t ovstage_population_open_usd_from_file_ex(
+        ovstage_population_instance_t* population,
+        ovx_string_t                   path,
+        ovstage_ordinal_t              ordinal,
+        double                         time,
+        uint32_t                       domains)
+    {
+        if (population == NULL)
+        {
+            ovstage_population_enqueue_result_t rejected;
+            rejected.status = OVSTAGE_ERROR_INVALID_ARGUMENT;
+            rejected.op_index = OVSTAGE_POPULATION_INVALID_OP_ID;
+            return rejected;
+        }
+        return population->vtable->open_usd_from_file(
+            population->context, path, ordinal, time, domains);
+    }
 
     /**
      * Enqueue an asynchronous operation to populate an ovstage instance from a
@@ -536,21 +401,34 @@ extern "C"
      * automatically when @p stage is destroyed.
      *
      * @param stage      ovstage instance to populate into.
-     * @param path       Filesystem path to a `.usda` / `.usdc` / `.usd` file, or
+     * @param path       Filesystem path to a `.usda` / `.usdc` / `.usd` file,
      *                   an Omniverse Nucleus URL (`omniverse://<server>/<path>.usd`),
-     *                   as an `ovx_string_t` view.
+     *                   or any other identifier a registered OpenUSD resolver
+     *                   opens (a context-dependent resolver sees the resolver
+     *                   context the instance captured at creation), as an
+     *                   `ovx_string_t` view. A relative filesystem path is
+     *                   anchored to the process working directory at the time
+     *                   of the call; when the population worker opens the layer
+     *                   and that anchored path exists, it opens the absolute
+     *                   path, keeping file-format arguments and a
+     *                   package-relative suffix (for `pkg.usdz[inner.usda]` the
+     *                   outer package is the path that must exist); a failed
+     *                   open of the anchored path is reported with that
+     *                   absolute path. Otherwise, for every URI, and on Windows
+     *                   with OpenUSD releases before 26.08 for an absolute form
+     *                   of 260 characters or more, the identifier reaches the
+     *                   resolver unchanged.
      * @param ordinal    Accumulating ordinal owned by the caller. Must be
      *                   greater than the effective write floor at execution
-     *                   time; a new instance's floor is 0, so initial
-     *                   population starts at 1.
+     *                   time. A new instance starts at `OVSTAGE_ORDINAL_MIN`;
+     *                   negative values above that minimum and zero are valid.
      * @param time       Time in seconds at which to evaluate attributes;
      *                   converted to a USD time code via the stage's
      *                   timeCodesPerSecond. `OVSTAGE_POPULATION_DEFAULT_TIME`
      *                   evaluates at USD's default time code instead.
      * @param domains    Bitmask of `ovstage_population_domain_t` selecting which
      *                   data domains to populate. `0` (DOMAIN_NONE) populates
-     *                   nothing; pass `OVSTAGE_POPULATION_DOMAIN_ALL` for
-     *                   everything.
+     *                   nothing.
      * @return Enqueue result (see `ovstage_population_enqueue_result_t`). A
      *  rejected enqueue is reported in `status`; failures while the op runs —
      *  the stage cannot be populated, the file cannot be opened, or population
@@ -561,12 +439,39 @@ extern "C"
      *  reported by `ovstage_population_wait_op` carries no such guarantee:
      *  repopulate at a higher ordinal.
      */
-    ovstage_population_enqueue_result_t ovstage_population_open_usd_from_file(
+    static inline ovstage_population_enqueue_result_t ovstage_population_open_usd_from_file(
         ovstage_instance_t* stage,
         ovx_string_t        path,
         ovstage_ordinal_t   ordinal,
         double              time,
-        uint32_t            domains);
+        uint32_t            domains)
+    {
+        return ovstage_population_open_usd_from_file_ex(
+            stage != NULL ? &stage->ext_instances.population : NULL,
+            path, ordinal, time, domains);
+    }
+
+    /** @brief The pair form of ovstage_population_open_usd_from_string: the same
+     *         call on the population instance, `&stage->ext_instances.population`.
+     *         C++ overloads ovstage_population_open_usd_from_string for this
+     *         receiver. */
+    static inline ovstage_population_enqueue_result_t ovstage_population_open_usd_from_string_ex(
+        ovstage_population_instance_t* population,
+        ovx_string_t                   usda,
+        ovstage_ordinal_t              ordinal,
+        double                         time,
+        uint32_t                       domains)
+    {
+        if (population == NULL)
+        {
+            ovstage_population_enqueue_result_t rejected;
+            rejected.status = OVSTAGE_ERROR_INVALID_ARGUMENT;
+            rejected.op_index = OVSTAGE_POPULATION_INVALID_OP_ID;
+            return rejected;
+        }
+        return population->vtable->open_usd_from_string(
+            population->context, usda, ordinal, time, domains);
+    }
 
     /**
      * Enqueue an asynchronous operation to populate an ovstage instance from an
@@ -579,16 +484,15 @@ extern "C"
      * @param usda       USDA content (e.g. "#usda 1.0\n...") as an `ovx_string_t` view.
      * @param ordinal    Accumulating ordinal owned by the caller. Must be
      *                   greater than the effective write floor at execution
-     *                   time; a new instance's floor is 0, so initial
-     *                   population starts at 1.
+     *                   time. A new instance starts at `OVSTAGE_ORDINAL_MIN`;
+     *                   negative values above that minimum and zero are valid.
      * @param time       Time in seconds; converted to a USD time code via the
      *                   stage's timeCodesPerSecond.
      *                   `OVSTAGE_POPULATION_DEFAULT_TIME` evaluates at USD's
      *                   default time code instead.
      * @param domains    Bitmask of `ovstage_population_domain_t` selecting which
      *                   data domains to populate. `0` (DOMAIN_NONE) populates
-     *                   nothing; pass `OVSTAGE_POPULATION_DOMAIN_ALL` for
-     *                   everything.
+     *                   nothing.
      * @return Enqueue result (see `ovstage_population_enqueue_result_t`). A
      *  rejected enqueue is reported in `status`; failures while the op runs —
      *  the stage cannot be populated, the USDA content fails to parse, or
@@ -599,12 +503,40 @@ extern "C"
      *  reported by `ovstage_population_wait_op` carries no such guarantee:
      *  repopulate at a higher ordinal.
      */
-    ovstage_population_enqueue_result_t ovstage_population_open_usd_from_string(
+    static inline ovstage_population_enqueue_result_t ovstage_population_open_usd_from_string(
         ovstage_instance_t* stage,
         ovx_string_t        usda,
         ovstage_ordinal_t   ordinal,
         double              time,
-        uint32_t            domains);
+        uint32_t            domains)
+    {
+        return ovstage_population_open_usd_from_string_ex(
+            stage != NULL ? &stage->ext_instances.population : NULL,
+            usda, ordinal, time, domains);
+    }
+
+    /** @brief The pair form of ovstage_population_open_usd_from_file_with_desc: the
+     *         same call on the population instance,
+     *         `&stage->ext_instances.population`. C++ overloads
+     *         ovstage_population_open_usd_from_file_with_desc for this receiver. */
+    static inline ovstage_population_enqueue_result_t ovstage_population_open_usd_from_file_with_desc_ex(
+        ovstage_population_instance_t*         population,
+        ovx_string_t                           path,
+        ovstage_ordinal_t                      ordinal,
+        double                                 time,
+        const ovstage_population_desc_t*       descs,
+        size_t                                 desc_count)
+    {
+        if (population == NULL)
+        {
+            ovstage_population_enqueue_result_t rejected;
+            rejected.status = OVSTAGE_ERROR_INVALID_ARGUMENT;
+            rejected.op_index = OVSTAGE_POPULATION_INVALID_OP_ID;
+            return rejected;
+        }
+        return population->vtable->open_usd_from_file_with_desc(
+            population->context, path, ordinal, time, descs, desc_count);
+    }
 
     /**
      * Enqueue an asynchronous operation to populate an ovstage instance from a
@@ -616,13 +548,27 @@ extern "C"
      * point.
      *
      * @param stage      ovstage instance to populate into.
-     * @param path       Filesystem path to a `.usda` / `.usdc` / `.usd` file, or
+     * @param path       Filesystem path to a `.usda` / `.usdc` / `.usd` file,
      *                   an Omniverse Nucleus URL (`omniverse://<server>/<path>.usd`),
-     *                   as an `ovx_string_t` view.
+     *                   or any other identifier a registered OpenUSD resolver
+     *                   opens (a context-dependent resolver sees the resolver
+     *                   context the instance captured at creation), as an
+     *                   `ovx_string_t` view. A relative filesystem path is
+     *                   anchored to the process working directory at the time
+     *                   of the call; when the population worker opens the layer
+     *                   and that anchored path exists, it opens the absolute
+     *                   path, keeping file-format arguments and a
+     *                   package-relative suffix (for `pkg.usdz[inner.usda]` the
+     *                   outer package is the path that must exist); a failed
+     *                   open of the anchored path is reported with that
+     *                   absolute path. Otherwise, for every URI, and on Windows
+     *                   with OpenUSD releases before 26.08 for an absolute form
+     *                   of 260 characters or more, the identifier reaches the
+     *                   resolver unchanged.
      * @param ordinal    Accumulating ordinal owned by the caller. Must be
      *                   greater than the effective write floor at execution
-     *                   time; a new instance's floor is 0, so initial
-     *                   population starts at 1.
+     *                   time. A new instance starts at `OVSTAGE_ORDINAL_MIN`;
+     *                   negative values above that minimum and zero are valid.
      * @param time       Time in seconds at which to evaluate attributes;
      *                   converted to a USD time code via the stage's
      *                   timeCodesPerSecond. `OVSTAGE_POPULATION_DEFAULT_TIME`
@@ -643,13 +589,41 @@ extern "C"
      *  reported by `ovstage_population_wait_op` carries no such guarantee:
      *  repopulate at a higher ordinal.
      */
-    ovstage_population_enqueue_result_t ovstage_population_open_usd_from_file_with_desc(
+    static inline ovstage_population_enqueue_result_t ovstage_population_open_usd_from_file_with_desc(
         ovstage_instance_t*                    stage,
         ovx_string_t                           path,
         ovstage_ordinal_t                      ordinal,
         double                                 time,
         const ovstage_population_desc_t*       descs,
-        size_t                                 desc_count);
+        size_t                                 desc_count)
+    {
+        return ovstage_population_open_usd_from_file_with_desc_ex(
+            stage != NULL ? &stage->ext_instances.population : NULL,
+            path, ordinal, time, descs, desc_count);
+    }
+
+    /** @brief The pair form of ovstage_population_open_usd_from_string_with_desc:
+     *         the same call on the population instance,
+     *         `&stage->ext_instances.population`. C++ overloads
+     *         ovstage_population_open_usd_from_string_with_desc for this receiver. */
+    static inline ovstage_population_enqueue_result_t ovstage_population_open_usd_from_string_with_desc_ex(
+        ovstage_population_instance_t*         population,
+        ovx_string_t                           usda,
+        ovstage_ordinal_t                      ordinal,
+        double                                 time,
+        const ovstage_population_desc_t*       descs,
+        size_t                                 desc_count)
+    {
+        if (population == NULL)
+        {
+            ovstage_population_enqueue_result_t rejected;
+            rejected.status = OVSTAGE_ERROR_INVALID_ARGUMENT;
+            rejected.op_index = OVSTAGE_POPULATION_INVALID_OP_ID;
+            return rejected;
+        }
+        return population->vtable->open_usd_from_string_with_desc(
+            population->context, usda, ordinal, time, descs, desc_count);
+    }
 
     /**
      * Enqueue an asynchronous operation to populate an ovstage instance from an
@@ -662,8 +636,8 @@ extern "C"
      * @param usda       USDA content (e.g. "#usda 1.0\n...") as an `ovx_string_t` view.
      * @param ordinal    Accumulating ordinal owned by the caller. Must be
      *                   greater than the effective write floor at execution
-     *                   time; a new instance's floor is 0, so initial
-     *                   population starts at 1.
+     *                   time. A new instance starts at `OVSTAGE_ORDINAL_MIN`;
+     *                   negative values above that minimum and zero are valid.
      * @param time       Time in seconds; converted to a USD time code via the
      *                   stage's timeCodesPerSecond.
      *                   `OVSTAGE_POPULATION_DEFAULT_TIME` evaluates at USD's
@@ -684,13 +658,40 @@ extern "C"
      *  reported by `ovstage_population_wait_op` carries no such guarantee:
      *  repopulate at a higher ordinal.
      */
-    ovstage_population_enqueue_result_t ovstage_population_open_usd_from_string_with_desc(
+    static inline ovstage_population_enqueue_result_t ovstage_population_open_usd_from_string_with_desc(
         ovstage_instance_t*                    stage,
         ovx_string_t                           usda,
         ovstage_ordinal_t                      ordinal,
         double                                 time,
         const ovstage_population_desc_t*       descs,
-        size_t                                 desc_count);
+        size_t                                 desc_count)
+    {
+        return ovstage_population_open_usd_from_string_with_desc_ex(
+            stage != NULL ? &stage->ext_instances.population : NULL,
+            usda, ordinal, time, descs, desc_count);
+    }
+
+    /** @brief The pair form of ovstage_population_repopulate_usd_with_desc: the same
+     *         call on the population instance, `&stage->ext_instances.population`.
+     *         C++ overloads ovstage_population_repopulate_usd_with_desc for this
+     *         receiver. */
+    static inline ovstage_population_enqueue_result_t ovstage_population_repopulate_usd_with_desc_ex(
+        ovstage_population_instance_t*   population,
+        ovstage_ordinal_t                ordinal,
+        double                           time,
+        const ovstage_population_desc_t* descs,
+        size_t                           desc_count)
+    {
+        if (population == NULL)
+        {
+            ovstage_population_enqueue_result_t rejected;
+            rejected.status = OVSTAGE_ERROR_INVALID_ARGUMENT;
+            rejected.op_index = OVSTAGE_POPULATION_INVALID_OP_ID;
+            return rejected;
+        }
+        return population->vtable->repopulate_usd_with_desc(
+            population->context, ordinal, time, descs, desc_count);
+    }
 
     /**
      * Enqueue a wholesale population from the stage's current USD source,
@@ -720,12 +721,40 @@ extern "C"
      *         OVSTAGE_ERROR_INVALID_ARGUMENT. Await an accepted operation using
      *         ovstage_population_wait_op.
      */
-    ovstage_population_enqueue_result_t ovstage_population_repopulate_usd_with_desc(
+    static inline ovstage_population_enqueue_result_t ovstage_population_repopulate_usd_with_desc(
         ovstage_instance_t* stage,
         ovstage_ordinal_t   ordinal,
         double              time,
         const ovstage_population_desc_t* descs,
-        size_t              desc_count);
+        size_t              desc_count)
+    {
+        return ovstage_population_repopulate_usd_with_desc_ex(
+            stage != NULL ? &stage->ext_instances.population : NULL,
+            ordinal, time, descs, desc_count);
+    }
+
+    /** @brief The pair form of ovstage_population_add_usd_reference_from_file: the
+     *         same call on the population instance,
+     *         `&stage->ext_instances.population`. C++ overloads
+     *         ovstage_population_add_usd_reference_from_file for this receiver. */
+    static inline ovstage_population_enqueue_result_t ovstage_population_add_usd_reference_from_file_ex(
+        ovstage_population_instance_t*   population,
+        ovx_string_t                     ref_file_path,
+        ovx_string_t                     target_path,
+        ovstage_population_usd_reference_handle_t* out_handle)
+    {
+        if (population == NULL)
+        {
+            ovstage_population_enqueue_result_t rejected;
+            if (out_handle != NULL)
+                *out_handle = OVSTAGE_POPULATION_INVALID_USD_REFERENCE_HANDLE;
+            rejected.status = OVSTAGE_ERROR_INVALID_ARGUMENT;
+            rejected.op_index = OVSTAGE_POPULATION_INVALID_OP_ID;
+            return rejected;
+        }
+        return population->vtable->add_usd_reference_from_file(
+            population->context, ref_file_path, target_path, out_handle);
+    }
 
     /**
      * Enqueue an asynchronous operation to add a USD file as a reference at
@@ -755,9 +784,23 @@ extern "C"
      * republishing existing prims, target a not-yet-existing prim path.
      *
      * @param stage         ovstage instance.
-     * @param ref_file_path Filesystem path to a `.usda` / `.usdc` / `.usd` file, or an
-     *                    Omniverse Nucleus URL (`omniverse://<server>/<path>.usd`), as an
-     *                    `ovx_string_t` view — the layer to reference.
+     * @param ref_file_path Filesystem path to a `.usda` / `.usdc` / `.usd` file, an
+     *                    Omniverse Nucleus URL (`omniverse://<server>/<path>.usd`), or
+     *                    any other identifier a registered OpenUSD resolver opens (a
+     *                    context-dependent resolver sees the resolver context the
+     *                    instance captured at creation), as an `ovx_string_t` view —
+     *                    the layer to reference. A relative filesystem path is
+     *                    anchored to the process working directory at the time
+     *                    of the call; when the population worker opens the
+     *                    layer and that anchored path exists, it opens the
+     *                    absolute path, keeping file-format arguments and a
+     *                    package-relative suffix (for `pkg.usdz[inner.usda]`
+     *                    the outer package is the path that must exist); a
+     *                    failed open of the anchored path is reported with that
+     *                    absolute path. Otherwise, for every URI, and on
+     *                    Windows with OpenUSD releases before 26.08 for an
+     *                    absolute form of 260 characters or more, the
+     *                    identifier reaches the resolver unchanged.
      * @param target_path Absolute path (starting with '/') selecting how the content
      *                    is merged, additively in every case:
      *                    - the root "/" — the content is merged in at the top level
@@ -770,9 +813,12 @@ extern "C"
      *                      (any missing ancestors are defined) and the layer referenced on it.
      * @param out_handle  [out, optional] Receives a handle for the added reference,
      *                    reserved synchronously (valid before the op runs) for a
-     *                    later `ovstage_population_remove_usd_reference`. Set to
+     *                    later `ovstage_population_remove_usd_reference`. An
+     *                    implementation that does not serve this function returns
+     *                    `OVSTAGE_ERROR_NOT_SUPPORTED` and leaves it unchanged. Set to
      *                    `OVSTAGE_POPULATION_INVALID_USD_REFERENCE_HANDLE` if the enqueue is
-     *                    rejected. A non-invalid handle does not by itself mean the
+     *                    rejected for any other reason.
+     *                    A non-invalid handle does not by itself mean the
      *                    reference was added — await the op to confirm.
      * @return Enqueue result (see `ovstage_population_enqueue_result_t`). A
      *  rejected enqueue is reported in `status`; failures while the op runs —
@@ -780,11 +826,39 @@ extern "C"
      *  are surfaced by `ovstage_population_wait_op`, with detail in
      *  `ovstage_population_get_last_error`.
      */
-    ovstage_population_enqueue_result_t ovstage_population_add_usd_reference_from_file(
+    static inline ovstage_population_enqueue_result_t ovstage_population_add_usd_reference_from_file(
         ovstage_instance_t*              stage,
         ovx_string_t                     ref_file_path,
         ovx_string_t                     target_path,
-        ovstage_population_usd_reference_handle_t* out_handle);
+        ovstage_population_usd_reference_handle_t* out_handle)
+    {
+        return ovstage_population_add_usd_reference_from_file_ex(
+            stage != NULL ? &stage->ext_instances.population : NULL,
+            ref_file_path, target_path, out_handle);
+    }
+
+    /** @brief The pair form of ovstage_population_add_usd_reference_from_string: the
+     *         same call on the population instance,
+     *         `&stage->ext_instances.population`. C++ overloads
+     *         ovstage_population_add_usd_reference_from_string for this receiver. */
+    static inline ovstage_population_enqueue_result_t ovstage_population_add_usd_reference_from_string_ex(
+        ovstage_population_instance_t*   population,
+        ovx_string_t                     ref_str,
+        ovx_string_t                     target_path,
+        ovstage_population_usd_reference_handle_t* out_handle)
+    {
+        if (population == NULL)
+        {
+            ovstage_population_enqueue_result_t rejected;
+            if (out_handle != NULL)
+                *out_handle = OVSTAGE_POPULATION_INVALID_USD_REFERENCE_HANDLE;
+            rejected.status = OVSTAGE_ERROR_INVALID_ARGUMENT;
+            rejected.op_index = OVSTAGE_POPULATION_INVALID_OP_ID;
+            return rejected;
+        }
+        return population->vtable->add_usd_reference_from_string(
+            population->context, ref_str, target_path, out_handle);
+    }
 
     /**
      * Enqueue an asynchronous operation to add inline USDA content as a reference
@@ -814,11 +888,34 @@ extern "C"
      *  path — are surfaced by `ovstage_population_wait_op`, with detail in
      *  `ovstage_population_get_last_error`.
      */
-    ovstage_population_enqueue_result_t ovstage_population_add_usd_reference_from_string(
+    static inline ovstage_population_enqueue_result_t ovstage_population_add_usd_reference_from_string(
         ovstage_instance_t*              stage,
         ovx_string_t                     ref_str,
         ovx_string_t                     target_path,
-        ovstage_population_usd_reference_handle_t* out_handle);
+        ovstage_population_usd_reference_handle_t* out_handle)
+    {
+        return ovstage_population_add_usd_reference_from_string_ex(
+            stage != NULL ? &stage->ext_instances.population : NULL,
+            ref_str, target_path, out_handle);
+    }
+
+    /** @brief The pair form of ovstage_population_remove_usd_reference: the same
+     *         call on the population instance, `&stage->ext_instances.population`.
+     *         C++ overloads ovstage_population_remove_usd_reference for this
+     *         receiver. */
+    static inline ovstage_population_enqueue_result_t ovstage_population_remove_usd_reference_ex(
+        ovstage_population_instance_t*  population,
+        ovstage_population_usd_reference_handle_t handle)
+    {
+        if (population == NULL)
+        {
+            ovstage_population_enqueue_result_t rejected;
+            rejected.status = OVSTAGE_ERROR_INVALID_ARGUMENT;
+            rejected.op_index = OVSTAGE_POPULATION_INVALID_OP_ID;
+            return rejected;
+        }
+        return population->vtable->remove_usd_reference(population->context, handle);
+    }
 
     /**
      * Enqueue an asynchronous operation to remove a USD reference previously added
@@ -829,8 +926,10 @@ extern "C"
      * subtree); a reference the add placed onto a pre-existing prim is removed on its
      * own, leaving that prim and its prior content in place; a root "/" merge removes
      * just the sublayer the add inserted. Like the add, it does not itself touch the
-     * ovstage; call `ovstage_population_apply_usd_changes` afterwards to propagate the
-     * removal (the affected prims are tombstoned out of the ovstage). For an inline
+     * ovstage; call `ovstage_population_apply_usd_changes` afterwards; it applies the
+     * removal to the ovstage and removes the prims that no longer exist in USD. With
+     * `OVSTAGE_POPULATION_DOMAIN_RENDERING`, a range read gives no `usd-path`
+     * tombstone for those prims. For an inline
      * (`_from_string`) reference this also releases the held layer. Carries no ordinal.
      *
      * @param stage   ovstage instance.
@@ -842,9 +941,29 @@ extern "C"
      *  `status`; a run-time failure (unknown/already-removed handle, or the prim
      *  could not be removed) is surfaced by `ovstage_population_wait_op`.
      */
-    ovstage_population_enqueue_result_t ovstage_population_remove_usd_reference(
+    static inline ovstage_population_enqueue_result_t ovstage_population_remove_usd_reference(
         ovstage_instance_t*             stage,
-        ovstage_population_usd_reference_handle_t handle);
+        ovstage_population_usd_reference_handle_t handle)
+    {
+        return ovstage_population_remove_usd_reference_ex(
+            stage != NULL ? &stage->ext_instances.population : NULL, handle);
+    }
+
+    /** @brief The pair form of ovstage_population_reset_usd: the same call on the
+     *         population instance, `&stage->ext_instances.population`. C++
+     *         overloads ovstage_population_reset_usd for this receiver. */
+    static inline ovstage_population_enqueue_result_t ovstage_population_reset_usd_ex(
+        ovstage_population_instance_t* population)
+    {
+        if (population == NULL)
+        {
+            ovstage_population_enqueue_result_t rejected;
+            rejected.status = OVSTAGE_ERROR_INVALID_ARGUMENT;
+            rejected.op_index = OVSTAGE_POPULATION_INVALID_OP_ID;
+            return rejected;
+        }
+        return population->vtable->reset_usd(population->context);
+    }
 
     /**
      * Enqueue an asynchronous operation to reset (clear) all USD source content
@@ -854,7 +973,9 @@ extern "C"
      * only the USD source. Call `ovstage_population_apply_usd_changes` afterwards to
      * propagate the cleared state into the ovstage: until something does, what was
      * populated from the old source is still there, and a later open merges into it
-     * rather than replacing it. Carries no ordinal.
+     * rather than replacing it. With `OVSTAGE_POPULATION_DOMAIN_RENDERING`, a range
+     * read gives no `usd-path` tombstone for the prims that apply removes. Carries
+     * no ordinal.
      *
      * @remark Only USD source content is cleared. With the RENDERING domain
      *  populated, the few prims the runtime currently maintains for its own
@@ -867,8 +988,30 @@ extern "C"
      *  rejected enqueue (no population state) is reported in `status`; a run-time
      *  failure is surfaced by `ovstage_population_wait_op`.
      */
-    ovstage_population_enqueue_result_t ovstage_population_reset_usd(
-        ovstage_instance_t* stage);
+    static inline ovstage_population_enqueue_result_t ovstage_population_reset_usd(
+        ovstage_instance_t* stage)
+    {
+        return ovstage_population_reset_usd_ex(
+            stage != NULL ? &stage->ext_instances.population : NULL);
+    }
+
+    /** @brief The pair form of ovstage_population_apply_usd_time: the same call on
+     *         the population instance, `&stage->ext_instances.population`. C++
+     *         overloads ovstage_population_apply_usd_time for this receiver. */
+    static inline ovstage_population_enqueue_result_t ovstage_population_apply_usd_time_ex(
+        ovstage_population_instance_t* population,
+        ovstage_ordinal_t              ordinal,
+        double                         time)
+    {
+        if (population == NULL)
+        {
+            ovstage_population_enqueue_result_t rejected;
+            rejected.status = OVSTAGE_ERROR_INVALID_ARGUMENT;
+            rejected.op_index = OVSTAGE_POPULATION_INVALID_OP_ID;
+            return rejected;
+        }
+        return population->vtable->apply_usd_time(population->context, ordinal, time);
+    }
 
     /**
      * Enqueue an asynchronous operation to advance the time and propagate
@@ -914,10 +1057,31 @@ extern "C"
      *  rejected enqueue (no population state) is reported in `status`; a run-time
      *  failure is surfaced by `ovstage_population_wait_op`.
      */
-    ovstage_population_enqueue_result_t ovstage_population_apply_usd_time(
+    static inline ovstage_population_enqueue_result_t ovstage_population_apply_usd_time(
         ovstage_instance_t* stage,
         ovstage_ordinal_t   ordinal,
-        double              time);
+        double              time)
+    {
+        return ovstage_population_apply_usd_time_ex(
+            stage != NULL ? &stage->ext_instances.population : NULL, ordinal, time);
+    }
+
+    /** @brief The pair form of ovstage_population_apply_usd_changes: the same call
+     *         on the population instance, `&stage->ext_instances.population`. C++
+     *         overloads ovstage_population_apply_usd_changes for this receiver. */
+    static inline ovstage_population_enqueue_result_t ovstage_population_apply_usd_changes_ex(
+        ovstage_population_instance_t* population,
+        ovstage_ordinal_t              ordinal)
+    {
+        if (population == NULL)
+        {
+            ovstage_population_enqueue_result_t rejected;
+            rejected.status = OVSTAGE_ERROR_INVALID_ARGUMENT;
+            rejected.op_index = OVSTAGE_POPULATION_INVALID_OP_ID;
+            return rejected;
+        }
+        return population->vtable->apply_usd_changes(population->context, ordinal);
+    }
 
     /**
      * Enqueue an asynchronous operation to propagate any USD edits accumulated
@@ -939,9 +1103,35 @@ extern "C"
      *  failure is surfaced by `ovstage_population_wait_op`. A no-op (nothing
      *  changed) returns `OVSTAGE_OK`.
      */
-    ovstage_population_enqueue_result_t ovstage_population_apply_usd_changes(
+    static inline ovstage_population_enqueue_result_t ovstage_population_apply_usd_changes(
         ovstage_instance_t* stage,
-        ovstage_ordinal_t   ordinal);
+        ovstage_ordinal_t   ordinal)
+    {
+        return ovstage_population_apply_usd_changes_ex(
+            stage != NULL ? &stage->ext_instances.population : NULL, ordinal);
+    }
+
+    /** @brief The pair form of ovstage_population_wait_op: the same call on the
+     *         population instance, `&stage->ext_instances.population`. C++
+     *         overloads ovstage_population_wait_op for this receiver. */
+    static inline ovstage_api_status_t ovstage_population_wait_op_ex(
+        ovstage_population_instance_t*       population,
+        ovstage_population_op_id_t           op_id,
+        ovstage_timeout_ns_t                 timeout_ns,
+        ovstage_population_op_wait_result_t* out_wait_result)
+    {
+        if (population == NULL)
+        {
+            if (out_wait_result != NULL)
+            {
+                out_wait_result->error_op_ids = NULL;
+                out_wait_result->error_op_id_count = 0;
+                out_wait_result->lowest_pending_op_id = OVSTAGE_POPULATION_INVALID_OP_ID;
+            }
+            return OVSTAGE_ERROR_INVALID_ARGUMENT;
+        }
+        return population->vtable->wait_op(population->context, op_id, timeout_ns, out_wait_result);
+    }
 
     /**
      * Wait for completion of all operations up to and including @p op_id, or until
@@ -971,19 +1161,28 @@ extern "C"
      *    instance, or issued by a stream this instance has since replaced.
      *  - `OVSTAGE_ERROR_NOT_FOUND` if @p stage has no population state (no
      *    `_open_usd_*` has run on it).
+     *  - `OVSTAGE_ERROR_INVALID_ARGUMENT` if @p stage is NULL. The wrapper then
+     *    writes `{NULL, 0, OVSTAGE_POPULATION_INVALID_OP_ID}` to @p out_wait_result.
      */
-    ovstage_api_status_t ovstage_population_wait_op(
+    static inline ovstage_api_status_t ovstage_population_wait_op(
         ovstage_instance_t*                  stage,
         ovstage_population_op_id_t           op_id,
         ovstage_timeout_ns_t                 timeout_ns,
-        ovstage_population_op_wait_result_t* out_wait_result);
+        ovstage_population_op_wait_result_t* out_wait_result)
+    {
+        return ovstage_population_wait_op_ex(
+            stage != NULL ? &stage->ext_instances.population : NULL,
+            op_id, timeout_ns, out_wait_result);
+    }
 
     /** Returns the thread-local error string for the latest population call on
      *  this thread, regardless of which ovstage instance produced it. For an
      *  op that failed asynchronously, this holds the primary failure only after
      *  `ovstage_population_wait_op` has observed it on this thread; for a rejected
-     *  enqueue it is set on return. Valid until the next population call on the
-     *  same thread. Returns `{NULL, 0}` when no error has been recorded. */
+     *  enqueue it is set on return. A call with a NULL stage is rejected by the
+     *  wrapper in this header and records no error string. Valid until the next
+     *  population call on the same thread. Returns `{NULL, 0}` when no error has
+     *  been recorded. */
     ovx_string_t ovstage_population_get_last_error(void);
 
     /** Returns the human-readable error string for @p op_id, as reported by the
@@ -994,6 +1193,96 @@ extern "C"
     ovx_string_t ovstage_population_get_last_op_error(ovstage_population_op_id_t op_id);
 
 #ifdef __cplusplus
+} /* extern "C" */
+
+/* C++ spells the pair form with the name of the instance form. A literal NULL or
+ * nullptr first argument is ambiguous between the two receivers: pass a
+ * typed null, or call the _ex form. */
+inline ovstage_population_enqueue_result_t ovstage_population_open_usd_from_file(
+    ovstage_population_instance_t* population, ovx_string_t path,
+    ovstage_ordinal_t ordinal, double time, uint32_t domains)
+{
+    return ovstage_population_open_usd_from_file_ex(population, path, ordinal, time, domains);
+}
+
+inline ovstage_population_enqueue_result_t ovstage_population_open_usd_from_string(
+    ovstage_population_instance_t* population, ovx_string_t usda,
+    ovstage_ordinal_t ordinal, double time, uint32_t domains)
+{
+    return ovstage_population_open_usd_from_string_ex(population, usda, ordinal, time, domains);
+}
+
+inline ovstage_population_enqueue_result_t ovstage_population_open_usd_from_file_with_desc(
+    ovstage_population_instance_t* population, ovx_string_t path,
+    ovstage_ordinal_t ordinal, double time,
+    const ovstage_population_desc_t* descs, size_t desc_count)
+{
+    return ovstage_population_open_usd_from_file_with_desc_ex(
+        population, path, ordinal, time, descs, desc_count);
+}
+
+inline ovstage_population_enqueue_result_t ovstage_population_open_usd_from_string_with_desc(
+    ovstage_population_instance_t* population, ovx_string_t usda,
+    ovstage_ordinal_t ordinal, double time,
+    const ovstage_population_desc_t* descs, size_t desc_count)
+{
+    return ovstage_population_open_usd_from_string_with_desc_ex(
+        population, usda, ordinal, time, descs, desc_count);
+}
+
+inline ovstage_population_enqueue_result_t ovstage_population_repopulate_usd_with_desc(
+    ovstage_population_instance_t* population, ovstage_ordinal_t ordinal,
+    double time, const ovstage_population_desc_t* descs, size_t desc_count)
+{
+    return ovstage_population_repopulate_usd_with_desc_ex(
+        population, ordinal, time, descs, desc_count);
+}
+
+inline ovstage_population_enqueue_result_t ovstage_population_add_usd_reference_from_file(
+    ovstage_population_instance_t* population, ovx_string_t ref_file_path,
+    ovx_string_t target_path, ovstage_population_usd_reference_handle_t* out_handle)
+{
+    return ovstage_population_add_usd_reference_from_file_ex(
+        population, ref_file_path, target_path, out_handle);
+}
+
+inline ovstage_population_enqueue_result_t ovstage_population_add_usd_reference_from_string(
+    ovstage_population_instance_t* population, ovx_string_t ref_str,
+    ovx_string_t target_path, ovstage_population_usd_reference_handle_t* out_handle)
+{
+    return ovstage_population_add_usd_reference_from_string_ex(
+        population, ref_str, target_path, out_handle);
+}
+
+inline ovstage_population_enqueue_result_t ovstage_population_remove_usd_reference(
+    ovstage_population_instance_t* population, ovstage_population_usd_reference_handle_t handle)
+{
+    return ovstage_population_remove_usd_reference_ex(population, handle);
+}
+
+inline ovstage_population_enqueue_result_t ovstage_population_reset_usd(
+    ovstage_population_instance_t* population)
+{
+    return ovstage_population_reset_usd_ex(population);
+}
+
+inline ovstage_population_enqueue_result_t ovstage_population_apply_usd_time(
+    ovstage_population_instance_t* population, ovstage_ordinal_t ordinal, double time)
+{
+    return ovstage_population_apply_usd_time_ex(population, ordinal, time);
+}
+
+inline ovstage_population_enqueue_result_t ovstage_population_apply_usd_changes(
+    ovstage_population_instance_t* population, ovstage_ordinal_t ordinal)
+{
+    return ovstage_population_apply_usd_changes_ex(population, ordinal);
+}
+
+inline ovstage_api_status_t ovstage_population_wait_op(
+    ovstage_population_instance_t* population, ovstage_population_op_id_t op_id,
+    ovstage_timeout_ns_t timeout_ns, ovstage_population_op_wait_result_t* out_wait_result)
+{
+    return ovstage_population_wait_op_ex(population, op_id, timeout_ns, out_wait_result);
 }
 #endif
 

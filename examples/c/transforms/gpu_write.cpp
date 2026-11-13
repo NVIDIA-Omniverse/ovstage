@@ -16,7 +16,9 @@
 #include "../common/ovstage_example_utils.h"
 
 // [snippet:gpu-transform-write-c]
-// Write caller-owned CUDA buffers after the producer event, with no CPU readback.
+/// Write one row-major float64 matrix and boolean reset flag per queried prim from CUDA deviceId, then compute the hierarchy at ordinal.
+/// Record readyEvent after producing both buffers; keep the buffers and event valid and unchanged until this function returns.
+/// Require a populated hierarchy with derived-output rows. Throw if GPU_GLOBAL is unavailable; other API failures use the example's checks. Return after writes, write-floor advance, and computation complete.
 void writeGpuTransforms(ovstage_instance_t* stage, ovstage_query_handle_t query,
                        double* deviceMatrices, bool* deviceResetFlags,
                        int64_t primCount, int deviceId, ovstage_ordinal_t ordinal,
@@ -32,8 +34,7 @@ void writeGpuTransforms(ovstage_instance_t* stage, ovstage_query_handle_t query,
         supported = supported || models[i].model_id == model;
     if (!supported)
     {
-        std::fprintf(stderr, "GPU global hierarchy computation is unavailable\n");
-        std::exit(EXIT_FAILURE);
+        fail("GPU global hierarchy computation is unavailable");
     }
 
     // Dense query order: one row-major 4x4 matrix and one bool per prim.

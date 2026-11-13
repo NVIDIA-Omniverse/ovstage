@@ -10,7 +10,7 @@
 # its affiliates is strictly prohibited.
 name: string-handling
 description: >
-  Working with ovx_string_t and ovx_string_or_token_t in ovstage (C / C++). Use when
+  Working with ovx_string_t and ovx_token_or_string_t in ovstage (C / C++). Use when
   user asks about passing or comparing strings, attribute names, or prim paths, or
   about choosing between a raw string and a pre-resolved path-dictionary token.
 license: LicenseRef-NvidiaProprietary
@@ -30,20 +30,20 @@ tools:
 ## When to Use
 
 Use this skill when the user asks about passing, printing, or comparing ovstage strings,
-or about the dual-mode `ovx_string_or_token_t` arguments (attribute names, filter
+or about the dual-mode `ovx_token_or_string_t` arguments (attribute names, filter
 attributes, prim paths) that accept either a raw string or a pre-resolved path-dictionary
-token. Covers both the **C/C++** surface (`ovx_string_t` / `ovx_string_or_token_t`) and the
-**Python** bindings (plain `str` vs. interned `int` token) — see the Python section.
+token. Covers both the **C/C++** surface (`ovx_string_t` / `ovx_token_or_string_t`) and the
+**Python** bindings (plain `str` vs. interned `Token`) — see the Python section.
 
 ## Inputs
 
 Resolve inputs in this order: existing repository files and referenced snippets, explicit user request, then broader agent context.
 
-- Target API surface: C/C++ (`ovx_string_t` / `ovx_string_or_token_t`) or Python (the
-  `ovstage` bindings, where strings are plain `str` and tokens are interned `int`s).
+- Target API surface: C/C++ (`ovx_string_t` / `ovx_token_or_string_t`) or Python (the
+  `ovstage` bindings, where strings are plain `str` and tokens are `Token` handles).
 - Source of the `ovx_string_t`: a literal/attribute name the caller is passing in, a
   prim path, or a string view returned from the path dictionary.
-- Whether an argument is plain `ovx_string_t` or dual-mode `ovx_string_or_token_t`, and
+- Whether an argument is plain `ovx_string_t` or dual-mode `ovx_token_or_string_t`, and
   whether the caller already holds an interned `ovx_token_t`.
 - Required operation: construct, print, compare, convert to `std::string_view`, or copy
   to owning storage.
@@ -59,12 +59,12 @@ Resolve inputs in this order: existing repository files and referenced snippets,
 - Treat `ovx_string_t` as a **non-owning** view: the caller owns the pointed-to memory,
   and the bytes are not required to be null-terminated.
 - For dual-mode arguments, know whether the caller has a token already; if not, leave
-  `token = 0` and the string is resolved through the dictionary at call time.
+  a non-null `string.ptr` and the string is resolved through the dictionary at call time.
 
 ## Instructions
 
 1. Identify whether the task is constructing, printing, comparing, or converting an
-   `ovx_string_t`, or whether it concerns the dual-mode `ovx_string_or_token_t`.
+   `ovx_string_t`, or whether it concerns the dual-mode `ovx_token_or_string_t`.
 2. Always use both the pointer and length (`ptr`/`length`); never
    assume a null terminator. `length` is bytes, not code points.
 3. In C, print with a precision-limited format (`%.*s` with `(int)length, ptr`) and compare
@@ -72,9 +72,9 @@ Resolve inputs in this order: existing repository files and referenced snippets,
    unsafe — a shorter string prefix-matches).
 4. In C++, prefer `std::string_view{ s.ptr, s.length }` for borrowed access, and copy
    (`std::string`) if the value must outlive the source buffer.
-5. For `ovx_string_or_token_t`, set `token` (non-zero) for repeated/hot-path identity
-   use to skip per-call string hashing; otherwise leave `token = 0` and populate
-   `string`. See the `path-dictionary` skill for interning and the cost model.
+5. For `ovx_token_or_string_t`, a non-null `string.ptr` selects `string`, even when
+   its length is zero. To reuse an interned `token`, leave `string.ptr = NULL`.
+   See the `path-dictionary` skill for interning and the cost model.
 6. When changing code, run the narrow ovstage unit test that exercises the referenced
    string pattern whenever practical.
 
@@ -95,8 +95,8 @@ This skill has no scripts.
   and `ovstage_get_last_error()` return `ovx_string_t`, so this skill's view/print/lifetime
   guidance applies to both. The exception is `ovstage_get_error_string(instance, code)`,
   which returns a static `const char*` (never NULL). See the `error-handling` skill.
-- **Python:** covered in the Python section (plain `str` ↔ interned `int` token; no
-  `ovx_string_t` in Python). Inline Python pending a shipping Python example to snippet-source.
+- **Python:** covered in the Python section (plain `str` ↔ interned `Token`; no
+  `ovx_string_t` in Python).
 
 ## Overview
 
@@ -117,10 +117,12 @@ but a non-empty view the library **returns** (e.g. `get_last_error`,
 can go straight to libc C-string functions. A `{ NULL, 0 }` return means "no value".
 
 Many ovstage entry points (attribute names, filter attributes, prim paths) take
-`ovx_string_or_token_t` — a dual-mode value carrying either a pre-resolved
-`ovx_token_t` or an `ovx_string_t`. If `token != 0` the token is used directly; if
-`token == 0` the `string` is resolved through the path dictionary at call time.
-Pre-resolving the token avoids per-call string hashing in hot loops.
+`ovx_token_or_string_t`, which has a `token` field and a `string` field.
+If `string.ptr` is non-null, the API uses the string and its length and ignores
+`token`. This includes an empty string with a non-null pointer and length zero.
+Otherwise, it uses `token`: ID `0` represents the empty string, and
+`OVX_INVALID_TOKEN` is invalid. For repeated calls, look up the token ID once
+and reuse it with `string.ptr = NULL`.
 
 ## C
 
@@ -132,9 +134,9 @@ terminating NUL):
 ovx_string_t name = literal_to_ovx_string("points");
 ```
 
-The macro expands to C++ brace-init syntax (`ovx_string_t{ (str), sizeof(str) - 1 }`),
-and the shipped examples compile as C++. In a pure-C translation unit, or for
-non-literal bounded storage, use an explicit `{ ptr, length }` construction instead:
+The macro supports both C and C++: it uses a C compound literal or C++ brace
+initialization, respectively. It accepts string literals only. Explicit `{ ptr, length }`
+initialization also works, and is appropriate for non-literal bounded storage:
 
 ```c
 ovx_string_t name = { "points", sizeof("points") - 1 };  /* literal, plain C */
@@ -153,8 +155,8 @@ printf("%.*s\n", (int)name.length, name.ptr);
 Compare by checking `length` first, then `memcmp` over exactly `length` bytes — do
 not rely on a null terminator, and avoid `strncmp` (a shorter string prefix-matches).
 
-Build a dual-mode argument from a string (token left `0` so the string is resolved); set
-`token` instead when you already hold an interned handle:
+Build a dual-mode argument by setting `string.ptr` and `string.length`. To use an
+interned handle instead, set `token` and leave `string.ptr` null:
 
 > **Source:** `examples/c/minimal/main.cpp` snippet `string-or-token-arg`
 
@@ -172,19 +174,19 @@ std::string_view view{ s.ptr, s.length };
 ## Python
 
 In Python there is **no `ovx_string_t`** — the binding handles encoding, so you pass and
-receive plain `str`. The string-vs-token duality maps to **`str` vs. interned `int`
-token**: API methods accept `Union[int, str]` for names/paths, and the `PathDictionary`
+receive plain `str`. The string-vs-token duality maps to **`str` vs. interned `Token`
+token**: API methods accept `Union[Token, str]` for names/paths, and the `PathDictionary`
 interns/resolves between them.
 
 > **Source:** `examples/python/minimal/main.py` snippet `intern-and-resolve`
 >
 > Followed by: `examples/python/minimal/main.py` snippet `string-or-token-arg`
 
-Both forms are accepted where the C API takes `ovx_string_or_token_t`: a pre-interned token
+Both forms are accepted where the C API takes `ovx_token_or_string_t`: a pre-interned token
 (cheaper — `minimal-write-read` writes with the token) or a raw `str`, interned each call
 (`string-or-token-arg`).
 
-Prefer the interned `int` token for repeated/hot-path use (skips per-call hashing); use a
+Prefer the interned `Token` for repeated/hot-path use (skips per-call hashing); use a
 raw `str` for one-shot calls. See the `path-dictionary` skill for interning details.
 
 ## Key Types / Functions
@@ -193,8 +195,8 @@ raw `str` for one-shot calls. See the `path-dictionary` skill for interning deta
 |------|--------|-------|
 | `ovx_string_t` | `<ovx/string_types.h>` | non-owning `(ptr, length)`; `length` is bytes |
 | `literal_to_ovx_string(str)` | `<ovx/types.h>` | creates `ovx_string_t` from a string literal (compile-time `sizeof` length) |
-| `ovx_string_or_token_t` | `<ovx/string_types.h>` | dual-mode: `token != 0` uses token, else `string` |
-| `ovx_token_t` | `<ovx/string_types.h>` | interned handle; `0` is the unresolved sentinel |
+| `ovx_token_or_string_t` | `<ovx/string_types.h>` | a non-null `string.ptr` selects `string`; otherwise use `token` |
+| `ovx_token_t` | `<ovx/string_types.h>` | Empty strings have token ID `0`. `OVX_INVALID_TOKEN` is `UINT64_MAX`. |
 
 ## Troubleshooting
 
@@ -204,8 +206,8 @@ raw `str` for one-shot calls. See the `path-dictionary` skill for interning deta
   `std::string_view`. (Library-**returned** views are null-terminated; see above.)
 - `length` is a **byte** count, not a code-point count — slicing at `length` is byte-exact
   but not character-aware.
-- For `ovx_string_or_token_t`, a non-zero `token` takes precedence and the `string` field
-  is ignored. Leave `token = 0` unless you intend to use an interned handle.
+- For `ovx_token_or_string_t`, a non-null `string.ptr` takes precedence over
+  `token`, even for an empty string. Token-only arguments must leave that pointer null.
 - A string view returned from the path dictionary is valid for the dictionary's lifetime;
   copy it if you need to outlive that.
 

@@ -80,8 +80,8 @@ static void translationMatrix(double tx, double ty, double tz, double* m)
     m[14] = tz;
 }
 
-// cpuFloatTensor's sibling for token-id columns: uint64 ids, one lane.
-static DLTensor cpuTokenTensor(uint64_t* ids, const int64_t* shape, const int64_t* strides)
+// Token handles retain their C++ type; DLPack describes their uint64 storage.
+static DLTensor cpuTokenTensor(ovx_token_t* ids, const int64_t* shape, const int64_t* strides)
 {
     DLTensor tensor{};
     tensor.data = ids;
@@ -209,26 +209,28 @@ static bool tryReadWorldTranslation(ovstage_instance_t* stage, path_dictionary_i
     waitOp(stage, enq, "read_attributes");
 
     bool found = false;
+    size_t fetchedGroupCount = 0;
     ovstage_read_group_t group{};
-    const ovstage_api_status_t fetched = ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group);
+    const ovstage_api_status_t fetched =
+        ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group, 1, &fetchedGroupCount);
     if (fetched == OVSTAGE_OK)
     {
         // This single-prim query must yield one scalar-lane float64 4x4 matrix row.
-        if (group.data.tensor_count != 1 || !group.data.tensors[0].data || group.data.tensors[0].ndim != 3 ||
-            !group.data.tensors[0].shape || group.data.tensors[0].shape[0] != 1 ||
-            group.data.tensors[0].shape[1] != 4 || group.data.tensors[0].shape[2] != 4 ||
-            group.data.tensors[0].dtype.code != kDLFloat || group.data.tensors[0].dtype.bits != 64 ||
-            group.data.tensors[0].dtype.lanes != 1)
+        if (group.column_count != 1 || !group.columns || group.columns[0].data.tensor_count != 1 || !group.columns[0].data.tensors[0].data || group.columns[0].data.tensors[0].ndim != 3 ||
+            !group.columns[0].data.tensors[0].shape || group.columns[0].data.tensors[0].shape[0] != 1 ||
+            group.columns[0].data.tensors[0].shape[1] != 4 || group.columns[0].data.tensors[0].shape[2] != 4 ||
+            group.columns[0].data.tensors[0].dtype.code != kDLFloat || group.columns[0].data.tensors[0].dtype.bits != 64 ||
+            group.columns[0].data.tensors[0].dtype.lanes != 1)
         {
             std::fprintf(stderr, "unexpected %s read-group shape for %s\n", kWorldMatrixAttr, path);
             std::exit(EXIT_FAILURE);
         }
-        const double* m = static_cast<const double*>(group.data.tensors[0].data);
+        const double* m = static_cast<const double*>(group.columns[0].data.tensors[0].data);
         out[0] = m[12];
         out[1] = m[13];
         out[2] = m[14];
         found = true;
-        ovstage_release_group(stage, &group);
+        ovstage_release_groups(stage, &group, 1);
     }
     else if (fetched != OVSTAGE_ERROR_END_OF_ITERATION)
     {
@@ -290,27 +292,33 @@ static std::vector<std::string> readTokenColumnNames(ovstage_instance_t* stage, 
     std::vector<std::pair<size_t, std::vector<std::string>>> perPrim;
     for (;;)
     {
+        size_t fetchedGroupCount = 0;
         ovstage_read_group_t group{};
-        const ovstage_api_status_t fetched = ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group);
+        const ovstage_api_status_t fetched =
+            ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group, 1, &fetchedGroupCount);
         if (fetched == OVSTAGE_ERROR_END_OF_ITERATION)
             break;
         check(stage, fetched, "fetch_read_next");
-        if (group.is_delete)
+        if (group.column_count != 1)
+            fail("single-attribute read returned multiple columns");
+        const ovstage_read_column_t& column = group.columns[0];
+        if (column.is_delete)
         {
-            ovstage_release_group(stage, &group); // tombstone group: no data, no names
+            ovstage_release_groups(stage, &group, 1); // tombstone group: no data, no names
             continue;
         }
         // Every covered prim must resolve to a transported data row, directly
         // or through data.index_map. Fixed rows are stacked in one tensor;
         // array attributes use one tensor per data row.
-        if (!group.data.tensors)
+        if (!column.data.tensors)
             layoutError();
-        if (!group.is_array && (group.data.tensor_count != 1 || !isTokenTensor(group.data.tensors[0])))
+        if (!column.is_array && (column.data.tensor_count != 1 || !isTokenTensor(column.data.tensors[0])))
             layoutError();
-        const size_t logicalCount = group.data.index_map ?
-                                        group.data.count :
-                                        (group.is_array ? group.data.tensor_count :
-                                                          static_cast<size_t>(group.data.tensors[0].shape[0]));
+        const size_t logicalCount =
+            column.data.index_map ?
+                column.data.count :
+                                        (column.is_array ? column.data.tensor_count :
+                                                          static_cast<size_t>(column.data.tensors[0].shape[0]));
         if (logicalCount != group.prims.count)
             layoutError();
 
@@ -318,32 +326,34 @@ static std::vector<std::string> readTokenColumnNames(ovstage_instance_t* stage, 
         {
             const size_t listIndex =
                 group.prims.index_map ? group.prims.index_map[local] : group.prims.offset + local;
-            const uint32_t row = group.data.index_map ? group.data.index_map[local] : local;
+            const uint32_t row = column.data.index_map ? column.data.index_map[local] : local;
             const uint64_t* ids = nullptr;
             int64_t elementCount = 0;
-            if (group.is_array)
+            if (column.is_array)
             {
                 // Per-row transport: the data index map picks which tensor
                 // holds this prim's variable-length row.
-                if (row >= group.data.tensor_count || !isTokenTensor(group.data.tensors[row]))
+                if (row >= column.data.tensor_count || !isTokenTensor(column.data.tensors[row]))
                     layoutError();
-                ids = static_cast<const uint64_t*>(group.data.tensors[row].data);
-                elementCount = group.data.tensors[row].shape[0];
+                ids = reinterpret_cast<const uint64_t*>(
+                    static_cast<const uint8_t*>(column.data.tensors[row].data) + column.data.tensors[row].byte_offset);
+                elementCount = column.data.tensors[row].shape[0];
             }
             else
             {
                 // Stacked rows: the data index map picks this prim's row in
                 // the single tensor.
-                if (static_cast<int64_t>(row) >= group.data.tensors[0].shape[0])
+                if (static_cast<int64_t>(row) >= column.data.tensors[0].shape[0])
                     layoutError();
-                ids = static_cast<const uint64_t*>(group.data.tensors[0].data) + row;
+                ids = reinterpret_cast<const uint64_t*>(
+                    static_cast<const uint8_t*>(column.data.tensors[0].data) + column.data.tensors[0].byte_offset) + row;
                 elementCount = 1;
             }
             std::vector<std::string> primNames;
             primNames.reserve(static_cast<size_t>(elementCount));
             for (int64_t i = 0; i < elementCount; ++i)
             {
-                ovx_token_t token = static_cast<ovx_token_t>(ids[i]);
+                ovx_token_t token{ ids[i] };
                 ovx_string_t name{};
                 ovx_api_result_t ovxResult = path_dictionary_get_strings_from_tokens(dict, &token, 1, &name);
                 checkOvx(dict, ovxResult, "resolve-token");
@@ -351,7 +361,7 @@ static std::vector<std::string> readTokenColumnNames(ovstage_instance_t* stage, 
             }
             perPrim.emplace_back(listIndex, std::move(primNames));
         }
-        ovstage_release_group(stage, &group);
+        ovstage_release_groups(stage, &group, 1);
     }
     enq = ovstage_release_read(stage, read);
     waitOp(stage, enq, "release_read");
@@ -478,10 +488,7 @@ int main()
     ovxResult = path_dictionary_create_tokens_from_strings(dict, typeNames, kProtoCount, typeTokens);
     checkOvx(dict, ovxResult, "intern-types");
 
-    uint64_t typeIds[kProtoCount];
-    for (size_t i = 0; i < kProtoCount; ++i)
-        typeIds[i] = typeTokens[i];
-    DLTensor typeTensor = cpuTokenTensor(typeIds, kProtoShape, kUnitStrides);
+    DLTensor typeTensor = cpuTokenTensor(typeTokens, kProtoShape, kUnitStrides);
     ovstage_write_data_t typeWrite = writeData(&typeTensor);
     enq = ovstage_write_attribute(stage, protoQuery, { primType, {} }, /*ordinal*/ 1, typeWrite,
                                   OVSTAGE_PRIM_MODE_UPSERT);
@@ -507,9 +514,8 @@ int main()
     ovxResult = path_dictionary_create_tokens_from_strings(dict, schemaNames, 2, schemaTokens);
     checkOvx(dict, ovxResult, "intern-schemas");
 
-    uint64_t schemaIds[2] = { schemaTokens[0], schemaTokens[1] };
     const int64_t schemaShape[] = { 2 };
-    DLTensor schemaTensor = cpuTokenTensor(schemaIds, schemaShape, kUnitStrides);
+    DLTensor schemaTensor = cpuTokenTensor(schemaTokens, schemaShape, kUnitStrides);
     ovstage_write_data_t schemaWrite = writeData(&schemaTensor, OVSTAGE_SEMANTIC_NONE, /*isArray*/ true);
     enq = ovstage_write_attribute(stage, bodyQuery, { schemas, {} }, /*ordinal*/ 1, schemaWrite,
                                   OVSTAGE_PRIM_MODE_UPSERT);

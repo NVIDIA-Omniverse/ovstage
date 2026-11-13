@@ -4,7 +4,7 @@ A standalone Python program that shows **how to place time-indexed data on
 the ordinal axis**: one timeline, two data sources. A saxpy simulator steps
 three sphere prims with **non-uniform dt** (`position += velocity * dt`), and
 a time-sampled USD clip animates a conveyor. ovstage stores no time — it
-orders writes by opaque `uint64` ordinals — so the application owns an
+orders writes by opaque `int64` ordinals — so the application owns an
 explicit ordinal ↔ time table and uses it to land **both** sources in the
 same ordinal slot per tick. Because the slots are shared, anything a consumer
 reads at a sealed ordinal is **time-coherent** — every value describes the
@@ -92,11 +92,10 @@ python main.py
 
 ## Snippets
 
-The `[snippet:name]` markers in `main.py` fence regions the ovstage skills
-under `../../../skills/` can reference; keep them intact when editing.
+The `[snippet:name]` markers in [main.py](main.py) identify the source regions described below and referenced by the [ovstage skills](../../../skills/). Keep the markers intact when editing.
 
-- `time-to-ordinal-table` — the app-owned ordinal ↔ time table (a table, not a formula)
-- `float3-attribute-write` — float3-per-prim column write (`lanes=3`, POINT/VECTOR semantic)
+- `time-to-ordinal-table` — Builds `time_of_ordinal` by accumulating the step durations in `DT_OF_TICK`. Ordinal 1 represents time zero; each later entry records the simulation time in seconds after another step, so unequal step durations do not require equally spaced times.
+- `float3-attribute-write` — Uses `_float3_tensor()` to supply one three-component float32 value per sphere to `write_attribute()`. Positions use the `POINT` semantic and velocities use `VECTOR`; both writes complete at ordinal 1 before the surrounding code advances the write floor.
 
 ## Notes
 

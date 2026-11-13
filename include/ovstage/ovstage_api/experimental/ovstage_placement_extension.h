@@ -19,7 +19,7 @@
  * time: ovstage_query_placement_extension() and every wrapper below return
  * OVSTAGE_ERROR_NOT_FOUND when the implementation does not provide a table
  * this header can use. Once stable, placement stays an extension; it does not
- * move into ovstage_vtable_t.
+ * move into ovstage_data_plane_vtable_t.
  *
  * Versioning: the lookup accepts only `header.version` equal to
  * OVSTAGE_PLACEMENT_EXTENSION_VERSION, with `header.struct_size` at least
@@ -29,7 +29,7 @@
  * version, so a caller built against an older header gets
  * OVSTAGE_ERROR_NOT_FOUND instead of a table it would misuse.
  *
- * Placement is reached through query_extension, not ovstage_vtable_t, and
+ * Placement is reached through query_extension, not ovstage_data_plane_vtable_t, and
  * `<ovstage/ovstage.h>` does not include this header. Include it explicitly:
  *
  *     #include <ovstage/ovstage_api/experimental/ovstage_placement_extension.h>
@@ -329,7 +329,7 @@ typedef struct ovstage_placement_t {
  * ovstage_write_attribute_on_device() and its siblings directly: they look
  * the table up and return OVSTAGE_ERROR_NOT_FOUND when the implementation does
  * not provide it. The table is owned by the implementation, immutable, and valid
- * for the lifetime of the process. Every function takes the implementation
+ * for the lifetime of the process. Every function takes the data-plane
  * context as its first argument, exactly like a vtable slot.
  */
 typedef struct ovstage_placement_extension_v1_t
@@ -341,7 +341,7 @@ typedef struct ovstage_placement_extension_v1_t
      *
      * Device-aware counterparts of write_attribute, write_attributes,
      * map_attribute and read_attributes. They live in this extension rather
-     * than in ovstage_vtable_t, so the core vtable keeps exactly its released
+     * than in ovstage_data_plane_vtable_t, so the core vtable keeps exactly its released
      * layout and a caller can ask whether an implementation provides them
      * instead of assuming it does. A NULL placement makes each one exactly the
      * unplaced call it mirrors.
@@ -365,7 +365,7 @@ typedef struct ovstage_placement_extension_v1_t
      * applies and reports OVSTAGE_ERROR_OP_FAILED. It has consumed its ordinal,
      * so write_attribute's same-ordinal retry after a failure does not apply.
      *
-     * @param instance Implementation context.
+     * @param context The context of the data plane.
      * @param handle Query handle identifying target prims.
      * @param attribute Attribute to write.
      * @param ordinal Ordinal for this write (must be > write floor at execution time).
@@ -379,13 +379,13 @@ typedef struct ovstage_placement_extension_v1_t
      *         invalid op_index.
      */
     ovstage_enqueue_result_t (*write_attribute_on_device)(
-        ovstage_context_t*           instance,
-        ovstage_query_handle_t       handle,
-        ovx_string_or_token_t        attribute,
-        ovstage_ordinal_t            ordinal,
-        ovstage_write_data_t         data,
-        ovstage_prim_mode_t          prim_mode,
-        const ovstage_placement_t*   placement);
+        ovstage_data_plane_context_t* context,
+        ovstage_query_handle_t        handle,
+        ovx_token_or_string_t         attribute,
+        ovstage_ordinal_t             ordinal,
+        ovstage_write_data_t          data,
+        ovstage_prim_mode_t           prim_mode,
+        const ovstage_placement_t*    placement);
 
     /**
      * @brief Enqueue a multi-attribute write, targeting a specific device.
@@ -398,7 +398,7 @@ typedef struct ovstage_placement_extension_v1_t
      * applies and reports OVSTAGE_ERROR_OP_FAILED. It has consumed its ordinal,
      * so write_attributes' same-ordinal retry after a failure does not apply.
      *
-     * @param instance Implementation context.
+     * @param context The context of the data plane.
      * @param handle Query handle identifying target prims.
      * @param writes Per-attribute write entries.
      * @param write_count Number of entries in `writes`.
@@ -410,7 +410,7 @@ typedef struct ovstage_placement_extension_v1_t
      * @return Enqueue result with status + op_index.
      */
     ovstage_enqueue_result_t (*write_attributes_on_device)(
-        ovstage_context_t*                 instance,
+        ovstage_data_plane_context_t*      context,
         ovstage_query_handle_t             handle,
         const ovstage_attribute_write_t*   writes,
         size_t                             write_count,
@@ -430,10 +430,12 @@ typedef struct ovstage_placement_extension_v1_t
      *         committing a group. To preserve existing values, read them first
      *         and explicitly copy them into staging before applying edits.
      *         Release overlapping read groups before committing the map.
-     *         CUDA staging is supported only for fixed-size attributes;
-     *         array-valued CUDA maps return OVSTAGE_ERROR_NOT_SUPPORTED.
+     *         CUDA staging is supported only for fixed-size value attributes;
+     *         array-valued CUDA maps and maps of the reserved metadata
+     *         (`usd-prim-type`, `usd-schemas`, `usd-ancestor-types`, which
+     *         are lowered on the host) return OVSTAGE_ERROR_NOT_SUPPORTED.
      *
-     * @param instance Implementation context.
+     * @param context The context of the data plane.
      * @param handle Query handle identifying target prims.
      * @param desc Map descriptor (attribute, dtype, semantic, prim_mode).
      * @param ordinal Ordinal for this map session.
@@ -461,14 +463,14 @@ typedef struct ovstage_placement_extension_v1_t
      *         the handle.
      */
     ovstage_enqueue_result_t (*map_attribute_on_device)(
-        ovstage_context_t*           instance,
-        ovstage_query_handle_t       handle,
-        const ovstage_map_desc_t*    desc,
-        ovstage_ordinal_t            ordinal,
-        const size_t*                element_sizes,
-        size_t                       element_count,
-        const ovstage_placement_t*   placement,
-        ovstage_map_handle_t*        out_map_handle);
+        ovstage_data_plane_context_t* context,
+        ovstage_query_handle_t        handle,
+        const ovstage_map_desc_t*     desc,
+        ovstage_ordinal_t             ordinal,
+        const size_t*                 element_sizes,
+        size_t                        element_count,
+        const ovstage_placement_t*    placement,
+        ovstage_map_handle_t*         out_map_handle);
 
     /**
      * @brief Enqueue a multi-attribute read served from a specific device.
@@ -486,13 +488,18 @@ typedef struct ovstage_placement_extension_v1_t
      * no recourse but to read it elsewhere and copy it themselves, which is the
      * work this function is doing on their behalf.
      *
+     * @remark CUDA output supports ragged numeric arrays, including zero-length
+     *         arrays. Every nonempty CUDA array payload is 32-byte aligned.
+     *         Keep each group alive through consumer device work and observe the
+     *         availability-event obligations below before accessing its payload.
+     *
      * Zero-copy is preserved where it is available: if the column is already
-     * current on `placement->device` the group points straight into that copy and
+     * current on `placement->device` for every queried prim, the group points into that copy and
      * nothing is transferred. Only a column that is current elsewhere is
      * materialized onto the requested device, into storage owned by the group and
-     * released with it by release_group.
+     * released with it by release_groups.
      *
-     * @param instance Implementation context.
+     * @param context The context of the data plane.
      * @param handle Query handle identifying target prims.
      * @param attrs Attributes to read.
      * @param attr_count Number of entries in `attrs`.
@@ -562,13 +569,13 @@ typedef struct ovstage_placement_extension_v1_t
      *         the requested device transfers nothing and has neither cost.
      */
     ovstage_enqueue_result_t (*read_attributes_on_device)(
-        ovstage_context_t*           instance,
-        ovstage_query_handle_t       handle,
-        const ovx_token_t*           attrs,
-        size_t                       attr_count,
-        ovstage_ordinal_range_t      range,
-        const ovstage_placement_t*   placement,
-        ovstage_read_handle_t*       out_read_handle);
+        ovstage_data_plane_context_t* context,
+        ovstage_query_handle_t        handle,
+        const ovx_token_t*            attrs,
+        size_t                        attr_count,
+        ovstage_ordinal_range_t       range,
+        const ovstage_placement_t*    placement,
+        ovstage_read_handle_t*        out_read_handle);
 } ovstage_placement_extension_v1_t;
 
 /* ───────────────────────────────────────────────────────────────────────────
@@ -599,8 +606,8 @@ static inline ovstage_api_status_t ovstage_query_placement_extension(
     if (!out_extension)
         return OVSTAGE_ERROR_INVALID_ARGUMENT;
     *out_extension = NULL;
-    status = instance->vtable->query_extension(
-        instance->context, OVSTAGE_PLACEMENT_EXTENSION_NAME, &table);
+    status = instance->data_plane.vtable->query_extension(
+        instance->data_plane.context, OVSTAGE_PLACEMENT_EXTENSION_NAME, &table);
     if (status != OVSTAGE_OK)
         return status;
     placement = (const ovstage_placement_extension_v1_t*)table;
@@ -616,7 +623,7 @@ static inline ovstage_api_status_t ovstage_query_placement_extension(
 static inline ovstage_enqueue_result_t ovstage_write_attribute_on_device(
     ovstage_instance_t*           instance,
     ovstage_query_handle_t        handle,
-    ovx_string_or_token_t         attribute,
+    ovx_token_or_string_t         attribute,
     ovstage_ordinal_t             ordinal,
     ovstage_write_data_t          data,
     ovstage_prim_mode_t           prim_mode,
@@ -629,7 +636,7 @@ static inline ovstage_enqueue_result_t ovstage_write_attribute_on_device(
     if (rejected.status != OVSTAGE_OK)
         return rejected;
     return ext->write_attribute_on_device(
-        instance->context, handle, attribute, ordinal, data, prim_mode, placement);
+        instance->data_plane.context, handle, attribute, ordinal, data, prim_mode, placement);
 }
 
 static inline ovstage_enqueue_result_t ovstage_write_attributes_on_device(
@@ -648,7 +655,7 @@ static inline ovstage_enqueue_result_t ovstage_write_attributes_on_device(
     if (rejected.status != OVSTAGE_OK)
         return rejected;
     return ext->write_attributes_on_device(
-        instance->context, handle, writes, write_count, ordinal, prim_mode, placement);
+        instance->data_plane.context, handle, writes, write_count, ordinal, prim_mode, placement);
 }
 
 static inline ovstage_enqueue_result_t ovstage_read_attributes_on_device(
@@ -671,7 +678,7 @@ static inline ovstage_enqueue_result_t ovstage_read_attributes_on_device(
         return rejected;
     }
     return ext->read_attributes_on_device(
-        instance->context, handle, attrs, attr_count, range, placement, out_read_handle);
+        instance->data_plane.context, handle, attrs, attr_count, range, placement, out_read_handle);
 }
 
 static inline ovstage_enqueue_result_t ovstage_map_attribute_on_device(
@@ -695,7 +702,7 @@ static inline ovstage_enqueue_result_t ovstage_map_attribute_on_device(
         return rejected;
     }
     return ext->map_attribute_on_device(
-        instance->context, handle, desc, ordinal,
+        instance->data_plane.context, handle, desc, ordinal,
         element_sizes, element_count, placement, out_map_handle);
 }
 

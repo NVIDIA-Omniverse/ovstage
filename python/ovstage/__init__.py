@@ -32,7 +32,7 @@ Example::
         read = stage.read_attributes(query, [attr], OrdinalRange.latest(2))
         read.wait()
         group = read.fetch_next()
-        print(group.array(0))           # -> [1.5]
+        print(group.columns[0].array(0))  # -> [1.5]
         stage.release_group(group)
         read.release().wait()
         paths.destroy_path_list(plist)
@@ -49,6 +49,8 @@ from . import _src
 # builds export, so it is instrumentation, not public API.
 from ._src import gates, instancing, population  # noqa: F401  (gates: re-export only)
 from ._src.bindings import (
+    OVSTAGE_ORDINAL_MIN,
+    OVSTAGE_ORDINAL_MAX,
     OVSTAGE_TIMEOUT_INFINITE,
     OVX_API_ERROR,
     OVX_API_SUCCESS,
@@ -67,13 +69,18 @@ from ._src.dlpack import (
     ManagedDLTensor,
     dltensor_to_numpy,
     make_dltensor,
-    typed_tensor_to_write,
     numpy_to_dldatatype,
+    typed_tensor_to_write,
 )
 from ._src.path_dictionary import OvxError, PathDictionary, PathList
 from ._src.stage import Hierarchy, Map, OrdinalQuery, Query, Read, Stage
 from ._src.types import (
+    ORDINAL_MIN,
+    ORDINAL_MAX,
+    POPULATION_THREAD_LIMIT_AUTO,
+    TIMEOUT_INFINITE,
     AttributeMeta,
+    AttributeMode,
     AttributeSemantic,
     CloneOperation,
     CloneResult,
@@ -91,17 +98,45 @@ from ._src.types import (
     OrdinalAdmissionPolicy,
     OrdinalRange,
     OvstageError,
-    Predicate,
-    PopulationDomain,
     Placement,
+    PopulationDomain,
+    Predicate,
     PrimMode,
-    AttributeMode,
     QueryResult,
+    ReadColumn,
     ReadGroup,
     Scope,
     StageConfig,
-    TIMEOUT_INFINITE,
     WriteDesc,
+)
+from .handles import (
+    INVALID_HIERARCHY_HANDLE,
+    INVALID_HIERARCHY_RESULT_ID,
+    INVALID_MAP_HANDLE,
+    INVALID_OP_ID,
+    INVALID_ORDINAL_QUERY_HANDLE,
+    INVALID_QUERY_HANDLE,
+    INVALID_QUERY_RESULT_ID,
+    INVALID_READ_GROUP_ID,
+    INVALID_READ_HANDLE,
+    POPULATION_EXPORT_INVALID_DESTINATION_HANDLE,
+    POPULATION_INVALID_OP_ID,
+    POPULATION_INVALID_USD_REFERENCE_HANDLE,
+    HierarchyHandle,
+    HierarchyResultId,
+    MapHandle,
+    OpId,
+    OrdinalQueryHandle,
+    PopulationExportDestinationHandle,
+    PopulationOpId,
+    PopulationUsdReferenceHandle,
+    PrimPath,
+    PrimPathList,
+    QueryHandle,
+    QueryResultId,
+    ReadGroupId,
+    ReadHandle,
+    Token,
 )
 
 # __version__ mirrors the installed wheel's distribution version. The build injects
@@ -133,6 +168,30 @@ _sys.modules[f"{__name__}.instancing"] = instancing
 _sys.modules[f"{__name__}.population"] = population
 
 __all__ = [
+    "INVALID_OP_ID",
+    "INVALID_QUERY_HANDLE",
+    "INVALID_READ_HANDLE",
+    "INVALID_MAP_HANDLE",
+    "INVALID_ORDINAL_QUERY_HANDLE",
+    "INVALID_READ_GROUP_ID",
+    "INVALID_QUERY_RESULT_ID",
+    "INVALID_HIERARCHY_HANDLE",
+    "INVALID_HIERARCHY_RESULT_ID",
+    "POPULATION_INVALID_OP_ID",
+    "POPULATION_INVALID_USD_REFERENCE_HANDLE",
+    "POPULATION_EXPORT_INVALID_DESTINATION_HANDLE",
+    "OpId",
+    "QueryHandle",
+    "ReadHandle",
+    "MapHandle",
+    "OrdinalQueryHandle",
+    "ReadGroupId",
+    "QueryResultId",
+    "HierarchyHandle",
+    "HierarchyResultId",
+    "PopulationOpId",
+    "PopulationUsdReferenceHandle",
+    "PopulationExportDestinationHandle",
     "Stage",
     "StageConfig",
     "Query",
@@ -140,6 +199,9 @@ __all__ = [
     "Map",
     "OrdinalQuery",
     "Hierarchy",
+    "Token",
+    "PrimPath",
+    "PrimPathList",
     "PathDictionary",
     "PathList",
     "OvxError",
@@ -161,6 +223,7 @@ __all__ = [
     "Operation",
     "CloneOperation",
     "WriteDesc",
+    "ReadColumn",
     "ReadGroup",
     "MapGroup",
     "AttributeMeta",
@@ -188,7 +251,12 @@ __all__ = [
     "flush_log",
     "LogSeverity",
     "TIMEOUT_INFINITE",
+    "ORDINAL_MIN",
+    "ORDINAL_MAX",
+    "OVSTAGE_ORDINAL_MIN",
+    "OVSTAGE_ORDINAL_MAX",
     "OVSTAGE_TIMEOUT_INFINITE",
+    "POPULATION_THREAD_LIMIT_AUTO",
     "OVX_API_SUCCESS",
     "OVX_API_ERROR",
     "__version__",

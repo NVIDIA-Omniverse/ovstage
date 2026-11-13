@@ -94,8 +94,8 @@ This skill has no scripts.
 ## Limitations
 
 - The referenced snippets remain the source of truth; update or add tested snippets before documenting new API usage.
-- **Python:** covered in the Python section (`ovstage.PathDictionary`; `int` handles,
-  `str` names, `OvxError`). Inline Python pending a shipping Python example to snippet-source.
+- **Python:** covered in the Python section (`ovstage.PathDictionary`; typed handles,
+  `str` names, `OvxError`).
 - **Snippets** are sourced from the shipping example `examples/c/minimal/main.cpp`.
 
 ## Overview
@@ -106,9 +106,18 @@ surface is a vtable (`path_dictionary_vtable_t`) plus inline wrappers in
 `path_dictionary_utils.h`; an instance (`path_dictionary_instance_t`) is produced by an
 owner subsystem (e.g. ovstage) and maps strings to stable, trivially comparable handles:
 
-- `ovx_token_t` — interned string (e.g. an attribute name). `OVX_INVALID_TOKEN` is `0`.
+- `ovx_token_t` — interned string (e.g. an attribute name). Empty strings have token ID `0`. `OVX_INVALID_TOKEN` is `UINT64_MAX`.
 - `ovx_primpath_t` — interned prim path. `OVX_INVALID_PRIMPATH` is `0`.
 - `ovx_primpath_list_t` — an immutable set/ordering of prim paths. `OVX_INVALID_PRIMPATH_LIST` is `0`.
+
+The C handles are distinct structs with one `uint64_t raw_id` member. Python APIs
+reject bare integers and wrong-kind handles. Keep handles typed in C/C++ application
+code. Read uint64 tensor payloads as numeric IDs, applying `tensor.byte_offset` in
+bytes before accessing the elements, then explicitly construct the corresponding
+handle (for example, `ovx_token_t token{values[i]}` in C++). Use `.raw_id` when an
+integer is required (for example, Python NumPy arrays), and explicitly wrap those
+integers with `Token`, `PrimPath`, or `PrimPathList` on Python readback.
+Copying an owning `PathList` yields a non-owning `PrimPathList`.
 
 Design guarantees:
 
@@ -119,7 +128,7 @@ Design guarantees:
 - **Thread-safe interning:** concurrent interning is supported; returned handles and
   string pointers are stable for the dictionary's lifetime.
 
-This is the type backbone for `ovx_string_or_token_t` dual-mode arguments throughout
+This is the type backbone for `ovx_token_or_string_t` dual-mode arguments throughout
 ovstage — see the `string-handling` skill.
 
 ## Ownership & lifetime
@@ -156,7 +165,7 @@ resolve back to strings:
 
 The basic stage test interns paths into a list and passes it to
 `ovstage_query_from_path_list`, then uses the interned attribute token as the
-`ovx_string_or_token_t` argument:
+`ovx_token_or_string_t` argument:
 
 > **Source:** `examples/c/minimal/main.cpp` snippet `path-list-query`
 
@@ -175,7 +184,7 @@ comparable:
 ## Python
 
 The path dictionary is `ovstage.PathDictionary` — a context manager wrapping the same
-interning service. Tokens and prim paths are Python `int` handles; strings are `str`. Errors
+interning service. Tokens and prim paths are Python `Token` and `PrimPath` handles; strings are `str`. Errors
 raise `ovstage.OvxError`.
 
 > **Source:** `examples/python/minimal/main.py` snippet `intern-and-resolve`
@@ -197,8 +206,7 @@ when transferring a selection. List references do not extend Stage lifetime. Sam
 ### Path-list ownership in Python
 
 `create_path_list` / `create_path_list_from_strings` return an `ovstage.PathList`. It
-subclasses `int` and **is** the handle — it passes into `query_from_path_list` and every
-other slot unchanged, and `isinstance(handle, int)` still holds — but it also owns the
+subclasses `PrimPathList` and passes into every path-list slot unchanged. It owns the
 reference the create call minted, and releases it on `with`-exit:
 
 > **Source:** `tests/python/test_path_lists.py` snippet `path-list-context-manager`
@@ -207,14 +215,14 @@ reference the create call minted, and releases it on `with`-exit:
 `PathList` whose reference is still outstanding when it is garbage-collected releases it and
 emits a `ResourceWarning` — a bug report, not a strategy.
 
-Only `create_path_list*` mints a `PathList`. Borrowed lists from read results stay plain
-`int`, so the finalizer can never release a reference the caller does not own.
+Only `create_path_list*` mints a `PathList`. Borrowed lists from read results are non-owning
+`PrimPathList` handles, so the finalizer can never release a reference the caller does not own.
 
 A `PathList` owns exactly one reference: the one `create_path_list*` minted. A reference you
 add with `add_path_list_reference` is yours — pair it with one extra `destroy_path_list`, and
 note that dropping the `PathList` never reclaims it, so a bare handle you hand to a
 longer-lived consumer keeps working. Passing the `PathList` to `destroy_path_list` releases
-its own reference; passing the plain `int` releases one of your added references while any
+its own reference; passing a non-owning `PrimPathList` copy releases one of your added references while any
 are outstanding.
 
 `query_from_path_list` wraps a **caller-owned** list, so keep your list alive for as long as
@@ -256,15 +264,18 @@ All operations are inline wrappers from `path_dictionary_utils.h` taking a
 
 Every slot returns `ovx_api_result_t { ovx_api_status_t status; ovx_string_t error; }`, where
 `ovx_api_status_t` is `OVX_API_SUCCESS` (0) or `OVX_API_ERROR` (1). Handle sentinels
-`OVX_INVALID_TOKEN` / `OVX_INVALID_PRIMPATH` / `OVX_INVALID_PRIMPATH_LIST` are all `0` and are
-never returned on success.
+are `UINT64_MAX` for `OVX_INVALID_TOKEN` and `0` for `OVX_INVALID_PRIMPATH` /
+`OVX_INVALID_PRIMPATH_LIST`; they are never returned on success.
 
 ## Troubleshooting
 
-- A successful mint never returns `0` — treat `OVX_INVALID_TOKEN` /
-  `OVX_INVALID_PRIMPATH` / `OVX_INVALID_PRIMPATH_LIST` (all `0`) as "unset/invalid".
+- Token id `0` is valid and represents the empty string. Use `OVX_INVALID_TOKEN`
+  (`UINT64_MAX`) for an invalid token; resolving it returns `OVX_API_ERROR`.
+  Invalid prim-path and path-list handles remain `0`.
 - `create_*` slots intern on miss (create-on-miss), so there is no separate lookup call;
-  empty token/path strings are rejected. Both path-list constructors accept zero paths and mint
+  empty token strings succeed with id `0` and resolve to an empty string (a non-null
+  pointer with length zero in C). Empty path strings and embedded NUL bytes remain
+  rejected. `create_paths_from_tokens` rejects token id `0` as a path component. Both path-list constructors accept zero paths and mint
   a valid empty list; their input array may be null when the count is zero.
   `get_*` slots require a live
   handle — calling one on a released/unknown path list returns `OVX_API_ERROR`.
@@ -285,12 +296,13 @@ never returned on success.
   unknown or already-freed handle — those calls return `OVX_API_ERROR`.
 - String pointers from the dictionary are borrowed; copy before the dictionary is
   destroyed.
-- For passing a name as either a token or a raw string, see `ovx_string_or_token_t` in the
-  `string-handling` skill (set `token` for hot paths, else `string`).
+- For passing a name as either a token or a raw string, see `ovx_token_or_string_t` in the
+  `string-handling` skill. A non-null `string.ptr` selects text; leave it null
+  when passing an interned `token`.
 
 ## References
 
 - Use the `> **Source:**` directives in this skill to locate tested snippets before reusing API patterns.
-- `string-handling` skill — `ovx_string_t` / `ovx_string_or_token_t` dual-mode usage.
+- `string-handling` skill — `ovx_string_t` / `ovx_token_or_string_t` dual-mode usage.
 - `error-handling` skill — ovstage-level error handling (distinct `ovstage_api_status_t` codes).
 - Keep related skills, docs, and snippets synchronized when changing the workflow.

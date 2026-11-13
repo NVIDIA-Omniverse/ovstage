@@ -95,8 +95,10 @@ protected:
         ASSERT_TRUE(waitOp(stage_, ovstage_read_attributes(stage_, query_, &heat_, 1, range, &read), "read"));
         for (;;)
         {
+            size_t fetchedGroupCount = 0;
             ovstage_read_group_t group{};
-            const ovstage_api_status_t fetched = ovstage_fetch_read_next(stage_, read, OVSTAGE_TIMEOUT_INFINITE, &group);
+            const ovstage_api_status_t fetched =
+                ovstage_fetch_read_next(stage_, read, OVSTAGE_TIMEOUT_INFINITE, &group, 1, &fetchedGroupCount);
             if (fetched == OVSTAGE_ERROR_END_OF_ITERATION)
                 break;
             if (fetched != OVSTAGE_OK)
@@ -104,19 +106,21 @@ protected:
                 ADD_FAILURE() << "fetch_read_next failed (code " << fetched << ")";
                 break;
             }
-            if (!group.is_delete && group.data.tensor_count == 1 && group.data.tensors[0].data)
+            ASSERT_EQ(group.column_count, 1u);
+            const ovstage_read_column_t& column = group.columns[0];
+            if (!column.is_delete && column.data.tensor_count == 1 && column.data.tensors[0].data)
             {
-                const float* rows = static_cast<const float*>(group.data.tensors[0].data);
+                const float* rows = static_cast<const float*>(column.data.tensors[0].data);
                 for (uint32_t local = 0; local < group.prims.count; ++local)
                 {
                     const size_t listIndex = group.prims.index_map ? group.prims.index_map[local]
                                                                    : group.prims.offset + local;
-                    const uint32_t row = group.data.index_map ? group.data.index_map[local] : local;
+                    const uint32_t row = column.data.index_map ? column.data.index_map[local] : local;
                     if (listIndex < 4)
                         out[listIndex] = rows[row];
                 }
             }
-            ovstage_release_group(stage_, &group);
+            ovstage_release_groups(stage_, &group, 1);
         }
         waitOp(stage_, ovstage_release_read(stage_, read), "release_read");
     }

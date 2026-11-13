@@ -7,7 +7,7 @@
 # disclosure or distribution of this material and related documentation
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
-"""Population descriptions: predicates, selectors and descs.
+"""Population descriptions: predicates, expressions, derived properties, selectors and descs.
 
 A predicate is built with a constructor per kind and is immutable once built, so a
 tree can be shared between selectors and reused across calls. Nothing is converted to
@@ -26,10 +26,14 @@ from __future__ import annotations
 
 import ctypes
 from enum import IntEnum
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from . import bindings as _b
+from .dlpack import DLDataType
 from .types import (
+    AttributeSemantic,
+    DeriveWhen,
+    ExpressionKind,
     PopulationDomain,
     PrimPredicateKind,
     PropertyPredicateKind,
@@ -40,6 +44,8 @@ from .types import (
 __all__ = [
     "PrimPredicate",
     "PropertyPredicate",
+    "Expression",
+    "DerivedProperty",
     "Selector",
     "Desc",
 ]
@@ -129,6 +135,14 @@ class _Predicate(_Immutable):
                 f"{type(self).__name__}.{self.kind.name} declares no values slot"
             ) from None
         filled = tuple(name for name in ("strings", "subpredicates", "nested") if getattr(self, name))
+        if expected == "targeted_by":
+            # One subpredicate of this type and one nested predicate of the other, as the C struct
+            # holds them side by side.
+            if filled == ("subpredicates", "nested") and len(self.subpredicates) == 1:
+                return
+            raise TypeError(
+                f"{type(self).__name__}.{self.kind.name} takes one subpredicate and one nested predicate"
+            )
         if filled == ((expected,) if expected else ()):
             return
         got = ", ".join(filled) if filled else "nothing"
@@ -138,12 +152,10 @@ class _Predicate(_Immutable):
     def __repr__(self) -> str:
         if self.strings:
             detail = ", ".join(repr(s) for s in self.strings)
-        elif self.subpredicates:
-            detail = ", ".join(repr(p) for p in self.subpredicates)
-        elif self.nested is not None:
-            detail = repr(self.nested)
         else:
-            detail = ""
+            detail = ", ".join(
+                [repr(p) for p in self.subpredicates] + ([repr(self.nested)] if self.nested is not None else [])
+            )
         return f"{type(self).__name__}.{self.kind.name}({detail})"
 
 
@@ -176,6 +188,9 @@ class PrimPredicate(_Predicate):
         PrimPredicateKind.HAS_KIND: "strings",
         PrimPredicateKind.HAS_PURPOSE: "strings",
         PrimPredicateKind.HAS_METADATA: "strings",
+        PrimPredicateKind.IS_TARGETED_BY: "targeted_by",
+        PrimPredicateKind.HAS_DESCENDANT: "subpredicates",
+        PrimPredicateKind.IS_INSTANCE: None,
     }
 
     @staticmethod
@@ -220,6 +235,38 @@ class PrimPredicate(_Predicate):
         return PrimPredicate(
             PrimPredicateKind.HAS_ANCESTOR, subpredicates=_check_predicates((subpredicate,), PrimPredicate)
         )
+
+    @staticmethod
+    def has_descendant(subpredicate: "PrimPredicate") -> "PrimPredicate":
+        """Matches when any descendant matches ``subpredicate``.
+
+        The descendants are the prims population walks below the prim: active, defined, loaded
+        and not abstract. The walk crosses native instance boundaries: an instance's descendants
+        are its prototype's prims. A prim is not its own descendant.
+        """
+        return PrimPredicate(
+            PrimPredicateKind.HAS_DESCENDANT, subpredicates=_check_predicates((subpredicate,), PrimPredicate)
+        )
+
+    @staticmethod
+    def is_targeted_by(referrer: "PrimPredicate", relationship: "PropertyPredicate") -> "PrimPredicate":
+        """Matches a prim that a relationship points at: one matching ``relationship``, on a prim
+        matching ``referrer``. A target naming a property points at the prim that owns it.
+
+        It may be the whole prim predicate or sit inside :meth:`and_`, :meth:`or_` and
+        :meth:`not_`; anywhere else, and with ``IS_TARGETED_BY``, :meth:`PropertyPredicate.targets`
+        or :meth:`has_descendant` inside its own predicates, submission is rejected.
+        """
+        return PrimPredicate(
+            PrimPredicateKind.IS_TARGETED_BY,
+            subpredicates=_check_predicates((referrer,), PrimPredicate),
+            nested=_check_predicate(relationship, PropertyPredicate),
+        )
+
+    @staticmethod
+    def is_instance() -> "PrimPredicate":
+        """Matches a native instance, including an instance nested inside a prototype."""
+        return PrimPredicate(PrimPredicateKind.IS_INSTANCE)
 
     @staticmethod
     def has_property(subpredicate: "PropertyPredicate") -> "PrimPredicate":
@@ -307,6 +354,7 @@ class PropertyPredicate(_Predicate):
     """Which of an in-scope prim's properties a selector includes in population."""
 
     _KIND_ENUM = PropertyPredicateKind
+    _NESTS = True  # TARGETS nests a prim predicate
     _KIND_SLOTS = {
         PropertyPredicateKind.NONE: None,
         PropertyPredicateKind.ALL: None,
@@ -321,6 +369,7 @@ class PropertyPredicate(_Predicate):
         PropertyPredicateKind.IS_RELATIONSHIP: None,
         PropertyPredicateKind.IS_CUSTOM: None,
         PropertyPredicateKind.IS_AUTHORED: None,
+        PropertyPredicateKind.TARGETS: "nested",
     }
 
     @staticmethod
@@ -410,6 +459,16 @@ class PropertyPredicate(_Predicate):
         return PropertyPredicate(PropertyPredicateKind.IS_CUSTOM)
 
     @staticmethod
+    def targets(target: "PrimPredicate") -> "PropertyPredicate":
+        """Matches a relationship any of whose targets matches ``target``.
+
+        A target naming a property counts as the prim carrying it, and a target population does
+        not walk matches nothing. An attribute never matches. Accepted only inside
+        :meth:`PrimPredicate.has_property`.
+        """
+        return PropertyPredicate(PropertyPredicateKind.TARGETS, nested=_check_predicate(target, PrimPredicate))
+
+    @staticmethod
     def is_authored() -> "PropertyPredicate":
         """Matches a property carrying an authored opinion rather than a schema fallback."""
         return PropertyPredicate(PropertyPredicateKind.IS_AUTHORED)
@@ -427,17 +486,229 @@ def _check_predicates(preds, expected) -> Tuple:
     return tuple(_check_predicate(p, expected) for p in preds)
 
 
+class Expression(_Immutable):
+    """The value of a derived property: a small tree evaluated on each prim the rule applies to.
+
+    Built with one constructor per kind (``ovstage_population_expression.h``) and immutable once
+    built, so a tree can be shared between rules. It yields a number, a bool, a vector, a token
+    or paths, or nothing where the kind says so.
+    """
+
+    __slots__ = ("kind", "literal", "name", "operands", "prim_predicate", "property_predicate")
+
+    def __init__(self, kind, literal=None, name="", operands=(), prim_predicate=None,
+                 property_predicate=None):
+        self.kind = ExpressionKind(check_enum_member(kind, ExpressionKind, "expression kind"))
+        if literal is not None and not isinstance(literal, (bool, int, float)):
+            raise TypeError(f"literal must be a number or a bool, got {type(literal).__name__}")
+        self.literal = literal
+        self.name = _check_str(name, "name") if name else ""
+        self.operands = tuple(_check_predicate(o, Expression) for o in operands)
+        self.prim_predicate = None if prim_predicate is None else _check_predicate(prim_predicate, PrimPredicate)
+        self.property_predicate = (
+            None if property_predicate is None else _check_predicate(property_predicate, PropertyPredicate)
+        )
+        self._check_shape()
+
+    def _check_shape(self) -> None:
+        """Reject an expression holding other than what its kind takes, as the predicates do: the C
+        side reads only the fields `kind` names, so anything else would be dropped or misread."""
+        kind = self.kind
+        if kind == ExpressionKind.NUMBER:
+            takes = ("literal",)
+            if not isinstance(self.literal, (int, float)) or isinstance(self.literal, bool):
+                raise TypeError("Expression.NUMBER takes a number literal")
+        elif kind == ExpressionKind.BOOL:
+            takes = ("literal",)
+            if not isinstance(self.literal, bool):
+                raise TypeError("Expression.BOOL takes a bool literal")
+        elif kind == ExpressionKind.STAGE_METADATA:
+            takes = ("name",)
+            if not self.name:
+                raise TypeError("Expression.STAGE_METADATA takes a field name")
+        elif kind == ExpressionKind.UP_AXIS:
+            takes = ()
+        elif kind in (ExpressionKind.ADD, ExpressionKind.SUBTRACT, ExpressionKind.MULTIPLY, ExpressionKind.DIVIDE):
+            takes = ("operands",)
+            if len(self.operands) != 2:
+                raise TypeError(f"Expression.{kind.name} takes two operands, got {len(self.operands)}")
+        elif kind == ExpressionKind.RESOLVED_COLLECTION_MEMBERS:
+            takes = ("name", "prim_predicate", "property_predicate")
+            if not self.name:
+                raise TypeError("Expression.RESOLVED_COLLECTION_MEMBERS takes a collection name")
+        else:
+            # The bound-material kinds: a purpose, which may be empty, and an optional prim predicate.
+            takes = ("name", "prim_predicate")
+        filled = [
+            field for field, held in (
+                ("literal", self.literal is not None),
+                ("name", bool(self.name)),
+                ("operands", bool(self.operands)),
+                ("prim_predicate", self.prim_predicate is not None),
+                ("property_predicate", self.property_predicate is not None),
+            ) if held and field not in takes
+        ]
+        if filled:
+            raise TypeError(f"Expression.{kind.name} takes no {', '.join(filled)}")
+
+    def __repr__(self) -> str:
+        return f"Expression.{self.kind.name}"
+
+    @staticmethod
+    def number(value: float) -> "Expression":
+        """A number literal."""
+        return Expression(ExpressionKind.NUMBER, literal=float(value))
+
+    @staticmethod
+    def bool_(value: bool) -> "Expression":
+        """A bool literal."""
+        return Expression(ExpressionKind.BOOL, literal=bool(value))
+
+    @staticmethod
+    def stage_metadata(field: str) -> "Expression":
+        """A stage metadata field holding a number, such as ``metersPerUnit``, or a ``:``-joined key
+        path inside a dictionary field. A field that does not hold a number fails the evaluation."""
+        return Expression(ExpressionKind.STAGE_METADATA, name=_check_str(field, "field"))
+
+    @staticmethod
+    def up_axis() -> "Expression":
+        """The unit vector along the stage's ``upAxis``."""
+        return Expression(ExpressionKind.UP_AXIS)
+
+    @staticmethod
+    def add(a: "Expression", b: "Expression") -> "Expression":
+        """``a + b``, between two numbers, or two vectors component by component."""
+        return Expression(ExpressionKind.ADD, operands=(a, b))
+
+    @staticmethod
+    def subtract(a: "Expression", b: "Expression") -> "Expression":
+        """``a - b``, between two numbers, or two vectors component by component."""
+        return Expression(ExpressionKind.SUBTRACT, operands=(a, b))
+
+    @staticmethod
+    def multiply(a: "Expression", b: "Expression") -> "Expression":
+        """``a * b``, between two numbers, or a number and a vector in either order."""
+        return Expression(ExpressionKind.MULTIPLY, operands=(a, b))
+
+    @staticmethod
+    def divide(a: "Expression", b: "Expression") -> "Expression":
+        """``a / b``, a number or a vector over a number."""
+        return Expression(ExpressionKind.DIVIDE, operands=(a, b))
+
+    @staticmethod
+    def resolved_bound_material(purpose: str = "", prim_predicate: Optional[PrimPredicate] = None) -> "Expression":
+        """The material bound to the prim for ``purpose`` (empty for the all-purpose binding), as a
+        one-element list of paths. Nothing if no material is bound, or if ``prim_predicate`` is given
+        and the material does not match it."""
+        return Expression(ExpressionKind.RESOLVED_BOUND_MATERIAL, name=purpose, prim_predicate=prim_predicate)
+
+    @staticmethod
+    def resolved_material_binding_strength(
+        purpose: str = "", prim_predicate: Optional[PrimPredicate] = None
+    ) -> "Expression":
+        """The strength of the binding that binds the prim's material for ``purpose`` (empty for the
+        all-purpose binding), a token, ``strongerThanDescendants`` or ``weakerThanDescendants``.
+        Nothing if no material is bound, or if ``prim_predicate`` is given and the material does not
+        match it."""
+        return Expression(
+            ExpressionKind.RESOLVED_MATERIAL_BINDING_STRENGTH, name=purpose, prim_predicate=prim_predicate
+        )
+
+    @staticmethod
+    def resolved_material_binding_purpose(
+        purpose: str = "", prim_predicate: Optional[PrimPredicate] = None
+    ) -> "Expression":
+        """The purpose the binding that binds the prim's material for ``purpose`` was authored for, a
+        token: ``purpose``, or ``allPurpose`` where resolution fell back to an all-purpose binding.
+        Nothing if no material is bound, or if ``prim_predicate`` is given and the material does not
+        match it."""
+        return Expression(
+            ExpressionKind.RESOLVED_MATERIAL_BINDING_PURPOSE, name=purpose, prim_predicate=prim_predicate
+        )
+
+    @staticmethod
+    def resolved_collection_members(
+        collection: str,
+        prim_predicate: Optional[PrimPredicate] = None,
+        property_predicate: Optional[PropertyPredicate] = None,
+    ) -> "Expression":
+        """The members of the prim's ``CollectionAPI:<collection>``, as USD resolves them. A prim
+        member is kept if it matches ``prim_predicate`` and a property member if it matches
+        ``property_predicate``; ``None`` keeps every member of its kind. The list may be empty.
+        Nothing if the prim applies no such collection."""
+        return Expression(
+            ExpressionKind.RESOLVED_COLLECTION_MEMBERS,
+            name=_check_str(collection, "collection"),
+            prim_predicate=prim_predicate,
+            property_predicate=property_predicate,
+        )
+
+
+class DerivedProperty(_Immutable):
+    """A column a selector computes rather than reads off a prim.
+
+    ``name`` names the column; ``value`` gives its value. ``prim_predicate`` narrows the rule to
+    some of the selector's prims, and ``when`` decides from the prim's own property of that name
+    whether it publishes. ``dtype``, ``semantic`` and ``is_array`` give the column's type where no
+    schema declares it; left unset, the column takes the type its value yields. With
+    ``multi_apply_schema_family`` set, ``name`` holds ``__INSTANCE_NAME__`` once and the rule is
+    evaluated once per applied instance of the family.
+    """
+
+    __slots__ = (
+        "name",
+        "value",
+        "prim_predicate",
+        "when",
+        "dtype",
+        "semantic",
+        "is_array",
+        "multi_apply_schema_family",
+    )
+
+    def __init__(
+        self,
+        name: str,
+        value: Expression,
+        prim_predicate: Optional[PrimPredicate] = None,
+        when: DeriveWhen = DeriveWhen.ALWAYS,
+        dtype: Optional[DLDataType] = None,
+        semantic: AttributeSemantic = AttributeSemantic.NONE,
+        is_array: bool = False,
+        multi_apply_schema_family: str = "",
+    ):
+        self.name = _check_str(name, "name")
+        self.value = _check_predicate(value, Expression)
+        self.prim_predicate = None if prim_predicate is None else _check_predicate(prim_predicate, PrimPredicate)
+        self.when = DeriveWhen(check_enum_member(when, DeriveWhen, "when"))
+        if dtype is not None and not isinstance(dtype, DLDataType):
+            raise TypeError(f"dtype must be a DLDataType, got {type(dtype).__name__}")
+        self.dtype = dtype
+        self.semantic = AttributeSemantic(check_enum_member(semantic, AttributeSemantic, "semantic"))
+        self.is_array = bool(is_array)
+        self.multi_apply_schema_family = (
+            _check_str(multi_apply_schema_family, "multi_apply_schema_family") if multi_apply_schema_family else ""
+        )
+
+
 class Selector(_Immutable):
     """One (which prims, which of their properties, which metadata) rule.
 
     Selectors compose: a prim is in scope if any selector matches it, and its
-    properties are the union over the selectors that did.
+    properties are the union over the selectors that did. ``derived_properties`` are the
+    columns the selector computes on the prims it selects.
     """
 
-    __slots__ = ("prim_predicate", "property_predicate", "prim_metadata_paths", "property_metadata_paths")
+    __slots__ = (
+        "prim_predicate",
+        "property_predicate",
+        "prim_metadata_paths",
+        "property_metadata_paths",
+        "derived_properties",
+    )
 
     def __init__(self, prim_predicate=None, property_predicate=None,
-                 prim_metadata_paths=(), property_metadata_paths=()):
+                 prim_metadata_paths=(), property_metadata_paths=(), derived_properties=()):
         self.prim_predicate = (
             PrimPredicate.none() if prim_predicate is None else _check_predicate(prim_predicate, PrimPredicate)
         )
@@ -448,6 +719,7 @@ class Selector(_Immutable):
         )
         self.prim_metadata_paths = _check_metadata_paths(prim_metadata_paths, "prim_metadata_paths")
         self.property_metadata_paths = _check_metadata_paths(property_metadata_paths, "property_metadata_paths")
+        self.derived_properties = tuple(_check_predicate(d, DerivedProperty) for d in derived_properties)
 
 
 class Desc(_Immutable):
@@ -494,7 +766,14 @@ def _build_prim_predicate(pred: PrimPredicate, keepalive: List, memo: Dict):
         return built[1]
     out = _b.ovstage_population_prim_predicate_t()
     out.kind = check_enum_member(pred.kind, PrimPredicateKind, "prim predicate kind")
-    if pred.strings:
+    if pred.kind == PrimPredicateKind.IS_TARGETED_BY:
+        referrer = _build_prim_predicate(pred.subpredicates[0], keepalive, memo)
+        relationship = _build_property_predicate(pred.nested, keepalive, memo)
+        keepalive.extend((referrer, relationship))
+        out.values.targeted_by.prim_predicate = ctypes.pointer(referrer)
+        out.values.targeted_by.property_predicate = ctypes.pointer(relationship)
+        out.value_count = 2
+    elif pred.strings:
         array, count = _string_array(pred.strings, keepalive)
         out.values.strings = ctypes.cast(array, ctypes.POINTER(_b.ovx_string_t))
         out.value_count = count
@@ -532,11 +811,99 @@ def _build_property_predicate(pred: PropertyPredicate, keepalive: List, memo: Di
         keepalive.append(array)
         out.values.subpredicates = ctypes.cast(array, ctypes.POINTER(_b.ovstage_population_property_predicate_t))
         out.value_count = len(children)
+    elif pred.nested is not None:
+        target = _build_prim_predicate(pred.nested, keepalive, memo)
+        keepalive.append(target)
+        out.values.prim_predicate = ctypes.pointer(target)
+        out.value_count = 1
     else:
         out.values.strings = None
         out.value_count = 0
     memo[id(pred)] = (pred, out)
     return out
+
+
+def _string_view(value: str, keepalive: List):
+    """One ``ovx_string_t`` over `value`, its bytes rooted in `keepalive`."""
+    view = _b.ovx_string_t(value)
+    keepalive.append(view)
+    return view
+
+
+# The values each expression kind takes, as the C constructors set value_count.
+_EXPRESSION_VALUE_COUNTS = {
+    ExpressionKind.NUMBER: 1,
+    ExpressionKind.BOOL: 1,
+    ExpressionKind.STAGE_METADATA: 1,
+    ExpressionKind.UP_AXIS: 0,
+    ExpressionKind.ADD: 2,
+    ExpressionKind.SUBTRACT: 2,
+    ExpressionKind.MULTIPLY: 2,
+    ExpressionKind.DIVIDE: 2,
+    ExpressionKind.RESOLVED_BOUND_MATERIAL: 2,
+    ExpressionKind.RESOLVED_MATERIAL_BINDING_STRENGTH: 2,
+    ExpressionKind.RESOLVED_MATERIAL_BINDING_PURPOSE: 2,
+    ExpressionKind.RESOLVED_COLLECTION_MEMBERS: 3,
+}
+
+
+def _build_expression(expr: Expression, keepalive: List, memo: Dict):
+    # One C node per distinct expression object, as for predicates; a node is referenced by
+    # pointer, so the built struct itself is rooted in `keepalive`.
+    built = memo.get(id(expr))
+    if built is not None:
+        return built[1]
+    out = _b.ovstage_population_expression_t()
+    out.kind = check_enum_member(expr.kind, ExpressionKind, "expression kind")
+    kind = expr.kind
+    if kind == ExpressionKind.NUMBER:
+        out.values.number = expr.literal
+    elif kind == ExpressionKind.BOOL:
+        out.values.boolean = expr.literal
+    elif kind == ExpressionKind.STAGE_METADATA:
+        out.values.name = _string_view(expr.name, keepalive)
+    elif kind in (ExpressionKind.ADD, ExpressionKind.SUBTRACT, ExpressionKind.MULTIPLY, ExpressionKind.DIVIDE):
+        for i, operand in enumerate(expr.operands):
+            out.values.operands[i] = ctypes.pointer(_build_expression(operand, keepalive, memo))
+    elif kind in _EXPRESSION_VALUE_COUNTS and _EXPRESSION_VALUE_COUNTS[kind] >= 2:
+        out.values.resolved.name = _string_view(expr.name, keepalive)
+        if expr.prim_predicate is not None:
+            prim = _build_prim_predicate(expr.prim_predicate, keepalive, memo)
+            keepalive.append(prim)
+            out.values.resolved.prim_predicate = ctypes.pointer(prim)
+        if expr.property_predicate is not None:
+            prop = _build_property_predicate(expr.property_predicate, keepalive, memo)
+            keepalive.append(prop)
+            out.values.resolved.property_predicate = ctypes.pointer(prop)
+    out.value_count = _EXPRESSION_VALUE_COUNTS.get(kind, 0)
+    keepalive.append(out)
+    memo[id(expr)] = (expr, out)
+    return out
+
+
+def _build_derived_properties(rules: Sequence[DerivedProperty], keepalive: List, memo: Dict):
+    """One ``ovstage_population_derived_property_t[]`` over `rules`, rooted in `keepalive`."""
+    if not rules:
+        return None, 0
+    built = []
+    for rule in rules:
+        out = _b.ovstage_population_derived_property_t()
+        out.name = _string_view(rule.name, keepalive)
+        out.multi_apply_schema_family = _string_view(rule.multi_apply_schema_family, keepalive)
+        if rule.prim_predicate is not None:
+            prim = _build_prim_predicate(rule.prim_predicate, keepalive, memo)
+            keepalive.append(prim)
+            out.prim_predicate = ctypes.pointer(prim)
+        out.when = int(rule.when)
+        if rule.dtype is not None:
+            out.dtype = rule.dtype
+        out.semantic = int(rule.semantic)
+        out.is_array = rule.is_array
+        out.value = ctypes.pointer(_build_expression(rule.value, keepalive, memo))
+        built.append(out)
+    array = (_b.ovstage_population_derived_property_t * len(built))(*built)
+    keepalive.append(array)
+    return array, len(built)
 
 
 def build_descs(descs: Sequence[Desc]) -> Tuple:
@@ -563,6 +930,9 @@ def build_descs(descs: Sequence[Desc]) -> Tuple:
             prop_paths, prop_count = _string_array(selector.property_metadata_paths, keepalive)
             csel.property_metadata_paths = ctypes.cast(prop_paths, ctypes.POINTER(_b.ovx_string_t))
             csel.property_metadata_path_count = prop_count
+            rules, rule_count = _build_derived_properties(selector.derived_properties, keepalive, memo)
+            csel.derived_properties = ctypes.cast(rules, ctypes.POINTER(_b.ovstage_population_derived_property_t))
+            csel.derived_property_count = rule_count
             selectors.append(csel)
         if selectors:
             sel_array = (_b.ovstage_population_selector_t * len(selectors))(*selectors)

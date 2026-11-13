@@ -35,13 +35,9 @@ final Torus xform translation (row [3][0:3]): 100.0 25.0 0.0
 after USD edit, prim types: Xform Mesh Mesh Cube
 ```
 
-- The first line confirms the populate: `/World` (an Xform) plus the Plane and
-  Torus meshes from `torus-plane.usda`.
-- The second line is update path 1. The scene is Y-up with the Torus authored
-  at `translate = (0, 25, 0)`, so it slid 100 units along +X, keeping y=25.
-- The last line is update path 2. `/World/EditCube` existed only in a USD
-  reference edit; `ovstage_population_apply_usd_changes` propagates it into
-  the runtime table as a fourth prim.
+- `populated prim types` confirms the populate: `/World` (an Xform) plus the Plane and Torus meshes from `torus-plane.usda`.
+- `final Torus xform translation` shows the direct runtime update. The scene is Y-up with the Torus authored at `translate = (0, 25, 0)`, so it slid 100 units along +X, keeping y=25.
+- `after USD edit, prim types` shows the update through the USD source. `/World/EditCube` existed only in a USD reference edit; `ovstage_population_apply_usd_changes` propagates it into the runtime table as a fourth prim.
 
 ## Build and run
 
@@ -78,14 +74,13 @@ aggregates them).
 
 ## Snippets
 
-The `[snippet:name]` markers in `main.cpp` fence regions referenced by the
-ovstage skills under `../../../skills/`; keep them intact when editing.
+The `[snippet:name]` markers in [main.cpp](main.cpp) identify the source regions described below and referenced by the [ovstage skills](../../../skills/). Keep the markers intact when editing.
 
-- `setup` — the includes shared by every section
-- `populate` — `ovstage_population_open_usd_from_file` + `advance_write_floor`
-- `read-populated` — read the reserved `usd-prim-type` metadata to confirm the populate
-- `update-table` — animate `omni:xform` over 24 frames straight into the table (path 1)
-- `update-usd` — `add_usd_reference_from_string` + `apply_usd_changes` (path 2)
+- `setup` — Includes the ovstage, population, and path-dictionary interfaces plus the C++ utilities used throughout the example. The shared example helpers provide status checking, waits, and tensor descriptions.
+- `populate` — Calls `ovstage_population_open_usd_from_file()` to load rendering data at time 0 and ordinal 1. After waiting for population, it waits for `ovstage_advance_write_floor()` so readers can access that state.
+- `read-populated` — `readPrimTypes()` reads `usd-prim-type` for the selected paths and resolves the returned tokens to names. It returns those names after releasing read groups and the read handle; the caller prints them to confirm population.
+- `update-table` — Calls `ovstage_write_attribute()` to move the Torus over 24 frames, assigning and sealing a new ordinal for each frame. It then reads the final `omni:xform` and prints translation `(100, 25, 0)` before releasing the read resources.
+- `update-usd` — Calls `ovstage_population_add_usd_reference_from_string()` to add `/World/EditCube` to the USD source, then `ovstage_population_apply_usd_changes()` at a fresh ordinal. After waiting and advancing the write floor, a query over the expanded path list confirms the new prim's type.
 
 ## Notes
 

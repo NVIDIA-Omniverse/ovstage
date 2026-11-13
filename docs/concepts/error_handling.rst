@@ -24,6 +24,8 @@ and carry a numeric ``code`` and a message. Some invalid Python arguments raise 
 before calling the native API. On success, :meth:`wait() <ovstage.Operation.wait>` returns the operation or
 handle it was called on.
 
+For Python calls that return an operation or query/read/map handle, call ``wait()`` even if submission did not raise. The returned object can carry a rejected native submission. For example, ``Stage.query()`` returns a ``Query`` for an unsupported filter; ``query.wait()`` raises ``OvstageError`` with code ``ErrorCode.NOT_SUPPORTED``.
+
 In C, check the status returned by the call. After :c:func:`ovstage_wait_op()`,
 also inspect every :term:`operation ID <Operation ID>` in ``error_op_ids``. Retrieve its message
 before the next wait on the same thread, which invalidates the list and messages.
@@ -93,7 +95,7 @@ and ``OVSTAGE_ERROR_*`` for the other members.
    * - ``ErrorCode.INVALID_ARGUMENT``
      - An argument is invalid.
    * - ``ErrorCode.INVALID_HANDLE``
-     - The handle is invalid or has been released.
+     - The handle is invalid or has been released. Do not reuse a query, read, map, or group handle after releasing it.
    * - ``ErrorCode.NOT_FOUND``
      - The requested item was not found.
    * - ``ErrorCode.PRIM_NOT_FOUND``
@@ -106,7 +108,7 @@ and ``OVSTAGE_ERROR_*`` for the other members.
    * - ``ErrorCode.NOT_SUPPORTED``
      - This build does not support the operation or requested data.
    * - ``ErrorCode.QUEUE_FULL``
-     - The submission queue is full.
+     - The call cannot be admitted now. A ``history_selective`` stage (experimental) returns it for a mutation submitted while a floor advance runs its reconciliation, and for a stage operation submitted while a history presentation is active. A ``history_latest`` stage does not return it in this release.
    * - ``ErrorCode.END_OF_ITERATION``
      - There are no more results to fetch.
    * - ``ErrorCode.OUT_OF_MEMORY``
@@ -116,20 +118,42 @@ and ``OVSTAGE_ERROR_*`` for the other members.
    * - ``ErrorCode.TIMEOUT``
      - The wait or fetch did not finish within its timeout.
    * - ``ErrorCode.OP_FAILED``
-     - An asynchronous operation failed. Inspect its diagnostic.
+     - An asynchronous operation failed. Inspect its diagnostic. A wait reports an execution failure as ``OP_FAILED`` with the specific cause in the message. This code is also returned when an operation overlaps a read group that is still held. See `Remediation`_.
    * - ``ErrorCode.OUT_OF_RANGE``
-     - A selected attribute on a queried path has a recorded change after the
-       requested end. The older value is unavailable even after sealing the later
-       change. Request a newer end or current state; see :doc:`/scene/reading_attributes`.
+     - The requested ordinal range cannot be read from the retained values, because a selected prim and attribute changed again after the range end. See `Remediation`_.
    * - ``ErrorCode.INTERNAL``
      - An internal error occurred.
 
 :meth:`ovstage.Read.fetch_next()` and :meth:`ovstage.Map.fetch_next()` return
 ``None`` at the end of iteration rather than raising an exception.
 
+Remediation
+-----------
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 70
+
+   * - Status
+     - What to do
+   * - ``WRITE_FLOOR_VIOLATION``
+     - For a write, delete, or clone, use an ordinal above the :term:`watermark <Watermark>` (write floor in the API) of every attribute it touches and satisfy the configured ordinal-admission policy (:ref:`ordinal-admission-policies`). A write submitted after an advance can still be accepted at submission and fail when it runs, so check the wait result as well. For a read, advance the watermark to cover the changes you want, wait for the advance to complete, and read again.
+   * - ``OUT_OF_RANGE``
+     - The range ends before a later change to a selected prim and attribute. Only the latest value is retained, so read through the later ordinal or read the latest state instead.
+   * - ``OP_FAILED`` (overlap)
+     - A read group, map, or pending write covers the same attribute on the same prims, or a read group covers a prim that the write, map, delete, or clone would give ``omni:fabric:worldMatrix``: a hierarchy parent or ancestor of its prims (for a delete, the ancestor its children move under), or a prim with a transform input between one of them and a descendant that carries it (see :doc:`/scene/transforms`). Release every fetched read group (``ovstage_release_groups()`` in C or ``Stage.release_group()`` in Python) and the read handle before writing, deleting, or mapping that data or cloning beneath those prims, and wait for a pending write before reading it. Aliased attribute names count as the same data. A population step is not rejected for a held group; it connects the affected prims, and gives the attribute, later (see :doc:`/scene/transforms`).
+   * - ``INVALID_HANDLE``
+     - The handle was already released, never existed, or belongs to another instance. Keep one owner per handle and release it once.
+   * - ``QUEUE_FULL``
+     - Retry the refused call after the floor advance or the presenting step returns. Limit the number of operations you keep in flight. See :ref:`ovstage-selective-history`.
+
+Copy an error message immediately, on the thread that made the call. Error state is per thread, and a later wait or internal wait on that thread can clear or replace it.
+
 See :doc:`overview` for diagrams explaining :term:`watermark <Watermark>` and range-read
 errors. A watermark advance to a lower ordinal has no effect; it does not move
 the watermark backwards or report a watermark violation.
+
+.. _ovstage-write-recovery:
 
 Recovering from a Failed Write
 --------------------------------------
@@ -146,8 +170,10 @@ A failed batch can leave some :term:`changes <Change>` applied:
   Visibility alone does not prove a change was recorded. ``PrimMode.INSERT`` can reject
   this existing target; ``PrimMode.UPSERT`` can repair it.
 
-Reserved metadata entries can complete before ordinary attribute entries
-during execution and remain committed if a later entry fails. Allocating ordinary attribute storage
+Check every write's completion and finish any repair before advancing the watermark. A successful advance does not report earlier write failures or undo completed entries. If a repair uses a newer ordinal, advance the watermark through that ordinal only after the repair succeeds.
+
+Completed metadata writes count as successful entries, even when they happened
+while preparing the rest of the batch. Allocating ordinary attribute storage
 alone does not count as a successful write.
 
 Under ``STRICTLY_INCREASING``, replaying completed cells at their recorded
@@ -171,10 +197,7 @@ the operation diagnostic.
 
 .. warning::
 
-   If an entry was applied successfully but the runtime cannot record its
-   committed prims or attributes, ordinal ownership, and change records
-   consistently, the implementation terminates the process. This is not a returned status or a
-   Python exception.
+   Recoverable allocation failures use the error reporting described above. If an update has already changed data and the runtime cannot keep the stage consistent, it terminates the process instead. This failure cannot be handled as a returned status or Python exception.
 
 Diagnostic Messages
 ---------------------------
@@ -192,7 +215,9 @@ the failure:
      - Static, non-null ``const char*`` for a status code. Requires a live instance.
    * - :c:func:`ovstage_get_last_op_error()`
      - Borrowed ``ovx_string_t`` for a failed ID from the last wait. Copy before another wait on
-       the same thread or releasing operation tracking.
+       the same thread or releasing operation tracking. Pass ``OVSTAGE_INVALID_OP_ID``
+       to read the current thread-local data-plane diagnostic, if available;
+       another API call may replace or clear it.
    * - :c:func:`ovstage_get_last_error()`
      - Borrowed ``ovx_string_t``, available without a live instance, including after
        instance creation fails. Copy it before subsequent calls replace it.
@@ -261,3 +286,15 @@ Release and recreate those handles; retrying them does not restore readiness.
 The refresh failure is not reported on the operation that caused the change,
 which can still report success. It first surfaces when an affected handle is
 used, currently without a diagnostic message.
+
+GPU Write Completion Failures
+-----------------------------
+
+In this implementation, if the stage cannot confirm that a CUDA write finished,
+every later attribute read, attribute write, and structural change on that
+stage reports ``OP_FAILED``, including attributes that no CUDA write touched.
+CUDA reports an asynchronous device fault on whichever later query observes
+it, so the failure cannot be attributed to one write or attribute. Waiting or
+retrying does not clear it. Destroy the stage and create a new one; whether
+the process can continue to use the CUDA device depends on the fault.
+

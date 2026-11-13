@@ -19,12 +19,15 @@ consumer would ("current mode"):
   2. C tests: cmake configure+build (find_package(ovstage) + GoogleTest) -> ctest;
   3. C examples: one aggregate cmake configure+build, then run every shipped
      example, assert exit 0 (GPU-requiring examples run only when a CUDA device
-     is detected; OVSTAGE_PUBLIC_TESTS_REQUIRE_GPU=1 makes their skip a failure);
+     is detected; OVSTAGE_PUBLIC_TESTS_REQUIRE_GPU=1 makes their skip a failure;
+     producer-consumer also runs its concurrent --threads mode, asserted exit 0
+     like any other run);
   4. if --wheel is given: create/reuse a venv, force-reinstall the wheel (so a
      rerun always tests this --wheel) + pytest + numpy, run pytest over
      tests/python, then run every shipped Python example (extra public-PyPI
      deps such as usd-core install from the example's own pins; GPU-only deps
-     such as warp install only when a CUDA device is present).
+     such as warp install only when a CUDA device is present), including the
+     same --threads run for producer-consumer.
 
 The package's bin/ is put on the loader path (PATH on Windows, LD_LIBRARY_PATH on
 Linux) so ovstage finds its bundled runtime closure. CPU-only except the
@@ -101,6 +104,15 @@ PY_GPU_DEPS = {
 # publishes no aarch64 wheels); skipped there instead of hard-failing the
 # dep install. x86_64/Windows keep the hard fail.
 PY_EXAMPLES_NO_AARCH64 = {"usd-to-ovstage"}
+# Examples with a second, concurrent mode (`main --threads`). It runs after the
+# default mode, in both languages, and must exit 0 like any other run. The mode
+# runs a producer and a consumer on one shared instance, coordinates the
+# accesses that conflict and asserts that an unrelated write completes while a
+# read group is held, so a rejection, an unexpected final state or a hang is a
+# defect. This gate used to accept exit 1 from the C run as an "expected race"
+# and never ran the Python mode, which hid a 45-62% failure rate of the shipped
+# Python example.
+THREADED_EXAMPLES = {"producer-consumer"}
 
 IS_WINDOWS = sys.platform == "win32"
 IS_AARCH64 = platform.machine().lower() in ("aarch64", "arm64")
@@ -399,21 +411,9 @@ def _run_c_examples(root: Path, config: str) -> None:
                 f"generator {_cmake_cache_value(build, 'CMAKE_GENERATOR') or 'unknown'}; "
                 f"matching files under {build / name}: {found or 'none'})")
         _run_scanned([exe], env=_runtime_env(root), cwd=exe.parent)
-        if name == "producer-consumer":
-            # Also cover the concurrent mode (--threads): producer and consumer
-            # on one shared instance with coordinated shutdown. The example
-            # documents an EXPECTED race under load (a producer write rejected
-            # while it overlaps an outstanding consumer read) and exits 1 with
-            # a coordinated shutdown in that case, so exit 0 and exit 1 are
-            # both healthy; anything else (crash, signal) fails the suite.
+        if name in THREADED_EXAMPLES:
             _log(f"=== C example: {name} --threads ===")
-            threads_rc = _run_scanned([exe, "--threads"], check=False,
-                                      env=_runtime_env(root), cwd=exe.parent)
-            if threads_rc not in (0, 1):
-                raise SystemExit(
-                    f"{name} --threads exited abnormally (code {threads_rc})")
-            if threads_rc == 1:
-                _log(f"{name} --threads hit its documented expected race (exit 1)")
+            _run_scanned([exe, "--threads"], env=_runtime_env(root), cwd=exe.parent)
     _check_absent_examples("C", absent)
 
 
@@ -462,7 +462,7 @@ def _run_python_suite(wheel: Path) -> None:
     # pip skips an already-installed same-version wheel: without it a rerun
     # would silently validate the previous run's artifact, not this --wheel.
     _run([py, "-m", "pip", "install", "--no-index", "--force-reinstall", wheel])
-    _run([py, "-m", "pip", "install", "pytest", "numpy"])
+    _run([py, "-m", "pip", "install", "pytest>=9.2.0,<10", "Pygments>=2.21.0", "numpy"])
     _run([py, "-m", "pytest", PYTHON_TESTS_DIR, "-v"])
     absent: list[str] = []
     for name, needs_gpu, extra_deps in PY_EXAMPLES:
@@ -485,6 +485,9 @@ def _run_python_suite(wheel: Path) -> None:
             _install_example_deps(py, example_dir, name, gpu_deps)
         _log(f"=== Python example: {name} ===")
         _run_scanned([py, main_py], cwd=example_dir)
+        if name in THREADED_EXAMPLES:
+            _log(f"=== Python example: {name} --threads ===")
+            _run_scanned([py, main_py, "--threads"], cwd=example_dir)
     _check_absent_examples("Python", absent)
 
 

@@ -1,84 +1,105 @@
-# USD export (c)
+# ovstage usd-export (C/C++)
 
-Export a typed USD subtree, mesh geometry, and runtime-created values. The example
-shows destination lifetime, custom attribute rules, renaming, selection, transforms,
-reports, changed properties, and asynchronous export. No USD Python binding is needed.
+Export selected runtime data to USD and inspect the result. The first workflow
+populates an inline USD scene and exports its typed `/World/Props` subtree.
+A second, separate runtime stage is authored directly to demonstrate transform
+export, property selection and renaming, destination ownership, and change export.
 
-## Run
+The [Python example](../../python/usd-export/README.md) covers the same workflows.
 
-```sh
+## At a glance
+
+Start with typed-hierarchy export when the runtime data already carries USD type
+and schema information. The later cases make export choices explicit for data
+written directly by an application. Export selects and projects runtime data;
+it is not an automatic serialization of every runtime column.
+
+Pseudocode (workflow only):
+
+```text
+populate the inline scene; finish writes through ordinal 1
+export /World/Props as typed USD and inspect the file
+export the mesh subtree separately
+on a new stage, write a transform and custom properties at ordinal 1
+compare one-shot file export with an explicitly owned destination
+select, rename, and type exported properties; inspect the reports
+change temperature at ordinal 2; export changes since ordinal 1
+```
+
+## What you'll see
+
+| Case | Result and meaning |
+|---|---|
+| Typed hierarchy | The file contains Sphere `Ball` and Cube `Crate`; `OutsideSelection` is excluded. |
+| Mesh subtree | A separate file exports the meshes and their schema data. |
+| Transform-only export | One transform is exported for the directly authored ball. |
+| Reused destination | Transform and temperature exports are accumulated before an explicit save. |
+| Renamed property | Runtime `solver:collisionRadius = 2.5` becomes USD `radius` on a Sphere definition. |
+| Changed properties | Temperature changes from 20 to 24.5; the change export reports one attribute. |
+
+The program also demonstrates closing a destination without saving and rejecting
+an export request at an invalid earlier ordinal. These are deliberate lifetime
+and error-handling cases, not additional successful file exports.
+
+The command below writes `exported.usda` and companion files such as
+`exported.usda.meshes.usda` and `exported.usda.changed.usda` in the build directory.
+Choose a new destination name when you want to retain earlier output.
+
+## How to read the code
+
+Start in `main()` in [main.cpp](main.cpp), then follow the helpers it calls.
+The names below are searchable `[snippet:name]` markers in that file.
+
+| Source markers | What to learn |
+|---|---|
+| `typed-hierarchy-c-example`, `export-mesh-c` | Read these blocks in main first: select a subtree, initialize typed-hierarchy export, save it, and inspect the result. Meshes use a second selection. |
+| `export-example-setup-c`, `export-write-runtime-c` | In the runtime-data helper, create a separate stage and author a transform, temperature, collision radius, and USD type information. |
+| `export-file-c`, `export-lifetime-c`, `export-reuse-c` | Compare the file convenience operation (export, save, close) with a destination that the caller must explicitly save and close. |
+| `export-custom-c`, `export-rule-c`, `export-rename-c` | Select a property namespace, then use an explicit rule when the runtime name or desired USD type differs. |
+| `export-selection-c`, `export-matrix-c` | Narrow the selected prim/properties and choose explicit matrix-op export for the transform. |
+| `export-report-c`, `export-async-c` | Inspect counts, handle the invalid-ordinal case, and wait for asynchronous file export to finish saving before using its report. |
+| `export-changed-c` | Update temperature at ordinal 2, finish writes, and export properties changed since ordinal 1. |
+
+## Build and run
+
+Use an ovstage package with population/export support.
+See the [shared setup](../../README.md) for package prerequisites.
+Run these commands from this example's directory.
+
+Linux:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+cd build
+./usd-export exported.usda
+```
+
+Windows (multi-configuration generator):
+
+```powershell
 cmake -S . -B build
 cmake --build build --config Release
-./build/usd-export /tmp/destination.usda
+$env:PATH = "<ovstage-package>\bin;$env:PATH"
+Set-Location build\Release
+.\usd-export.exe exported.usda
 ```
 
-On multi-config generators, use `build/Release/usd-export`. The main output path
-defaults to `destination.usda`; other files add suffixes to it.
+Keep the package's `bin/` directory intact so the library can find its plugins.
+Linux builds set an rpath to that directory. The project uses the shared
+[cmake](../cmake/) and [common](../common/) directories; retain them if copying it.
 
-## Snippet context
+## Notes
 
-The source contains `/World/Ball` with its watermark at ordinal 1. The final
-example advances it to 2. See the full program for the shared setup.
+- Closing an owned destination does not save it. The one-shot file operation
+  performs both steps; the reusable-destination path calls save explicitly.
+- Export reads through a completed write ordinal. The example waits for its
+  writes and floor advancement before requesting each export.
+- Changed-property export selects changed properties; it does not turn the
+  runtime stage into a general history archive.
 
-## Save a transform overlay
+## Further reading
 
-```cpp
-ovstage_population_export_attribute_rule_t transformRule{};
-transformRule.source_attribute_name = literal_to_ovx_string("omni:xform");
-ovstage_population_export_desc_t transformDesc{};
-check(stage, ovstage_population_export_desc_init_snapshot(&transformDesc, 1), "init export");
-transformDesc.attribute_rules = &transformRule;
-transformDesc.attribute_rule_count = 1;
-const std::string transformFile = prefix + "transforms.usda";
-ovstage_population_export_report_t report{};
-// One-shot export creates, saves, and closes the overlay layer.
-check(stage, ovstage_population_export_to_usd_file(stage,
-    {transformFile.c_str(), transformFile.size()}, &transformDesc, &report), "export transforms");
-std::printf("Transforms exported: %zu\n", report.transforms_exported);
-// Transforms exported: 1
-```
-
-## Accumulate exports, then save
-
-```cpp
-const std::string combinedFile = prefix + "combined.usda";
-ovstage_population_export_destination_handle_t usd{};
-check(stage, ovstage_population_export_destination_create(stage,
-    {combinedFile.c_str(), combinedFile.size()}, OVSTAGE_POPULATION_EXPORT_DESTINATION_EMPTY,
-    &usd), "create destination");
-check(stage, ovstage_population_export_to_destination(stage, usd, &transformDesc, nullptr), "export transform");
-ovstage_population_export_attribute_rule_t temperatureRule{};
-temperatureRule.source_attribute_name = literal_to_ovx_string("userProperties:temperature");
-temperatureRule.usd_type_name = literal_to_ovx_string("float");
-ovstage_population_export_desc_t temperatureDesc{};
-check(stage, ovstage_population_export_desc_init_snapshot(&temperatureDesc, 1), "init export");
-temperatureDesc.attribute_rules = &temperatureRule;
-temperatureDesc.attribute_rule_count = 1;
-check(stage, ovstage_population_export_to_destination(stage, usd, &temperatureDesc, nullptr), "export temperature");
-// Persist both exports, then release the destination. Save itself leaves it open.
-check(stage, ovstage_population_export_destination_save(stage, usd), "save");
-check(stage, ovstage_population_export_destination_destroy(stage, usd), "close destination");
-```
-
-## Export a changed temperature
-
-```cpp
-// custom.usda already holds the baseline temperature 20 at ordinal 1.
-// tensors[1] points to temperature; tokens[1] names userProperties:temperature.
-// query still selects the single prim /World/Ball.
-temperature = 24.5f;
-waitOp(stage, ovstage_write_attribute(stage, query, {tokens[1], {}}, 2,
-    writeData(&tensors[1]), OVSTAGE_PRIM_MODE_UPSERT), "update temperature");
-watermark.ordinal = 2;
-waitOp(stage, ovstage_advance_write_floor(stage, &watermark), "advance watermark");
-auto changedDesc = temperatureDesc;
-changedDesc.ordinal = 2;
-changedDesc.since_ordinal = 1;
-changedDesc.selection = OVSTAGE_POPULATION_EXPORT_SELECTION_CHANGED_PROPERTIES_SINCE_ORDINAL;
-const std::string changedFile = prefix + "changed.usda";
-ovstage_population_export_report_t changed{};
-check(stage, ovstage_population_export_to_usd_file(stage,
-    {changedFile.c_str(), changedFile.size()}, &changedDesc, &changed), "export changes");
-std::printf("Changed attributes exported: %zu\n", changed.attributes_exported);
-// Changed attributes exported: 1
-```
+- [Exporting runtime data to USD](../../../docs/scene/exporting_to_usd.rst)
+- [Population example](../population/README.md)
+- [Transform example](../transforms/README.md)

@@ -64,7 +64,7 @@ def test_unplaced_write_is_unchanged(placement_fixture):
     read = stage.read_attributes(query, [attr], OrdinalRange.latest(1))
     read.wait()
     group = read.fetch_next()
-    values = np.array(group.array(0))
+    values = np.array(group.columns[0].array(0))
     stage.release_group(group)
     read.release().wait()
     np.testing.assert_allclose(values, [1.0, 2.0, 3.0])
@@ -90,7 +90,7 @@ def test_cpu_placement_agreeing_with_source_round_trips(placement_fixture):
     read = stage.read_attributes(query, [attr], OrdinalRange.latest(1))
     read.wait()
     group = read.fetch_next()
-    values = np.array(group.array(0))
+    values = np.array(group.columns[0].array(0))
     stage.release_group(group)
     read.release().wait()
     np.testing.assert_allclose(values, [7.0, 8.0, 9.0])
@@ -180,7 +180,7 @@ def test_ragged_payload_round_trips_through_a_cpu_placement(placement_fixture):
     read.wait()
     group = read.fetch_next()
     assert group is not None
-    out = [np.array(group.array(i)).tolist() for i in range(group.raw.data.tensor_count)]
+    out = [np.array(group.columns[0].array(i)).tolist() for i in range(group.columns[0].raw.data.tensor_count)]
     stage.release_group(group)
     read.release().wait()
     assert out == [[1.0], [2.0, 3.0], [4.0, 5.0, 6.0]]
@@ -203,7 +203,7 @@ def test_placement_with_an_index_map_gathers_correctly(placement_fixture):
     read = stage.read_attributes(query, [attr], OrdinalRange.latest(1))
     read.wait()
     group = read.fetch_next()
-    values = np.array(group.array(0)).tolist()
+    values = np.array(group.columns[0].array(0)).tolist()
     stage.release_group(group)
     read.release().wait()
     assert values == [8.0, 9.0, 8.0]
@@ -242,7 +242,7 @@ def test_write_accepts_a_plain_placement(placement_fixture):
     read = stage.read_attributes(query, [attr], OrdinalRange.latest(1))
     read.wait()
     group = read.fetch_next()
-    values = np.array(group.array(0)).tolist()
+    values = np.array(group.columns[0].array(0)).tolist()
     stage.release_group(group)
     read.release().wait()
     assert values == [1.0, 2.0, 3.0]
@@ -266,7 +266,7 @@ def test_map_accepts_a_plain_placement(placement_fixture):
     read = stage.read_attributes(query, [attr], OrdinalRange.latest(1))
     read.wait()
     group = read.fetch_next()
-    values = np.array(group.array(0)).tolist()
+    values = np.array(group.columns[0].array(0)).tolist()
     stage.release_group(group)
     read.release().wait()
     assert values == [4.0, 4.0, 4.0]
@@ -293,11 +293,8 @@ def test_placement_structs_match_the_c_layout():
     ]
     assert ctypes.sizeof(_bindings.ovstage_placement_t) == 24
 
-    # Placement reaches the API through dedicated *_on_device entry points, so
-    # there is no per-operation options struct to mirror -- and a read places
-    # nothing at all. Assert the absence instead of dropping the check: a mirror
-    # left behind for a struct the C side no longer has is the silent kind of
-    # drift this test exists to catch.
+    # Placement uses dedicated *_on_device entry points, without per-operation
+    # options structs. Reject stale mirrors of removed C structs.
     for gone in ("ovstage_write_options_t", "ovstage_map_options_t", "ovstage_read_options_t"):
         assert not hasattr(_bindings, gone), f"{gone} no longer exists in the C API"
 
@@ -446,11 +443,11 @@ def _read_once(stage, query, attr, **kwargs):
     read.wait()
     group = read.fetch_next()
     assert group is not None
-    values = np.array(group.array(0)).tolist()
+    values = np.array(group.columns[0].array(0)).tolist()
     # device_type is a ctypes.c_int *subclass*, handed back as an instance rather
     # than an int, so .value is required -- without it the comparison below is an
     # identity test that is simply always false.
-    device = group.raw.data.tensors[0].device.device_type.value
+    device = group.columns[0].raw.data.tensors[0].device.device_type.value
     stage.release_group(group)
     read.release().wait()
     return values, device

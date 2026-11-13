@@ -151,7 +151,7 @@ TEST_F(DeleteTest, DeleteAttributeThenPrim)
     // no longer see the attribute. A named attribute list deletes just those
     // columns on the target prims; an EMPTY list (count 0) tombstones the prims
     // entirely. A HAS filter query shows the prim set shrinking.
-    ovx_string_or_token_t deleteAttr{ heat_, {} };
+    ovx_token_or_string_t deleteAttr{ heat_, {} };
     ASSERT_TRUE(waitOp(stage_, ovstage_delete_attributes(stage_, bQuery_, &deleteAttr, 1, 2), "delete attr on B"));
     seal(2);
     EXPECT_EQ(hasCount(), 1u); // only A still carries del-heat

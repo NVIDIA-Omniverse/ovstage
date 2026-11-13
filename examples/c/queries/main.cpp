@@ -31,24 +31,23 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "../common/ovstage_example_utils.h"
 
 // What reading one column over a query yields: one entry per matched prim, in
-// stage order (group order is an implementation detail). cells[i] is the raw
-// column value backing paths[i], widened to 64 bits -- this example reads a
-// uint64 token column (usd-prim-type) and an int32 column (example:count);
-// the caller knows the dtype and casts back.
+// stage order (group order is an implementation detail). cells[i] retains the
+// column type: ovx_token_t for usd-prim-type or int32_t for example:count.
+template <typename T>
 struct ColumnRows
 {
     std::vector<std::string> paths;
-    std::vector<uint64_t> cells;
+    std::vector<T> cells;
 };
 
 // [snippet:resolve-matched-prims]
-// Resolve prim handles back to path strings. Prim-path and token handles are
-// dictionary-lifetime -- no per-handle release.
+/// Resolve token through dict and return a copy of its text. The example exits if dictionary lookup fails.
 static std::string tokenName(path_dictionary_instance_t* dict, ovx_token_t token)
 {
     ovx_string_t name{};
@@ -57,8 +56,8 @@ static std::string tokenName(path_dictionary_instance_t* dict, ovx_token_t token
     return std::string(name.ptr ? name.ptr : "", name.length);
 }
 
-// One "/World/..." string from one prim-path handle: decompose the path into its name tokens
-// through the dictionary, then resolve each token.
+/// Resolve path through dict and return its full path string by joining the resolved name tokens.
+/// This example uses a fixed token buffer and exits if it cannot decompose the path.
 static std::string resolvePath(path_dictionary_instance_t* dict, ovx_primpath_t path)
 {
     ovx_token_t tokenBuffer[64] = {};
@@ -71,8 +70,7 @@ static std::string resolvePath(path_dictionary_instance_t* dict, ovx_primpath_t 
     checkOvx(dict, ovxResult, "get_tokens_from_paths");
     if (numProcessed == 0 || numTokens[0] == 0 || !tokensPerPath[0])
     {
-        std::fprintf(stderr, "could not decompose a prim path into tokens\n");
-        std::exit(EXIT_FAILURE);
+        fail("could not decompose a prim path into tokens");
     }
     std::string result;
     for (size_t i = 0; i < numTokens[0]; ++i)
@@ -83,7 +81,7 @@ static std::string resolvePath(path_dictionary_instance_t* dict, ovx_primpath_t 
     return result;
 }
 
-// Fetch every prim-path handle in a path list.
+/// Fetch the path handles in list through dict and return them in list order. This does not release the input list.
 static std::vector<ovx_primpath_t> pathListHandles(path_dictionary_instance_t* dict, ovx_primpath_list_t list)
 {
     size_t total = 0;
@@ -100,9 +98,8 @@ static std::vector<ovx_primpath_t> pathListHandles(path_dictionary_instance_t* d
     return handles;
 }
 
-// The prim paths a read group covers: a group identifies its prims as a path-list handle plus
-// offset/count (contiguous) or an index_map (sparse); the list handle is a BORROW owned by the
-// read -- do not release it.
+/// Return copied path strings for prims, applying its offset or index_map to the group's path list.
+/// Call while the read group is valid. Do not release the group's path-list handle separately.
 static std::vector<std::string> groupPaths(path_dictionary_instance_t* dict, const ovstage_prim_group_t& prims)
 {
     const std::vector<ovx_primpath_t> handles = pathListHandles(dict, prims.list);
@@ -112,8 +109,7 @@ static std::vector<std::string> groupPaths(path_dictionary_instance_t* dict, con
         const size_t index = prims.index_map ? prims.index_map[i] : prims.offset + i;
         if (index >= handles.size())
         {
-            std::fprintf(stderr, "read group indexes past its path list\n");
-            std::exit(EXIT_FAILURE);
+            fail("read group indexes past its path list");
         }
         paths.push_back(resolvePath(dict, handles[index]));
     }
@@ -125,7 +121,8 @@ static std::vector<std::string> groupPaths(path_dictionary_instance_t* dict, con
 // each matched prim's path and its raw column cell. The tensor row for logical prim i honors
 // data.index_map when present (gather/reorder/dedup) and is the identity otherwise, in which
 // case one tensor row backs each covered prim.
-static ColumnRows readColumnRows(ovstage_instance_t* stage, path_dictionary_instance_t* dict,
+template <typename T>
+static ColumnRows<T> readColumnRows(ovstage_instance_t* stage, path_dictionary_instance_t* dict,
                                  ovstage_query_handle_t query, ovx_token_t attribute, ovstage_ordinal_t endOrdinal)
 {
     ovstage_ordinal_range_t range{};
@@ -136,41 +133,52 @@ static ColumnRows readColumnRows(ovstage_instance_t* stage, path_dictionary_inst
     ovstage_enqueue_result_t enq = ovstage_read_attributes(stage, query, &attribute, 1, range, &read);
     waitOp(stage, enq, "read_attributes");
 
-    ColumnRows rows;
+    ColumnRows<T> rows;
     for (;;)
     {
+        size_t fetchedGroupCount = 0;
         ovstage_read_group_t group{};
-        const ovstage_api_status_t fetched = ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group);
+        const ovstage_api_status_t fetched =
+            ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group, 1, &fetchedGroupCount);
         if (fetched == OVSTAGE_ERROR_END_OF_ITERATION)
             break;
         check(stage, fetched, "fetch_read_next");
 
         const std::vector<std::string> paths = groupPaths(dict, group.prims);
-        if (group.data.tensor_count != 1 || !group.data.tensors || !group.data.tensors[0].data ||
-            group.data.tensors[0].ndim < 1)
+        if (group.column_count != 1)
+            fail("single-attribute read returned multiple columns");
+        const ovstage_read_column_t& column = group.columns[0];
+        if (column.data.tensor_count != 1 || !column.data.tensors || !column.data.tensors[0].data ||
+            column.data.tensors[0].ndim < 1)
         {
-            std::fprintf(stderr, "unexpected read-group layout (want one tensor row per covered prim)\n");
+            fail("unexpected read-group layout (want one tensor row per covered prim)");
+        }
+        const DLTensor& tensor = column.data.tensors[0];
+        if (static_cast<size_t>(tensor.dtype.bits) * tensor.dtype.lanes != sizeof(T) * 8)
+        {
+            std::fprintf(stderr, "column cell is %u bits x %u lanes, but the caller reads %zu-byte cells\n",
+                         static_cast<unsigned>(tensor.dtype.bits), static_cast<unsigned>(tensor.dtype.lanes),
+                         sizeof(T));
             std::exit(EXIT_FAILURE);
         }
-        const DLTensor& tensor = group.data.tensors[0];
-        const size_t rowCount = group.data.index_map ? static_cast<size_t>(group.data.count) :
+        const size_t rowCount = column.data.index_map ? static_cast<size_t>(column.data.count) :
                                                        static_cast<size_t>(tensor.shape[0]);
         if (rowCount != paths.size())
         {
-            std::fprintf(stderr, "unexpected read-group layout (want one tensor row per covered prim)\n");
-            std::exit(EXIT_FAILURE);
+            fail("unexpected read-group layout (want one tensor row per covered prim)");
         }
+        using TensorValue = std::conditional_t<std::is_same_v<T, ovx_token_t>, uint64_t, T>;
+        const auto* values = reinterpret_cast<const TensorValue*>(
+            static_cast<const uint8_t*>(tensor.data) + tensor.byte_offset);
         for (size_t i = 0; i < paths.size(); ++i)
         {
-            const uint32_t row = group.data.index_map ? group.data.index_map[i] : static_cast<uint32_t>(i);
-            const uint64_t cell = tensor.dtype.bits == 64 ?
-                                      static_cast<const uint64_t*>(tensor.data)[row] :
-                                      static_cast<uint64_t>(static_cast<const int32_t*>(tensor.data)[row]);
+            const uint32_t row = column.data.index_map ? column.data.index_map[i] : static_cast<uint32_t>(i);
+            T cell{ values[row] };
             rows.paths.push_back(paths[i]);
             rows.cells.push_back(cell);
         }
-        ovstage_api_status_t status = ovstage_release_group(stage, &group);
-        check(stage, status, "release_group");
+        ovstage_api_status_t status = ovstage_release_groups(stage, &group, 1);
+        check(stage, status, "release_groups");
     }
     enq = ovstage_release_read(stage, read);
     waitOp(stage, enq, "release_read");
@@ -178,12 +186,10 @@ static ColumnRows readColumnRows(ovstage_instance_t* stage, path_dictionary_inst
 }
 
 // [snippet:filter-query]
-// Run one single-predicate filter query end to end: enqueue the filter (predicates in one filter
-// AND together; values are always strings), enumerate the matched prims by reading the reserved
-// usd-prim-type column over the query, and release the query handle. No path list goes in --
-// the stage finds the prims.
+/// Query stage using attribute, op, and optional string value; read primType through endOrdinal to enumerate the matched paths.
+/// Wait for completion, release read/query resources, and print sorted paths with label. Shared checks exit the example on failure.
 static void runFilterQuery(ovstage_instance_t* stage, path_dictionary_instance_t* dict,
-                           ovx_string_or_token_t attribute, ovstage_filter_op_t op, const char* value,
+                           ovx_token_or_string_t attribute, ovstage_filter_op_t op, const char* value,
                            ovx_token_t primType, ovstage_ordinal_t endOrdinal, const char* label)
 {
     const ovx_string_t values[] = { { value, value ? std::strlen(value) : 0 } };
@@ -203,7 +209,7 @@ static void runFilterQuery(ovstage_instance_t* stage, path_dictionary_instance_t
     ovstage_enqueue_result_t enq = ovstage_query(stage, &filter, nullptr, 0, &query);
     waitOp(stage, enq, label);
 
-    ColumnRows rows = readColumnRows(stage, dict, query, primType, endOrdinal);
+    auto rows = readColumnRows<ovx_token_t>(stage, dict, query, primType, endOrdinal);
 
     enq = ovstage_release_query(stage, query);
     waitOp(stage, enq, "release_query");
@@ -236,11 +242,11 @@ int main(int argc, char** argv)
     const ovx_token_t countTok = tokens[1]; // user attribute for the HAS / GT sections
 
     // ---- 1. populate the scene and list the populated prims ----
-    // Populate everything (domain ALL) at ordinal 1 and seal it; NAN time means "default time".
-    // The instanceable references land as XformInstance prims, mapped out in section 6.
+    // Populate the rendering domain at ordinal 1 and seal it; NAN time means "default time".
+    // The instanceable references land as instance roots of their authored type, mapped out in section 6.
     const ovx_string_t sceneStr{ scenePath, std::strlen(scenePath) };
     ovstage_population_enqueue_result_t popEnq = ovstage_population_open_usd_from_file(
-        stage, sceneStr, /*ordinal*/ 1, /*time*/ NAN, OVSTAGE_POPULATION_DOMAIN_ALL);
+        stage, sceneStr, /*ordinal*/ 1, /*time*/ NAN, OVSTAGE_POPULATION_DOMAIN_RENDERING);
     waitPop(stage, popEnq, "open_usd");
 
     ovstage_write_floor_desc_t floor1{};
@@ -265,14 +271,14 @@ int main(int argc, char** argv)
     status = ovstage_query_from_path_list(stage, scenePaths, &sceneQuery);
     check(stage, status, "query_from_path_list");
 
-    const ColumnRows sceneRows = readColumnRows(stage, dict, sceneQuery, primType, /*endOrdinal*/ 1);
+    const auto sceneRows = readColumnRows<ovx_token_t>(stage, dict, sceneQuery, primType, /*endOrdinal*/ 1);
 
-    // Example plumbing: the usd-prim-type cells are uint64 tokens -- resolve each
+    // Example plumbing: the usd-prim-type cells are typed tokens -- resolve each
     // to its name and print "path = Type", sorted for deterministic output.
     std::vector<std::string> sceneLines;
     for (size_t i = 0; i < sceneRows.paths.size(); ++i)
         sceneLines.push_back(sceneRows.paths[i] + " = " +
-                             tokenName(dict, static_cast<ovx_token_t>(sceneRows.cells[i])));
+                             tokenName(dict, sceneRows.cells[i]));
     std::sort(sceneLines.begin(), sceneLines.end());
     std::printf("populated prims (usd-prim-type):\n");
     for (const std::string& line : sceneLines)
@@ -452,6 +458,33 @@ int main(int argc, char** argv)
     }
 
     {
+        // [snippet:query-excluded-attribute-c]
+        // Match meshes, leaving out every prim that has example:count.
+        const ovx_string_t meshType = literal_to_ovx_string("Mesh");
+        ovstage_predicate_t predicates[2]{};
+        predicates[0].attribute.string = literal_to_ovx_string("usd-prim-type");
+        predicates[0].op = OVSTAGE_FILTER_OP_IN;
+        predicates[0].values = &meshType;
+        predicates[0].value_count = 1;
+        predicates[1].attribute.string = literal_to_ovx_string("example:count");
+        predicates[1].op = OVSTAGE_FILTER_OP_NOT_HAS;
+        ovstage_filter_t filter{};
+        filter.predicates = predicates;
+        filter.count = 2;
+
+        ovstage_query_handle_t query = OVSTAGE_INVALID_QUERY_HANDLE;
+        waitOp(stage, ovstage_query(stage, &filter, nullptr, 0, &query), "query");
+        ovstage_query_result_t result{};
+        check(stage, ovstage_fetch_query_result(stage, query, OVSTAGE_TIMEOUT_INFINITE, &result),
+              "fetch_query_result");
+        std::printf("Meshes without example:count: %llu\n", static_cast<unsigned long long>(result.total_prim_count));
+        // Meshes without example:count: 1
+        check(stage, ovstage_release_query_result(stage, &result), "release_query_result");
+        waitOp(stage, ovstage_release_query(stage, query), "release_query");
+        // [/snippet:query-excluded-attribute-c]
+    }
+
+    {
         // [snippet:query-matched-paths-c]
         // Query the direct children of /World/Group.
         const ovx_string_t parent = literal_to_ovx_string("/World/Group");
@@ -479,22 +512,27 @@ int main(int argc, char** argv)
         std::vector<std::string> matchedPaths;
         for (;;)
         {
+            size_t fetchedGroupCount = 0;
             ovstage_read_group_t group{};
             const ovstage_api_status_t fetched =
-                ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group);
+                ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group, 1, &fetchedGroupCount);
             if (fetched == OVSTAGE_ERROR_END_OF_ITERATION)
                 break;
             check(stage, fetched, "fetch_read_next");
+            if (group.column_count != 1)
+                fail("single-attribute read returned multiple columns");
+            const ovstage_read_column_t& column = group.columns[0];
 
-            const DLTensor& tensor = group.data.tensors[0];
+            const DLTensor& tensor = column.data.tensors[0];
             const auto* pathIds = reinterpret_cast<const uint64_t*>(
                 static_cast<const uint8_t*>(tensor.data) + tensor.byte_offset);
             for (uint32_t i = 0; i < group.prims.count; ++i)
             {
-                const uint32_t row = group.data.index_map ? group.data.index_map[i] : i;
-                matchedPaths.push_back(resolvePath(dict, pathIds[row]));
+                const uint32_t row = column.data.index_map ? column.data.index_map[i] : i;
+                ovx_primpath_t path{ pathIds[row] };
+                matchedPaths.push_back(resolvePath(dict, path));
             }
-            check(stage, ovstage_release_group(stage, &group), "release_group");
+            check(stage, ovstage_release_groups(stage, &group, 1), "release_groups");
         }
         waitOp(stage, ovstage_release_read(stage, read), "release_read");
         waitOp(stage, ovstage_release_query(stage, query), "release_query");
@@ -558,30 +596,35 @@ int main(int argc, char** argv)
         checkOvx(dict, path_dictionary_create_tokens_from_strings(dict, &name, 1, &schemaAttribute),
                  "intern usd-schemas");
         ovstage_ordinal_range_t range{};
-        range.end_ordinal = 2; // Snapshot at 2 (no start); use UINT64_MAX for current schemas.
+        range.end_ordinal = 2; // Snapshot at 2 (no start); use OVSTAGE_ORDINAL_MAX for current schemas.
         ovstage_read_handle_t read = OVSTAGE_INVALID_READ_HANDLE;
         waitOp(stage, ovstage_read_attributes(stage, query, &schemaAttribute, 1, range, &read), "read schemas");
 
         std::vector<std::string> schemaNames;
         for (;;)
         {
+            size_t fetchedGroupCount = 0;
             ovstage_read_group_t group{};
             const ovstage_api_status_t fetched =
-                ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group);
+                ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group, 1, &fetchedGroupCount);
             if (fetched == OVSTAGE_ERROR_END_OF_ITERATION)
                 break;
             check(stage, fetched, "fetch_read_next");
+            if (group.column_count != 1)
+                fail("single-attribute read returned multiple columns");
+            const ovstage_read_column_t& column = group.columns[0];
 
-            // Array attributes return a separate tensor for each prim.
-            for (uint32_t i = 0; i < group.data.tensor_count; ++i)
+            // Resolve each logical prim to its own transported array row.
+            for (uint32_t i = 0; i < group.prims.count; ++i)
             {
-                const DLTensor& tensor = group.data.tensors[i];
-                const auto* tokens = reinterpret_cast<const ovx_token_t*>(
+                const uint32_t row = column.data.index_map ? column.data.index_map[i] : i;
+                const DLTensor& tensor = column.data.tensors[row];
+                const auto* tokenIds = reinterpret_cast<const uint64_t*>(
                     static_cast<const uint8_t*>(tensor.data) + tensor.byte_offset);
                 for (int64_t j = 0; j < tensor.shape[0]; ++j)
-                    schemaNames.push_back(tokenName(dict, tokens[j]));
+                    schemaNames.push_back(tokenName(dict, ovx_token_t{ tokenIds[j] }));
             }
-            check(stage, ovstage_release_group(stage, &group), "release_group");
+            check(stage, ovstage_release_groups(stage, &group, 1), "release_groups");
         }
         waitOp(stage, ovstage_release_read(stage, read), "release_read");
         waitOp(stage, ovstage_release_query(stage, query), "release_query");
@@ -625,7 +668,7 @@ int main(int argc, char** argv)
     // into the result, so a consumer handed only the ovstage_query_result_t can still read from
     // the matched set. release_query_result frees the payload; the query handle outlives it.
     ovstage_predicate_t hasPred{};
-    hasPred.attribute = ovx_string_or_token_t{ countTok, {} };
+    hasPred.attribute = ovx_token_or_string_t{ countTok, {} };
     hasPred.op = OVSTAGE_FILTER_OP_HAS;
     ovstage_filter_t hasFilter{};
     hasFilter.predicates = &hasPred;
@@ -651,7 +694,7 @@ int main(int argc, char** argv)
         std::printf(" %s", name.c_str());
     std::printf("\n  all_handle == query handle: %s\n", result.all_handle == introQuery ? "yes" : "no");
 
-    const ColumnRows countRows = readColumnRows(stage, dict, result.all_handle, countTok, endOrdinal);
+    const auto countRows = readColumnRows<int32_t>(stage, dict, result.all_handle, countTok, endOrdinal);
     status = ovstage_release_query_result(stage, &result);
     check(stage, status, "release_query_result");
 
@@ -660,7 +703,7 @@ int main(int argc, char** argv)
     std::vector<std::string> countLines;
     for (size_t i = 0; i < countRows.paths.size(); ++i)
         countLines.push_back(countRows.paths[i] + "=" +
-                             std::to_string(static_cast<int32_t>(countRows.cells[i])));
+                             std::to_string(countRows.cells[i]));
     std::sort(countLines.begin(), countLines.end());
     std::printf("  example:count via all_handle:");
     for (const std::string& row : countLines)
@@ -686,7 +729,7 @@ int main(int argc, char** argv)
     // One prototype -> its instance roots (both instanceable references).
     const ovx_primpath_t prototypeRoot = protoHandles[0];
     ovx_primpath_list_t instanceRoots = OVX_INVALID_PRIMPATH_LIST;
-    status = ovstage_instancing_get_instance_roots(stage, prototypeRoot, &instanceRoots);
+    status = ovstage_instancing_get_instance_roots_batch(stage, &prototypeRoot, 1, &instanceRoots);
     check(stage, status, "get_instance_roots");
     std::vector<std::string> instancePaths;
     for (const ovx_primpath_t handle : pathListHandles(dict, instanceRoots))
@@ -736,8 +779,18 @@ int main(int argc, char** argv)
     const std::string nestedFile = (slash == std::string::npos ? "" : sceneFile.substr(0, slash + 1)) + "nested.usda";
     // [snippet:instancing-timing-c]
     const ovx_string_t nestedPath{ nestedFile.data(), nestedFile.size() };
-    waitPop(stage, ovstage_population_open_usd_from_file(
-        stage, nestedPath, 1, NAN, OVSTAGE_POPULATION_DOMAIN_PHYSICS), "populate nested scene");
+    // The prims that apply a physics API, and their ancestors.
+    const ovx_string_t physicsApis[] = { literal_to_ovx_string("PhysicsRigidBodyAPI"),
+                                         literal_to_ovx_string("PhysicsCollisionAPI") };
+    const ovx_string_t physicsNamespace[] = { literal_to_ovx_string("physics") };
+    ovstage_population_selector_t physics{};
+    physics.prim_predicate = ovstage_population_prim_predicate_has_applied_schema(physicsApis, 2);
+    physics.property_predicate = ovstage_population_property_predicate_in_namespace(physicsNamespace, 1);
+    ovstage_population_desc_t nestedDesc{};
+    nestedDesc.selectors = &physics;
+    nestedDesc.selector_count = 1;
+    waitPop(stage, ovstage_population_open_usd_from_file_with_desc(
+        stage, nestedPath, 1, NAN, &nestedDesc, 1), "populate nested scene");
     // Wait for population, then advance the watermark before querying.
     waitOp(stage, ovstage_advance_write_floor(stage, &floor1), "advance watermark");
     // [/snippet:instancing-timing-c]
@@ -750,7 +803,7 @@ int main(int argc, char** argv)
     ovx_primpath_t leaf = OVX_INVALID_PRIMPATH, nestedLeaf = OVX_INVALID_PRIMPATH;
     check(stage, ovstage_instancing_get_prototype_root(stage, nestedPaths[0], &leaf), "leaf prototype");
     ovx_primpath_list_t leafInstances = OVX_INVALID_PRIMPATH_LIST;
-    check(stage, ovstage_instancing_get_instance_roots(stage, leaf, &leafInstances), "leaf instances");
+    check(stage, ovstage_instancing_get_instance_roots_batch(stage, &leaf, 1, &leafInstances), "leaf instances");
     std::vector<std::string> leafPaths;
     for (auto path : pathListHandles(dict, leafInstances))
         leafPaths.push_back(resolvePath(dict, path));

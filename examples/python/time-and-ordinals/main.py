@@ -11,7 +11,7 @@
 # One timeline, two data sources, one mapping. A saxpy simulator steps three
 # sphere prims with NON-UNIFORM dt (position += velocity * dt), and a
 # time-sampled USD clip animates a conveyor. ovstage stores no time -- it
-# only orders writes by opaque uint64 ordinals -- so the application owns an
+# only orders writes by opaque int64 ordinals -- so the application owns an
 # explicit ordinal <-> time table and uses it to land BOTH sources in the
 # same ordinal slot per tick: the sim write and the clip sample for the same
 # simulation time share one ordinal. Because the slots are shared, anything
@@ -104,7 +104,7 @@ def main() -> int:
         # the one ordinal axis from the start. Sealing ordinal 1 makes it
         # readable.
         population.open_usd_from_string(stage, CLIP_USDA, ordinal=1, time=0.0,
-                                        domains=PopulationDomain.ALL)
+                                        domains=PopulationDomain.RENDERING)
 
         # [snippet:float3-attribute-write]
         # This example uses the canonical float3 transport form: one tensor

@@ -19,10 +19,12 @@ with a finalizer safety net so a dropped group cannot brick subsequent writes.
 
 import gc
 import warnings
+import weakref
 
 import numpy as np
 import pytest
 
+from ovstage import PrimPathList
 from ovstage import OrdinalRange
 
 PRIMS = ["/World/ReadGroup/A", "/World/ReadGroup/B"]
@@ -74,7 +76,7 @@ def test_context_manager_releases_the_group(scene):
     # The group's pinned storage is released on block exit, so a later write to
     # the same prims is not blocked by a stale outstanding-read coverage record.
     with group:
-        values = np.array(group.array(0))  # copy out; the view dies with the group
+        values = np.array(group.columns[0].array(0))  # copy out; the view dies with the group
     # [/snippet:read-group-context-manager]
     np.testing.assert_allclose(values, [1.0, 2.0])
     assert group.released
@@ -93,6 +95,45 @@ def test_context_manager_releases_when_the_body_raises(scene):
     read.release().wait()
 
 
+def test_multi_column_group_lifetime_covers_every_column(ovstage_mod, stage):
+    """One group owns every column until that group is released."""
+    with ovstage_mod.PathDictionary(stage) as paths:
+        attrs = [paths.intern_token("test:read-group-a"), paths.intern_token("test:read-group-b")]
+        with paths.create_path_list_from_strings(PRIMS) as plist:
+            query = stage.query_from_path_list(plist)
+            try:
+                for ordinal, attr in enumerate(attrs, start=1):
+                    _write(stage, query, attr, ordinal)
+                stage.advance_write_floor(ordinal=len(attrs)).wait()
+
+                with stage.read_attributes(query, attrs, OrdinalRange.latest(len(attrs))) as read:
+                    read.wait()
+                    group = read.fetch_next()
+                    assert group is not None
+                    assert [column.attribute for column in group.columns] == attrs
+                    assert read.fetch_next() is None
+
+                # Releasing Read does not release the acquired group or any of its
+                # columns. Every column remains readable and pins its own attribute.
+                for ordinal, column in enumerate(group.columns, start=1):
+                    np.testing.assert_allclose(np.array(column.array(0)), [float(ordinal)] * len(PRIMS))
+                    blocked = stage.write_attribute(
+                        query, column.attribute, ordinal=ordinal + len(attrs),
+                        tensors=np.full(len(PRIMS), -1.0, np.float32), is_array=False,
+                    )
+                    assert blocked.status == ovstage_mod.ErrorCode.OP_FAILED
+                    assert "overlapping outstanding read" in blocked.error_message()
+
+                stage.release_group(group)
+                assert group.released
+
+                # Releasing the one containing group releases every column pin.
+                for ordinal, attr in enumerate(attrs, start=len(attrs) + 1):
+                    _write(stage, query, attr, ordinal)
+            finally:
+                stage.release_query(query).wait()
+
+
 def test_double_release_is_rejected(ovstage_mod, scene):
     """A second release would free storage the instance already reclaimed."""
     stage, query, attr = scene
@@ -108,9 +149,39 @@ def test_double_release_is_rejected(ovstage_mod, scene):
 def test_dropped_group_warns_and_releases(scene):
     stage, query, attr = scene
     read, group = _fetch_group(stage, query, attr)
+    group_ref = weakref.ref(group)
     with pytest.warns(ResourceWarning, match="garbage-collected"):
         del group
-        gc.collect()
+    assert group_ref() is None  # columns do not defer release until cyclic GC
+    read.release().wait()
+
+
+def test_borrowed_column_does_not_keep_group_alive(ovstage_mod, scene):
+    stage, query, attr = scene
+    read, group = _fetch_group(stage, query, attr)
+    column = group.columns[0]
+    group_ref = weakref.ref(group)
+
+    with pytest.warns(ResourceWarning, match="garbage-collected"):
+        del group
+    assert group_ref() is None
+    with pytest.raises(ovstage_mod.OvstageError, match="owning ReadGroup no longer exists"):
+        _ = column.tensor_count
+    read.release().wait()
+
+
+def test_dlpack_producer_keeps_its_group_alive(scene):
+    stage, query, attr = scene
+    read, group = _fetch_group(stage, query, attr)
+    producer = group.columns[0].dlpack(0)
+    group_ref = weakref.ref(group)
+
+    del group
+    assert group_ref() is not None
+    owner = group_ref()
+    stage.release_group(owner)
+    del owner, producer
+    assert group_ref() is None
     read.release().wait()
 
 
@@ -195,7 +266,7 @@ def test_query_outlives_its_source_path_list(ovstage_mod, stage, paths):
     and relax the Python docs — do not "fix" it by deleting the keepalives.
     """
     plist = paths.create_path_list_from_strings(PRIMS)
-    handle = int(plist)
+    handle = PrimPathList(plist)
     # Pass the plain int so the Query holds no keepalive, isolating what the C side
     # does on its own from what the binding does for the caller.
     query = stage.query_from_path_list(handle)
@@ -228,7 +299,7 @@ def test_release_is_tracked_on_a_caller_constructed_group(ovstage_mod, scene):
     assert detached.released
     with pytest.raises(ovstage_mod.OvstageError):
         stage.release_group(detached)  # must not reach the C API a second time
-    for call in (lambda: detached.tensor(0), lambda: detached.prim_index(0)):
+    for call in (lambda: detached.columns[0].tensor(0), lambda: detached.prim_index(0)):
         with pytest.raises(ovstage_mod.OvstageError):
             call()
 
@@ -241,7 +312,8 @@ def test_accessors_reject_a_released_group(ovstage_mod, scene):
     stage, query, attr = scene
     read, group = _fetch_group(stage, query, attr)
     stage.release_group(group)
-    for call in (lambda: group.array(0), lambda: group.tensor(0), lambda: group.prim_index(0)):
+    for call in (lambda: group.columns[0].array(0), lambda: group.columns[0].tensor(0), lambda: group.prim_index(0),
+    ):
         with pytest.raises(ovstage_mod.OvstageError):
             call()
     read.release().wait()
@@ -255,7 +327,7 @@ def test_group_survives_until_released(scene):
         assert not group.released
         for _ in range(3):
             gc.collect()
-            np.testing.assert_allclose(np.array(group.array(0)), [1.0, 2.0])
+            np.testing.assert_allclose(np.array(group.columns[0].array(0)), [1.0, 2.0])
         assert not group.released
     finally:
         stage.release_group(group)

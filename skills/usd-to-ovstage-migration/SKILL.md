@@ -107,7 +107,7 @@ Resolve inputs in this order: existing repository files and referenced snippets,
 |-----------|--------------------|------|
 | `stage.DefinePrim(path, type)` | INSERT-mode `Stage.write_attribute(query, "usd-prim-type", ordinal, tokens, is_array=False, prim_mode=PrimMode.INSERT)` | No create-prim call — prims come into existence via any attribute write; INSERT is create-only (fails on existing prims), and the reserved `usd-prim-type` column stamps one interned token id per prim (uint64, semantic NONE) |
 | `prim.CreateAttribute(name, type).Set(value)` | `Stage.write_attribute(query, attr, ordinal, tensors, is_array=...)` | One call authors the whole column: one tensor row per prim in the query, at a caller-owned ordinal; the write creates the column (and, in UPSERT mode, any absent prims) |
-| `attr.Get()` | `Stage.read_attributes(query, [attr], OrdinalRange.latest((1 << 64) - 1))` | One read op returns the current committed column. An `N` below `(1 << 64) - 1` requests the snapshot at `N` and returns `OUT_OF_RANGE` if a queried path changed after `N`. Recorded payloads must be covered by the write floor. |
+| `attr.Get()` | `Stage.read_attributes(query, [attr], OrdinalRange.latest(ovstage.ORDINAL_MAX))` | One read op returns the current committed column. An `N` below `ovstage.ORDINAL_MAX` requests the snapshot at `N` and returns `OUT_OF_RANGE` if a queried path changed after `N`. Recorded payloads must be covered by the write floor. |
 | `stage.RemovePrim(path)` | `Stage.delete_attributes(query, [], ordinal)` | An **empty attribute list** deletes the prims entirely; a non-empty list removes just those attributes; ordinal-keyed like any write, surfaced to range readers as an `is_delete` tombstone group |
 | `Sdf.ChangeBlock()` around N edits | `Stage.write_attributes(query, [WriteDesc, ...], ordinal)` | ChangeBlock batches only change *notification* — still one `Set` call per attribute per prim; `write_attributes` lands several columns in ONE op (a grouping, not an atomic transaction) |
 
@@ -226,7 +226,8 @@ This skill has no scripts.
   strict policy, a repeated modification of a cell needs a newer ordinal; disjoint
   cells may share one above the applicable floors.
 - **Type stamp did not land / garbage type names** — `usd-prim-type` takes interned token ids
-  (uint64) via the path dictionary, not strings; resolve reads back through `token_to_string`.
+  (uint64) via the path dictionary, not strings. Write `token.raw_id` into numeric tensors;
+  resolve a tensor read with `paths.token_to_string(ovstage.Token(raw_id))`.
 - **Values come back in the wrong prim order** — place rows via `group.prim_index(local)` (and
   the data `index_map` when present) instead of assuming row `i` is prim `i`.
 - **Looking for the timeSamples equivalent** — there is none on the ordinal axis; see Not

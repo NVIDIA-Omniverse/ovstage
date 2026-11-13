@@ -6,9 +6,11 @@
 
 ## Executive Summary
 
-**ovstage** is a high-performance, in-process runtime data store for USD scene data. It holds post-composition scene state (transforms, velocities, materials, hierarchy, metadata) in a vectorized, CPU/GPU-capable format and provides a unified C API for reading, writing, and querying that data.
+ovstage is a standalone C and Python library that gives simulation and visualization applications one shared, in-process store for scene and simulation data. Applications can author data directly or populate it from OpenUSD, then let physics, rendering, sensors, and other consumers query, read, and update that data through a common API. The application controls execution and when updates become visible, while ovstage provides bulk data access, shared scene identities, and change tracking so each consumer can read the state it needs.
 
-The core value proposition: **ovstage replaces the pattern where every library (physics, rendering, sensors) independently parses USD and maintains its own copy of common scene state.** Instead, participating libraries can share a single runtime stage with explicit change tracking, CPU/GPU tensor interchange, and change membership — reducing redundant parsing and memory usage while enabling zero-copy data paths between producers and consumers running at different rates.
+ovstage represents data in arrays for bulk access and uses DLPack tensors for CPU/GPU interchange. CUDA tensors are accepted as write sources. Reads and maps use CPU buffers by default; the experimental placement extension also supports CUDA read payloads and fixed-size CUDA map buffers. By default, history is off: reads return the latest committed state, and change tracking records which prims and attributes changed, not earlier values. An instance of `history_selective` (`ovstage_instance_desc_t.implementation`, Python `StageConfig(implementation="history_selective")`) turns history on for selected pairs. `ovstage_enable_history()` selects the exact `(prim, attribute)` pairs that retain earlier sealed values (`ovstage_history.h`). History support (the `history_selective` implementation and `ovstage_history.h`) is experimental and can change between releases without a deprecation period.
+
+The core value proposition: **ovstage replaces the pattern where every library (physics, rendering, sensors) independently parses USD and maintains its own copy of common scene state.** Instead, participating libraries can share a single runtime stage with explicit change tracking, CPU/GPU tensor interchange, and change membership — reducing redundant parsing and memory usage while letting producers and consumers run at different rates.
 
 ---
 
@@ -38,11 +40,11 @@ ovstage is a building block — the application is always in control of what dat
 
 Core capabilities:
 
-- **Ordinal-keyed writes** — every write carries an ordinal for admission, ordering and change membership; reads check requested ordinal bounds against recorded changes, while this build stores only current payloads (no historical or per-version payload access)
+- **Ordinal-keyed writes** — every write carries an ordinal for admission, ordering and change membership. Reads check requested ordinal bounds against recorded changes. An instance of `history_latest`, the default, keeps history off and keeps the latest value of every cell. An instance of `history_selective` (`ovstage_instance_desc_t.implementation`, Python `StageConfig(implementation="history_selective")`) turns history on for selected pairs. `ovstage_enable_history()` selects the exact `(prim, attribute)` pairs that retain earlier sealed values (`ovstage_history.h`)
 - **CPU/GPU tensor interchange** — DLTensor carries CPU or CUDA buffers without requiring a custom tensor format. CUDA source tensors can be written without a host round-trip. Reads and maps use CPU buffers by default; the experimental [placement extension](docs/concepts/dlpack_tensors.rst#experimental-device-placement) also selects CUDA read payloads and fixed-size CUDA map buffers. Array-valued CUDA maps are not supported.
 - **Built-in change detection** — change-membership queries ("what changed since ordinal N?") are a first-class operation (expressed as an ordinal-range read; see `ovstage_ordinal_range_t` in the C API reference) that report exact changed prims within the runtime-reported retention frontier; callers do not assume a fixed retention depth, and older markers may be coalesced per attribute and prim
 - **Uniform addressing** — shared prim path dictionary means handles pass between libraries with zero conversion
-- **Asynchronous submission** — state-mutating and data-producing work is enqueued, while fetch, status, lifecycle, and path-dictionary calls remain synchronous. The current implementation executes queued work serially; the API preserves ordinal ordering semantics for future concurrent backends.
+- **Asynchronous submission** — state-mutating and data-producing work is enqueued, while fetch, status, lifecycle, and path-dictionary calls remain synchronous. The API guarantees submission ordering for operations at the same ordinal; explicitly sequence work that depends on operations at other ordinals.
 - **Query filters** — queries filter on prim metadata (type, schema, path)
 
 ---
@@ -53,11 +55,11 @@ These principles guided the API design and are relevant for understanding trade-
 
 1. **Simplicity and ergonomics first.** Unified addressing model — every operation uses the same (prim set + attribute + ordinal) pattern. Stale handles are reported with a clear error (`OVSTAGE_ERROR_INVALID_HANDLE`), not silent corruption.
 
-2. **No leaked implementation details.** The API does not expose internal storage layout. Read results are grouped by memory locality (for performance), not by schema bucketing (an implementation choice). Consumers never need to understand internal partitioning.
+2. **Read results through the public API.** Iterate every returned group and use its tensor descriptors and prim-to-row mapping. Do not assume a particular grouping or physical memory layout.
 
 3. **Zero-copy-capable tensor transport.** Read results return pointers into internal storage. DLTensor carries device type, pointer, and shape for CPU and GPU interchange without a custom tensor format. Reads and maps default to CPU buffers; experimental placement can select CUDA read payloads and fixed-size CUDA map staging. A read of an already-current copy on the requested device avoids migration. Follow the placement event and buffer-lifetime rules before consuming device data.
 
-4. **Optional complexity — implementations can subset.** An implementation supporting only latest-value reads uses the same API signatures. Value-based query filters are optional. Historical/per-version payload access is optional. The API contract is the same; the capability level is declared.
+4. **Use supported operations.** Check the documented filter combinations, devices, and history limits for the release. An enum value or argument in the API does not by itself establish that every possible operation is supported.
 
 5. **Shared read/map layout.** Reads and writable maps expose scalar lanes and type-aware component axes. Writes retain their canonical input layout; use the explicit typed-tensor write adapter when forwarding a known read/map descriptor. Preserve semantic, array kind and logical prim-to-row association through `data.index_map`. Copy pinned read payload before releasing it to write back to the same storage.
 
@@ -108,7 +110,7 @@ graph TD
 | **ovrtx** | Optional integration consumer that can read changed render state from an application-owned ovstage. |
 | **ovx/path_dictionary** | Shared addressing API used by ovstage and participating consumers to exchange tokens and prim-path lists. |
 | **OpenUSD** | Optional source of composed scene data through the `ovstage_population_*` API and destination for explicitly selected runtime-to-USD export. Direct runtime authoring does not require loading USD. |
-| **DLPack** | Tensor interchange format for CPU and CUDA producers and consumers, subject to the current backend limitations described above. |
+| **DLPack** | Tensor interchange format for CPU and CUDA producers and consumers, subject to the documented device limits described above. |
 
 This graph describes supported public integration boundaries, not a requirement that every OV library use ovstage. Additional library integrations should be documented when their public contracts and maturity are established.
 
@@ -154,7 +156,7 @@ graph LR
 ovstage stores data and exposes changes — but it does **not** automatically push updates to consumers. Each library owns when and how it reads from ovstage:
 
 - **Pull-based:** Libraries call read operations when they're ready for new data (typically once per their simulation tick)
-- **Delta-aware:** Reads can ask "what changed since ordinal N?" — ovstage reports only the changed prims and returns their latest data, not the full scene. Only the latest payload is retained, so a fixed range whose selected `(attribute, path)` has a recorded change after the range end returns `OVSTAGE_ERROR_OUT_OF_RANGE`. A snapshot applies the same check to every queried path. Use end `UINT64_MAX` for current values; a selected unsealed change still returns `OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION`.
+- **Delta-aware:** Reads can ask "what changed since ordinal N?" — ovstage reports only the changed prims and returns their latest data, not the full scene. By default history is off and only the latest payload is retained. A fixed range whose selected `(attribute, path)` has a recorded change after the range end returns `OVSTAGE_ERROR_OUT_OF_RANGE`. A snapshot applies the same check to every queried path. Use end `OVSTAGE_ORDINAL_MAX` for current values. A selected unsealed change still returns `OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION`. Pairs selected with `ovstage_enable_history()` on an instance of `history_selective` answer such a range from retained history.
 - **Independent rates within retention:** A consumer can request a larger change range on its next read without imposing a global update cadence. Exact change membership is guaranteed only at or above the runtime-reported retention frontier; consumers must query that frontier and recover appropriately if they fall behind it. API waits and CPU/GPU synchronization still apply where documented.
 - **No global sync:** A write by ovphysx does not trigger an immediate update in ovrtx. The renderer reads when it's ready for the next frame.
 
@@ -166,6 +168,7 @@ ovstage stores data and exposes changes — but it does **not** automatically pu
 
 - Vectorized, CPU/GPU-capable data store for post-composition USD attributes
 - Ordinal-keyed writes; snapshot and change-range reads of current payloads check requested bounds against recorded changes
+- Opt-in history (experimental) for exact `(prim, attribute)` pairs on instances of `history_selective` (`ovstage_instance_desc_t.implementation` set to `history_selective`)
 - Delta reads (change-membership stream: which prims changed since a given ordinal)
 - Query filters
 - CPU map/unmap with writable staging buffers; zero-copy CUDA source-tensor ingest for writes; experimental CUDA reads and fixed-size maps through device placement
@@ -200,11 +203,11 @@ Libraries read from ovstage at runtime; they don't need to interact with USD dir
 
 ### How does change detection work?
 
-Every write carries an ordinal used for ordering and change membership. Readers can ask "what changed since ordinal N?" and get back the set of changed prims; payload reads then return those prims' latest committed values — there is no historical or per-version payload access. This replaces the pattern of external dirty flags or full-scene diffing. Change detection is built into the data plane — not a separate mechanism.
+Every write carries an ordinal used for ordering and change membership. Readers can ask "what changed since ordinal N?" and get back the set of changed prims. Payload reads then return the latest committed values of those prims. By default history is off, and there is no historical or per-version payload access. An instance of `history_selective` (`ovstage_instance_desc_t.implementation` set to `history_selective`) turns history on for the pairs selected with `ovstage_enable_history()`: only those pairs retain earlier sealed values. This replaces the pattern of external dirty flags or full-scene diffing. Change detection is built into the data plane — not a separate mechanism.
 
 ### What data format does ovstage use?
 
-All tensor data uses **DLTensor** (from the DLPack standard). This provides zero-copy interop with the Python/ML ecosystem (NumPy, PyTorch, JAX, Warp) and carries device type, pointer, shape, and lane-width metadata. No custom tensor types.
+All tensor data uses **DLTensor** (from the DLPack standard). This provides interop with the Python/ML ecosystem (NumPy, PyTorch, JAX, Warp) and carries device type, pointer, shape, and lane-width metadata. No custom tensor types.
 
 Fixed-size reads and maps expose scalar lanes: scalars `(N,)`, tuples `(N,C)`, and semantic square matrices `(N,S,S)` for S=2,3,4. Here `N` is the transported data-row count. Without `data.index_map`, logical prims select rows one-to-one; with it, `data.index_map[i]` selects the row for logical prim `i`, so `N` may differ from the logical prim count. The original write shape is not stored; dimensions follow component width and semantic. Generic tuples, including 12-component values, retain one component axis rather than an inferred non-square matrix shape. Array maps and reads apply the same trailing dimensions to each value tensor. Returned strides count scalar elements. Map creation dtypes and canonical writes retain complete logical elements in `dtype.lanes`; `ovstage_tensor_to_write()` / Python `typed_tensor_to_write()` explicitly fold a known typed result back into that layout without copying payload.
 

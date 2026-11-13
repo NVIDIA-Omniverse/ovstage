@@ -11,7 +11,7 @@
 // One timeline, two data sources, one mapping. A saxpy simulator steps three
 // sphere prims with NON-UNIFORM dt (position += velocity * dt), and a
 // time-sampled USD clip animates a conveyor. ovstage stores no time -- it
-// only orders writes by opaque uint64 ordinals -- so the application owns an
+// only orders writes by opaque int64 ordinals -- so the application owns an
 // explicit ordinal <-> time table and uses it to land BOTH sources in the
 // same ordinal slot per tick: the sim write and the clip sample for the same
 // simulation time share one ordinal. Because the slots are shared, anything
@@ -122,7 +122,7 @@ int main()
     // ordinal axis from the start. Sealing ordinal 1 makes it readable.
     const ovx_string_t clipUsda{ kClipUsda, std::strlen(kClipUsda) };
     ovstage_population_enqueue_result_t popEnq = ovstage_population_open_usd_from_string(
-        stage, clipUsda, /*ordinal*/ 1, /*time*/ 0.0, OVSTAGE_POPULATION_DOMAIN_ALL);
+        stage, clipUsda, /*ordinal*/ 1, /*time*/ 0.0, OVSTAGE_POPULATION_DOMAIN_RENDERING);
     waitPop(stage, popEnq, "open_usd_from_string");
 
     // [snippet:float3-attribute-write]
@@ -186,9 +186,9 @@ int main()
         tickFloor.scope = OVSTAGE_SCOPE_ALL;
         enq = ovstage_advance_write_floor(stage, &tickFloor);
         waitOp(stage, enq, "advance_write_floor");
-        std::printf("tick %d (dt = %.4f s) -> t = %.4f s = timecode %2.0f -> ordinal %llu:"
+        std::printf("tick %d (dt = %.4f s) -> t = %.4f s = timecode %2.0f -> ordinal %lld:"
                     " sim + clip written, sealed\n",
-                    tick, dt, t, t * kTimeCodesPerSecond, (unsigned long long)ordinal);
+                    tick, dt, t, t * kTimeCodesPerSecond, (long long)ordinal);
     }
 
     // ---- 3. USD time is playback policy: rewind the clip ----
@@ -206,9 +206,9 @@ int main()
     enq = ovstage_advance_write_floor(stage, &floorRewind);
     waitOp(stage, enq, "advance_write_floor");
 
-    std::printf("rewind: sim t = %.4f s (ordinal %llu) but the clip is pointed at usd t = %.4f s"
+    std::printf("rewind: sim t = %.4f s (ordinal %lld) but the clip is pointed at usd t = %.4f s"
                 " -- playback policy, not the timeline\n",
-                timeOfOrdinal[rewindOrdinal], (unsigned long long)rewindOrdinal, kRewindUsdTime);
+                timeOfOrdinal[rewindOrdinal], (long long)rewindOrdinal, kRewindUsdTime);
 
     // Release every handle, then destroy: ovstage_destroy_instance requires
     // all ops and handles released first.

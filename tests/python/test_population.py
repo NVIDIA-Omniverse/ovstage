@@ -16,6 +16,7 @@
 
 import pytest
 
+import ovstage
 from ovstage import (ErrorCode, Filter, FilterOp, OrdinalAdmissionPolicy, OrdinalRange, OvstageError,
                      PathDictionary, PopulationDomain, Predicate, Stage, StageConfig, population)
 
@@ -142,7 +143,7 @@ def test_populate_from_usda_and_query(stage):
     assert matched == 1
 
 
-@pytest.mark.parametrize("profile", ["physics", "all", "selector"])
+@pytest.mark.parametrize("profile", ["physics", "rendering-and-physics", "selector"])
 @pytest.mark.parametrize("async_apply", [False, True], ids=["blocking", "async"])
 @pytest.mark.parametrize("update_ordinal", [1, 2], ids=["reused-ordinal", "new-ordinal"])
 def test_population_live_edit_uses_a_new_ordinal(profile, async_apply, update_ordinal):
@@ -161,8 +162,16 @@ def test_population_live_edit_uses_a_new_ordinal(profile, async_apply, update_or
                 descs=population.Desc(selectors=[selector]),
             )
         else:
-            domains = PopulationDomain.PHYSICS if profile == "physics" else PopulationDomain.ALL
-            population.open_usd_from_string(stage, RIGID_BODY_USDA, ordinal=1, domains=domains)
+            # The physics properties of the prims that apply a physics API, alone or beside RENDERING.
+            physics = population.Selector(
+                prim_predicate=population.PrimPredicate.has_applied_schema("PhysicsRigidBodyAPI", "PhysicsCollisionAPI"),
+                property_predicate=population.PropertyPredicate.in_namespace("physics"),
+            )
+            domains = PopulationDomain.NONE if profile == "physics" else PopulationDomain.RENDERING
+            population.open_usd_from_string_with_desc(
+                stage, RIGID_BODY_USDA, ordinal=1, time=population.DEFAULT_TIME,
+                descs=population.Desc(domains=domains, selectors=[physics]),
+            )
         assert _publishes(stage, "/World/Body", "physics:velocity")
 
         # A reference supplies an authored value over the schema's initial fallback,
@@ -193,8 +202,8 @@ def test_population_live_edit_uses_a_new_ordinal(profile, async_apply, update_or
                             values = []
                             for group in read.groups():
                                 with group:
-                                    assert not group.is_delete
-                                    values.extend(float(v) for v in group.array(0).reshape(-1))
+                                    assert not group.columns[0].is_delete
+                                    values.extend(float(v) for v in group.columns[0].array(0).reshape(-1))
                             assert values == [3.0, 2.0, 1.0]
 
 
@@ -343,7 +352,7 @@ def test_repopulate_current_usd_preserves_reference_handle_and_replaces_scope(st
     # Like an open, a repopulation removes nothing: an empty description leaves the populated data.
     before = _prefix_count(stage, "/World")
     op = population.repopulate_usd_with_desc_async(stage, ordinal=3, time=population.DEFAULT_TIME, descs=[])
-    assert op.op_id != 0 and op.ok
+    assert op.op_id != ovstage.POPULATION_INVALID_OP_ID and op.ok
     assert op.wait() is True
     assert _prefix_count(stage, "/World") == before
 
@@ -357,21 +366,3 @@ def test_repopulate_current_usd_preserves_reference_handle_and_replaces_scope(st
     population.apply_usd_changes(stage, ordinal=5)
     assert _prefix_count(stage, "/World/Reference") == 0
     assert _prefix_count(stage, "/World/Cube") == 1
-
-
-def test_repopulate_reports_not_supported_by_an_older_loader(stage, monkeypatch):
-    """A library that predates repopulation lacks the symbol, so the wrapper raises
-    OvstageError(NOT_SUPPORTED) without calling into it."""
-    from types import SimpleNamespace
-
-    from ovstage._src import bindings
-
-    _, inst = population._require(stage)
-    population.open_usd_from_string(stage, CUBE_USDA, ordinal=1, domains=PopulationDomain.RENDERING)
-    monkeypatch.setattr(population, "_require", lambda _stage: (SimpleNamespace(), inst))
-    with pytest.raises(OvstageError) as error:
-        population.repopulate_usd_with_desc_async(stage, 2, population.DEFAULT_TIME, [])
-    assert error.value.code == bindings.OVSTAGE_ERROR_NOT_SUPPORTED
-    assert "does not support repopulating" in str(error.value)
-    monkeypatch.undo()
-    assert _prefix_count(stage, "/World/Cube") == 1  # ordinary population is unaffected

@@ -45,14 +45,14 @@ macro(ovstage_fetch)
         # an empty hash skips verification rather than failing the fetch.
         if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
             set(OVSTAGE_PACKAGE_SYSTEM "windows-x86_64")
-            set(OVSTAGE_HASH "007cd7ef776415c95342985fcf60ba89aa4222a07c914fdd314acb860e0b95a5")
+            set(OVSTAGE_HASH "aef6b5c24fe220e888cf0021638d5e7ba9947f3fc09cde8ca5bb2e0dc11fc707")
         elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
             if (CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
                 set(OVSTAGE_PACKAGE_SYSTEM "manylinux_2_35_aarch64")
-                set(OVSTAGE_HASH "14d8815694779799768480eaded48ae3c401ab128eca7e18ea2c3f30e385a307")
+                set(OVSTAGE_HASH "955311eadaccfc8f16e0efa43261c2c1a1ff3e456cc4e93489d4951e78bca2bf")
             elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64")
                 set(OVSTAGE_PACKAGE_SYSTEM "manylinux_2_35_x86_64")
-                set(OVSTAGE_HASH "922a64c3583040ea3ab3262c0e95aa4ac642bef8676b43a02fa262ea14adc387")
+                set(OVSTAGE_HASH "e39fc83dce13cd2818bc43448d27137f1659511a2d2f91a66bff263a23a6a4dd")
             else()
                 message(FATAL_ERROR "Unsupported system: ${CMAKE_SYSTEM_NAME} ${CMAKE_SYSTEM_PROCESSOR}")
             endif()
@@ -72,7 +72,7 @@ macro(ovstage_fetch)
         FetchContent_Declare(
             ovstage
             DOWNLOAD_EXTRACT_TIMESTAMP TRUE
-            URL "https://github.com/NVIDIA-Omniverse/ovstage/releases/download/v0.3.0/ovstage@0.3.0.1791986420.36fe3c44.${OVSTAGE_PACKAGE_SYSTEM}.zip"
+            URL "https://github.com/NVIDIA-Omniverse/ovstage/releases/download/v0.4.0/ovstage@0.4.0.1794520352.987892c3.${OVSTAGE_PACKAGE_SYSTEM}.zip"
             ${_OVSTAGE_URL_HASH}
         )
 

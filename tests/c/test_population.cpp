@@ -402,15 +402,18 @@ TEST_F(PopulationTest, RegisterUsdSchemas)
     ovstage_read_handle_t read = OVSTAGE_INVALID_READ_HANDLE;
     ASSERT_TRUE(waitOp(stage_, ovstage_read_attributes(stage_, query, &attr, 1, range, &read)));
 
+    size_t fetchedGroupCount = 0;
     ovstage_read_group_t group{};
-    ASSERT_EQ(ovstage_fetch_read_next(stage_, read, OVSTAGE_TIMEOUT_INFINITE, &group), OVSTAGE_OK);
-    ASSERT_EQ(group.data.tensor_count, 1u);
-    ASSERT_NE(group.data.tensors[0].data, nullptr);
+    ASSERT_EQ(ovstage_fetch_read_next(stage_, read, OVSTAGE_TIMEOUT_INFINITE, &group, 1, &fetchedGroupCount), OVSTAGE_OK);
+    ASSERT_EQ(group.column_count, 1u);
+    const ovstage_read_column_t& column = group.columns[0];
+    ASSERT_EQ(column.data.tensor_count, 1u);
+    ASSERT_NE(column.data.tensors[0].data, nullptr);
     float strength = NAN;
-    std::memcpy(&strength, group.data.tensors[0].data, sizeof(strength));
+    std::memcpy(&strength, column.data.tensors[0].data, sizeof(strength));
     EXPECT_FLOAT_EQ(strength, 1.5f);
 
-    ovstage_release_group(stage_, &group);
+    ovstage_release_groups(stage_, &group, 1);
     waitOp(stage_, ovstage_release_read(stage_, read));
     waitOp(stage_, ovstage_release_query(stage_, query));
     std::filesystem::remove_all(root);

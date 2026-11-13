@@ -276,7 +276,7 @@ protected:
         ASSERT_NE(dict_, nullptr);
 
         ovstage_population_enqueue_result_t pop = ovstage_population_open_usd_from_string(
-            stage_, str(kQueryUsda), /*ordinal=*/1, /*time=*/NAN, OVSTAGE_POPULATION_DOMAIN_ALL);
+            stage_, str(kQueryUsda), /*ordinal=*/1, /*time=*/NAN, OVSTAGE_POPULATION_DOMAIN_RENDERING);
         ASSERT_EQ(pop.status, OVSTAGE_OK);
         ASSERT_EQ(ovstage_population_wait_op(stage_, pop.op_index, OVSTAGE_TIMEOUT_INFINITE, nullptr), OVSTAGE_OK);
 
@@ -338,9 +338,9 @@ protected:
 TEST_F(QueryMatrixTest, PredicateMatrix)
 {
     // [snippet:query-predicate-matrix-c]
-    // HAS works on any attribute; the value operators pair only with the reserved
-    // metadata built-ins. Predicates in one filter AND together; values are always
-    // strings. Queries resolve against the latest committed state.
+    // HAS and NOT_HAS work on any attribute; the value operators pair only with the
+    // reserved metadata built-ins. Predicates in one filter AND together; values are
+    // always strings. Queries resolve against the latest committed state.
     EXPECT_EQ(runFilter(stage_, "usd-prim-type", OVSTAGE_FILTER_OP_IN, "Mesh"), 2u);
     EXPECT_EQ(runFilter(stage_, "usd-path", OVSTAGE_FILTER_OP_PREFIX, "/World/Group"), 3u);
     // PREFIX is byte-prefix: "/World" also matches "/Worldwide"; trailing "/" scopes.
@@ -359,6 +359,20 @@ TEST_F(QueryMatrixTest, PredicateMatrix)
     hasFilter.predicates = &hasPred;
     hasFilter.count = 1;
     EXPECT_EQ(queryPrimCount(stage_, &hasFilter, nullptr, 0), 2u);  // Anchor, Group/Left
+
+    // NOT_HAS leaves out every prim that has the attribute.
+    const ovx_string_t meshType = str("Mesh");
+    ovstage_predicate_t notHasPreds[2]{};
+    notHasPreds[0].attribute.string = str("usd-prim-type");
+    notHasPreds[0].op = OVSTAGE_FILTER_OP_IN;
+    notHasPreds[0].values = &meshType;
+    notHasPreds[0].value_count = 1;
+    notHasPreds[1].attribute = { count_, {} };
+    notHasPreds[1].op = OVSTAGE_FILTER_OP_NOT_HAS;
+    ovstage_filter_t notHasFilter{};
+    notHasFilter.predicates = notHasPreds;
+    notHasFilter.count = 2;
+    EXPECT_EQ(queryPrimCount(stage_, &notHasFilter, nullptr, 0), 1u);  // Group/Right
     // [/snippet:query-predicate-matrix-c]
 
     // usd-active appears in the header contract but is not supported (a live

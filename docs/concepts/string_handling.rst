@@ -11,12 +11,15 @@
 String Handling
 =======================
 
-Python accepts a ``str`` or integer :term:`token <Token>` for scalar dual-mode
+Python accepts a ``str`` or :class:`ovstage.Token` for scalar dual-mode
 attribute-name arguments, such as write, map, delete, and attribute-floor lookup.
 The list arguments ``Stage.read_attributes(attrs)``, ``Stage.query(attrs=...)``,
-and ``Stage.advance_write_floor(attributes=...)`` require integer tokens.
+and ``Stage.advance_write_floor(attributes=...)`` require ``Token`` objects.
 Use :meth:`PathDictionary.intern_token() <ovstage.PathDictionary.intern_token>`
 for those lists, and reuse tokens when passing the same names repeatedly.
+Use ``Token(raw_id)`` to explicitly reconstruct a token from a numeric ID in
+the same dictionary, and ``token.raw_id`` when a numeric API needs its ID.
+Bare integers are not accepted as tokens.
 
 In C, :c:type:`ovx_string_t` contains a pointer and a byte length. The text is
 UTF-8. An input string need not end with a null character; use its length when
@@ -25,12 +28,14 @@ reading it. The view does not own its buffer.
 Passing Strings or Tokens
 ---------------------------------
 
-In C, arguments of type :c:type:`ovx_string_or_token_t` accept a string or a
-:term:`token <Token>`. A nonzero ``token`` is used directly; otherwise the name in
-``string`` is resolved through the path dictionary. Reuse a token when passing
-the same name repeatedly.
+In C, arguments of type :c:type:`ovx_token_or_string_t` accept a string or a
+:term:`token <Token>`. When ``string.ptr`` is non-null, the API uses ``string``
+and its length and ignores ``token``, including for an empty string with length
+zero. Otherwise, the API uses ``token``: ID ``0`` represents the empty string,
+and ``OVX_INVALID_TOKEN`` (``UINT64_MAX``) is invalid. Reuse a token when passing
+the same name repeatedly, leaving ``string.ptr = NULL`` to select it.
 
-Python accepts a ``str`` or an integer token for these arguments. The snippets
+Python accepts a ``str`` or a ``Token`` for these arguments. The snippets
 below show an attribute passed as a string in Python and as a token in C.
 The Python snippet assumes an existing stage and query; the C snippet uses the
 previously resolved ``attr`` token.

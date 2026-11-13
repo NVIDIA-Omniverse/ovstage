@@ -29,7 +29,8 @@ import numpy as np
 
 import ovstage
 from ovstage import (AttributeSemantic, DLDataType, DLDataTypeCode, OrdinalRange, OvstageError,
-                     PopulationDomain, make_dltensor, population)
+                     PopulationDomain, make_dltensor, population,
+)
 # [/snippet:setup]
 
 # The ovrtx minimal example scene, copied next to this file so the example is
@@ -118,7 +119,7 @@ def main() -> int:
                 if group is None:  # fetch_next() returns None when the read yields no group
                     raise SystemExit("no data group returned for the final-frame omni:xform read")
                 try:
-                    m = np.asarray(group.array(0)).ravel()  # row-major 4x4
+                    m = np.asarray(group.columns[0].array(0)).ravel()  # row-major 4x4
                     if m.size != 16:  # single-path query -> exactly one 4x4 matrix row
                         raise SystemExit(f"unexpected omni:xform read layout: {m.size} values, expected 16")
                     print("final Torus xform translation (row [3][0:3]):", m[12:15])  # -> [100. 25. 0.]
@@ -141,7 +142,8 @@ def main() -> int:
                 ["/World", "/World/Plane", "/World/Torus", "/World/EditCube"])
             expanded_query = stage.query_from_path_list(expanded_paths)
             print("after USD edit, prim types:",
-                  ", ".join(_prim_types(stage, paths, expanded_query, prim_type, usd_ordinal)))
+                  ", ".join(_prim_types(stage, paths, expanded_query, prim_type, usd_ordinal)),
+            )
             # [/snippet:update-usd]
         finally:
             # Cleanup runs on every exit path. When an exception is already
@@ -186,8 +188,8 @@ def _prim_types(stage, paths, query, prim_type_tok, ordinal):
         read.wait()
         for group in read.groups():
             try:
-                for token_id in group.array(0).tolist():
-                    names.append(paths.token_to_string(int(token_id)))
+                for token_id in group.columns[0].array(0).tolist():
+                    names.append(paths.token_to_string(ovstage.Token(token_id)))
             finally:
                 stage.release_group(group)
     return names

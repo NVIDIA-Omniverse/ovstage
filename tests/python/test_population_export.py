@@ -31,6 +31,18 @@ class _Stage:
     _inst = object()
 
 
+# RENDERING, and the physics properties of the prims that apply a physics API.
+_RENDERING_AND_PHYSICS = population.Desc(
+    domains=PopulationDomain.RENDERING,
+    selectors=[
+        population.Selector(
+            prim_predicate=population.PrimPredicate.has_applied_schema("PhysicsCollisionAPI", "PhysicsRigidBodyAPI"),
+            property_predicate=population.PropertyPredicate.in_namespace("physics"),
+        )
+    ],
+)
+
+
 def _descriptor(**overrides):
     options = {
         "ordinal": 7,
@@ -130,7 +142,7 @@ def _retain_empty_destination(path):
         encoding="utf-8",
     )
     owner = Stage("test.ovstage.population-export.destination-owner")
-    population.open_usd(owner, str(path), ordinal=1, domains=PopulationDomain.ALL)
+    population.open_usd(owner, str(path), ordinal=1, domains=PopulationDomain.RENDERING)
     return owner
 
 
@@ -285,7 +297,7 @@ def test_export_runtime_attribute_to_usd_schema_name(stage, tmp_path):
                     query,
                     "usd-prim-type",
                     ordinal=1,
-                    tensors=np.array([paths.intern_token("Sphere")], dtype=np.uint64),
+                    tensors=np.array([paths.intern_token("Sphere").raw_id], dtype=np.uint64),
                     is_array=False,
                 ).wait()
         finally:
@@ -351,8 +363,8 @@ def Xform "World"
     }
 }
 """
-    population.open_usd_from_string(
-        stage, source, ordinal=1, time=math.nan, domains=PopulationDomain.ALL
+    population.open_usd_from_string_with_desc(
+        stage, source, ordinal=1, time=math.nan, descs=_RENDERING_AND_PHYSICS
     )
     stage.advance_write_floor(1).wait()
 
@@ -371,12 +383,8 @@ def Xform "World"
     assert report["attributes_exported"] >= 8
 
     with Stage("test.ovstage.population-export.mesh-result") as destination_owner:
-        population.open_usd(
-            destination_owner,
-            str(destination),
-            ordinal=1,
-            time=math.nan,
-            domains=PopulationDomain.ALL,
+        population.open_usd_with_desc(
+            destination_owner, str(destination), ordinal=1, time=math.nan, descs=_RENDERING_AND_PHYSICS
         )
         destination_owner.advance_write_floor(1).wait()
         root = "/World/SimulatedMeshes"
@@ -418,13 +426,14 @@ def Xform "World"
         } <= exported_names
 
 
-def test_export_changed_property_overlay(stage, tmp_path):
+@pytest.mark.parametrize("base_ordinal", [-2, 0, 1])
+def test_export_changed_property_overlay(stage, tmp_path, base_ordinal):
     prim_paths = ["/World/SensorA", "/World/SensorB", "/World/SensorC"]
     _write_float_columns(
         stage,
         prim_paths,
         {"temperature": np.array([20.0, 21.0, 22.0], dtype=np.float32)},
-        ordinal=1,
+        ordinal=base_ordinal,
     )
 
     rule = {"source_attribute_name": "temperature", "usd_type_name": "float"}
@@ -434,7 +443,7 @@ def test_export_changed_property_overlay(stage, tmp_path):
         base_report = population.export_to_usd_layer(
             stage,
             str(base_destination),
-            ordinal=1,
+            ordinal=base_ordinal,
             attribute_rules=[rule],
         )
         assert base_report["attributes_exported"] == 3
@@ -445,7 +454,7 @@ def test_export_changed_property_overlay(stage, tmp_path):
         stage,
         ["/World/SensorB"],
         {"temperature": np.array([24.5], dtype=np.float32)},
-        ordinal=2,
+        ordinal=base_ordinal + 1,
     )
     changed_destination = tmp_path / "changed-properties.usda"
     changed_owner = _retain_empty_destination(changed_destination)
@@ -454,9 +463,9 @@ def test_export_changed_property_overlay(stage, tmp_path):
         report = population.export_to_usd_layer(
             stage,
             str(changed_destination),
-            ordinal=2,
+            ordinal=base_ordinal + 1,
             selection=population.OVSTAGE_POPULATION_EXPORT_SELECTION_CHANGED_PROPERTIES_SINCE_ORDINAL,
-            since_ordinal=1,
+            since_ordinal=base_ordinal,
             attribute_rules=[rule],
         )
         # [/snippet:export-changed-properties-to-usd]
@@ -629,12 +638,17 @@ def Xform "World"
     }
 }
 """
-    population.open_usd_from_string(
+    # RENDERING, and the physics properties of the prims that apply a physics API.
+    physics = population.Selector(
+        prim_predicate=population.PrimPredicate.has_applied_schema("PhysicsCollisionAPI", "PhysicsRigidBodyAPI"),
+        property_predicate=population.PropertyPredicate.in_namespace("physics"),
+    )
+    population.open_usd_from_string_with_desc(
         stage,
         scene,
-        ordinal=1,
-        time=math.nan,
-        domains=PopulationDomain.ALL,
+        1,
+        math.nan,
+        population.Desc(domains=PopulationDomain.RENDERING, selectors=[physics]),
     )
     stage.advance_write_floor(1).wait()
 

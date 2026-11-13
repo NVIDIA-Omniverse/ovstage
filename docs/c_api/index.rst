@@ -38,6 +38,31 @@ Types
 
 Backend-owned enums, handles, and result structures.
 
+.. _c-api-handle-types:
+
+Handle Types
+^^^^^^^^^^^^
+
+Operation IDs and query, read, map, hierarchy, population, and result handles
+are distinct structs containing ``uint64_t raw_id``. Keep handles typed through
+arguments, arrays, callbacks, and result structures. Use ``.raw_id`` for C
+comparisons, diagnostics, or serialization. C++ supports same-kind comparison
+and hashing.
+
+Zero is the invalid value for these resource and operation handles. C++ value
+initialization (``Handle{}``) produces the matching invalid value. Use the
+matching named constant for resets and comparisons, such as
+``query == OVSTAGE_INVALID_QUERY_HANDLE`` in C++. Ordinals, timeouts, counts,
+and masks are numeric types.
+
+Copying a handle does not retain its resource. Its kind and nonzero value do
+not establish liveness or membership in a particular stage. See
+:doc:`/concepts/threading_lifetime` for lifetime and wait requirements, and
+:ref:`python-handle-types` for Python usage.
+
+Type Reference
+^^^^^^^^^^^^^^
+
 .. doxygenfile:: ovstage_types.h
    :project: ovstage
 
@@ -51,7 +76,13 @@ destroyed via ``ovstage_destroy_instance``.
 .. doxygenfile:: ovstage_population.h
    :project: ovstage
 
+.. doxygenfile:: ovstage_population_types.h
+   :project: ovstage
+
 .. doxygenfile:: ovstage_population_predicate.h
+   :project: ovstage
+
+.. doxygenfile:: ovstage_population_expression.h
    :project: ovstage
 
 Population Export (ovstage → USD)
@@ -82,6 +113,9 @@ API Types and Utilities
 .. doxygenfile:: ovstage_api_types.h
    :project: ovstage
 
+.. doxygenfile:: ovstage_ext_vtables.h
+   :project: ovstage
+
 .. doxygenfile:: ovstage_api_utils.h
    :project: ovstage
 
@@ -100,6 +134,22 @@ table; unavailable or incompatible implementations return ``OVSTAGE_ERROR_NOT_FO
 See :ref:`ovstage-device-placement` for device selection and synchronization.
 
 .. doxygenfile:: ovstage_placement_extension.h
+   :project: ovstage
+
+History Selection (Experimental)
+--------------------------------
+
+The ``ovstage.history.v1`` extension of an instance of ``history_selective``
+selects the ``(prim, attribute)`` pairs that retain their earlier sealed
+values. Include ``<ovstage/ovstage_history.h>`` explicitly; ``ovstage.h`` does
+not include it. History support (the ``history_selective`` implementation and
+``ovstage_history.h``) is experimental and can change between releases without
+a deprecation period. An instance of ``history_latest``, the default, answers
+``OVSTAGE_ERROR_NOT_SUPPORTED``. The header states the preconditions of a
+selection and the recovery after a failed baseline copy or a failed floor
+advance. See :ref:`ovstage-selective-history` for the complete sequence.
+
+.. doxygenfile:: ovstage_history.h
    :project: ovstage
 
 Configuration

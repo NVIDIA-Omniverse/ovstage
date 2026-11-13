@@ -28,18 +28,44 @@ Names, Paths, and Lists
    * - Python method
      - Result
    * - :meth:`intern_token(name) <ovstage.PathDictionary.intern_token>`
-     - An integer :term:`token <Token>` for a string, such as an attribute name.
+     - A :class:`ovstage.Token` for a string, such as an attribute name.
    * - :meth:`intern_path(path) <ovstage.PathDictionary.intern_path>`
-     - An integer identifier for a :term:`prim <Prim>` path.
+     - A :class:`ovstage.PrimPath` for a :term:`prim <Prim>` path.
    * - :meth:`create_path_list_from_strings(paths) <ovstage.PathDictionary.create_path_list_from_strings>`
      - An immutable, ordered :class:`ovstage.PathList` for a query.
 
 Within one dictionary, interning the same string or prim path returns the same
 identifier. Compare those identifiers directly rather than resolving their strings.
 Path lists are different: creating the same ordered list twice can return different
-handles. Do not compare path-list handles to determine whether their contents match. The C types are
-``ovx_token_t``, ``ovx_primpath_t``, and ``ovx_primpath_list_t`` respectively;
-their ``OVX_INVALID_*`` values are 0 and are not successful results.
+handles. Do not compare path-list handles to determine whether their contents match.
+The C types are ``ovx_token_t``, ``ovx_primpath_t``, and ``ovx_primpath_list_t``
+respectively.
+
+These are distinct structs containing one ``uint64_t raw_id`` in C, with
+same-kind comparison and hashing in C++. Python uses distinct handle classes,
+not integer subclasses. APIs reject another handle kind or a bare integer.
+In C/C++, keep handles typed in scalars, arrays, and containers. A DLPack tensor
+can point directly at typed handle storage while describing it as uint64.
+Read uint64 tensor payloads as numeric IDs, applying ``tensor.byte_offset`` in
+bytes before accessing the elements, then construct the corresponding handle
+(for example, ``ovx_token_t token{values[i]}`` in C++).
+Use ``handle.raw_id`` when an interface requires an integer,
+such as a Python NumPy uint64 array or numeric diagnostic output. Explicitly
+construct the correct handle kind when reading such integers back. Equal numeric
+values across kinds do not imply identity.
+All native producers, consumers, and Python bindings must be rebuilt together.
+
+``PathList`` extends ``PrimPathList`` with ownership. Copying it or constructing
+``PrimPathList(owned_list)`` produces a non-owning typed handle, without adding a
+native reference. Use ``add_path_list_reference`` when an extra reference is needed.
+
+The empty string is a valid token and always interns to ID ``0``. Resolving
+that ID returns an empty string (a non-null pointer with length zero in C).
+``OVX_INVALID_TOKEN`` is ``UINT64_MAX`` and resolving it returns ``OVX_API_ERROR``
+(``OvxError`` in Python). Empty prim-path strings remain invalid.
+``create_paths_from_tokens`` rejects token ID ``0`` as a path component.
+``OVX_INVALID_PRIMPATH`` and ``OVX_INVALID_PRIMPATH_LIST`` remain ``0``.
+No successful creation call returns the corresponding invalid sentinel.
 
 Interning and Resolving
 -----------------------
@@ -112,8 +138,8 @@ strings and open a query over those prims:
 Attribute Arguments: String or Token
 ------------------------------------
 
-Attribute arguments accept a string or an integer token. Reusing an interned
-token avoids a string lookup on each call. In C, ``ovx_string_or_token_t`` holds
+Attribute arguments accept a string or an :class:`ovstage.Token`. Reusing an interned
+token avoids a string lookup on each call. In C, ``ovx_token_or_string_t`` holds
 either form. These snippets show both:
 
 .. tab-set::
@@ -148,9 +174,9 @@ Ownership and Lifetime
   do not release them individually.
 * :meth:`create_path_list() <ovstage.PathDictionary.create_path_list>` and :meth:`create_path_list_from_strings() <ovstage.PathDictionary.create_path_list_from_strings>` return an owned
   :class:`ovstage.PathList`. Use a ``with`` block or call :meth:`release() <ovstage.PathList.release>`. The object
-  is also an ``int`` and can be passed wherever a list handle is accepted.
+  is a ``PrimPathList`` and can be passed wherever a list handle is accepted.
   Reuse a list outside a per-frame loop when its paths do not change.
-* Lists borrowed from read results remain plain integers. Do not release them.
+* Lists borrowed from read results are non-owning :class:`ovstage.PrimPathList` handles. Do not release them.
 * An unreleased Python ``PathList`` releases its reference on garbage collection
   and emits ``ResourceWarning``. Explicit release avoids relying on that cleanup.
 

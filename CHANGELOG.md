@@ -4,6 +4,228 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-11-10
+
+### Summary
+
+- Feature release. Selected attributes can retain their earlier values;
+  population descriptions can derive values and select prims by their scene
+  relationships; reads return aligned attribute columns and support CUDA arrays;
+  and ordinals are signed. Physics population now uses descriptions instead of a
+  predefined domain.
+
+### Changed
+
+- **API and data contracts**
+
+  - **Breaking: signed ordinals.** `ovstage_ordinal_t` is now `int64_t`, with
+    `OVSTAGE_ORDINAL_MIN` and `OVSTAGE_ORDINAL_MAX` bounds (Python `ORDINAL_MIN`
+    and `ORDINAL_MAX`). A new stage is sealed through the minimum; negative
+    ordinals above it and zero are writable. Use the maximum for current-value
+    reads instead of `UINT64_MAX`. Changed-property USD export also accepts zero
+    and negative `since_ordinal` values preceding its export ordinal.
+  - **Breaking: typed identities.** Operation IDs, resource handles, tokens and
+    paths are distinct types in C/C++ and Python. Keep the matching type and use
+    `.raw_id` only at numeric boundaries; plain integers and other handle kinds
+    are no longer interchangeable. Existing ownership rules still apply.
+  - **Breaking: token sentinels and string precedence.** `OVX_INVALID_TOKEN` is
+    now `UINT64_MAX`; token `0` represents the empty string. The renamed
+    `ovx_token_or_string_t` replaces `ovx_string_or_token_t`, and a non-null
+    `string.ptr` takes precedence over its token. Leave that pointer null for
+    token-only values. Query attribute lists reject empty and invalid tokens.
+  - **Breaking: multi-column read groups.** Read attributes through
+    `group.columns[i]` (Python `ReadColumn`); flattened `ReadGroup` attribute and
+    payload fields are removed. Groups combine columns with identical prim-row
+    layouts, omit absent columns and deduplicate requested attributes. Release
+    a group only after its column views are no longer needed.
+  - **Breaking: batched C read fetch and release.** `ovstage_fetch_read_next()`
+    takes an output array, capacity and returned count. Use
+    `ovstage_release_groups()` instead of `ovstage_release_group()`. Python's
+    single-group fetch conveniences remain available.
+  - **Breaking: instance and vtable layout.** `ovstage_instance_t` now contains
+    `data_plane` and `ext_instances`. Rename `ovstage_vtable_t` and
+    `ovstage_context_t` to `ovstage_data_plane_vtable_t` and
+    `ovstage_data_plane_context_t`. Existing stage-bound hierarchy,
+    population/export, instancing, USD-stage and clone operations move to inline
+    vtable wrappers; use matching headers instead of resolving those operations
+    by symbol.
+  - **Breaking: population descriptor layouts grow.** Rebuild callers of
+    `ovstage_population_prim_predicate_t`, `ovstage_population_selector_t` and
+    `ovstage_population_export_desc_t`. Zero-initialize selectors so the new
+    derived-property fields are empty unless explicitly supplied.
+
+  - Use matching 0.4 headers, native libraries and Python bindings, and rebuild
+    native consumers. The package's `upgrading_from_0_3` guide and
+    `update-0-3-to-0-4` skill provide migration details.
+
+- **Reads and writes**
+
+  - **Breaking: wildcard names.** Attribute names containing `*` are reserved
+    for read selectors. Writes, maps, deletes, query attributes/predicates and
+    named floor operations now reject them with `OVSTAGE_ERROR_INVALID_ARGUMENT`.
+  - Range reads of `usd-path` report whole-prim deletion tombstones and require
+    its write floor to cover the range end. Prim creation/deletion history also
+    contributes to the reported retention frontier.
+  - Writes that specify a non-`NONE` semantic against an existing attribute with
+    no semantic now fail under `OVSTAGE_ATTRIBUTE_MODE_REJECT`. Use
+    `OVSTAGE_ATTRIBUTE_MODE_FORCE` to replace the schema.
+  - Reduced overhead for repeated writes through retained queries, indexed
+    fixed-size writes, and Python path/string conversion.
+  - Writes do not guarantee an implicit input snapshot. Copy source data that
+    could overlap storage affected by the write into independent memory before
+    submission, and retain it for the required input lifetime.
+
+- **USD population and runtime**
+
+  - **Breaking: instance metadata follows USD.** In every population domain,
+    `RENDERING` included, an instance root's `usd-prim-type` is its authored USD
+    type instead of `XformInstance` or `ScopeInstance`, and two instance roots
+    of different types sharing a prototype each keep their own. Instance roots
+    no longer carry `usd-metadata:typeName` unless a selector explicitly selects
+    the `typeName` metadata path. Without `RENDERING`, their schemas and ancestor
+    types also follow USD.
+  - **Breaking: point-instancer prototypes.** `prototypes` contains authored
+    targets in the order indexed by `protoIndices`; `prototypes:usd-targets` is
+    removed. Read the authored targets from `prototypes`.
+  - Live property edits republish affected properties and computed values
+    instead of unconditionally republishing the prim's subtree. Selection
+    dependencies and instancing can still require broader updates.
+  - Bundled Omniverse Client Library updated from 2.75.1 to 2.76.0; the separate
+    `omniverse_connection` library is no longer shipped.
+
+### Removed
+
+- **Breaking: `PHYSICS` and `ALL` population domains.** Pass a physics
+  population description through the `_with_desc` APIs, adding `RENDERING`
+  when needed. The former `PHYSICS` bit is ignored and populates no data.
+
+### Added
+
+- **Python 3.14 support** for the `ovstage` package. The standalone Python
+  examples remain limited to Python 3.10–3.13 because they pin NumPy 2.2.6.
+
+- **Data access and history**
+
+  - **Experimental selective history.** Select `history_selective` through
+    `ovstage_instance_desc_t.implementation` or `StageConfig.implementation`,
+    then enable retained values for selected prim/attribute pairs with
+    `ovstage_enable_history()` (Python `Stage.enable_history()`).
+    `OVSTAGE_CONFIG_RETENTION_WINDOW` bounds retention. The default
+    `history_latest` implementation keeps latest values only.
+  - **CUDA array reads.** Device-placed reads support numeric array attributes,
+    including ragged and empty arrays. Current device payloads can be borrowed;
+    other payloads are copied into storage retained by the read group.
+  - Read selectors `*` and `prefix*` discover matching attributes at each read.
+    Hidden namespaces require an explicit matching prefix. Pattern range reads
+    require a stage-wide floor covering the range end.
+  - `OVSTAGE_FILTER_OP_NOT_HAS` (Python `FilterOp.NOT_HAS`) selects prims without
+    an attribute.
+
+- **USD population and instancing**
+
+  - **Derived properties.** Population selectors can compute columns from
+    expressions, stage metadata and up-axis information, with conditional
+    publication and multiple-apply schema expansion. Expressions also resolve
+    bound materials, binding strength/purpose and collection members. Python
+    exposes `Expression`, `DerivedProperty` and `Selector.derived_properties`.
+  - New population predicates select native instances (`IS_INSTANCE`), prims
+    with matching descendants (`HAS_DESCENDANT`), prims with relationships
+    targeting matching prims (`HAS_PROPERTY` with `TARGETS`) and prims targeted
+    by matching relationships (`IS_TARGETED_BY`). These predicates are not
+    supported by USD export.
+  - `ovstage_instancing_get_instance_roots_batch()` batches instance queries;
+    `ovstage_instancing_resolve_paths()` resolves logical instance descendants
+    to instance roots, prototypes and backing paths. Python exposes both.
+  - `OVSTAGE_CONFIG_POPULATION_THREAD_LIMIT` (Python
+    `StageConfig.population_thread_limit`) enables parallel selector reads;
+    the default remains one thread. Repeated USD asset resolution is cached
+    within population operations.
+  - Instances capture the resolver context bound at creation for subsequent
+    population opens. Configure context-dependent resolvers before creating
+    the instance. Layer-open diagnostics distinguish unresolved URI schemes
+    from failures in registered resolvers.
+  - `OVSTAGE_CONFIG_POPULATION_STRICT_RESOLUTION` (Python
+    `StageConfig.population_strict_resolution`) makes unresolved composition
+    dependencies fail open/repopulate operations with `OVSTAGE_ERROR_OP_FAILED`.
+    It defaults off; failure does not roll back the partially resolved content.
+
+### Fixed
+
+- **Data plane and hierarchy**
+
+  - Maps of `usd-prim-type`, `usd-schemas` and `usd-ancestor-types` update the
+    actual metadata used by reads, filters and change tracking. Use canonical
+    host-resident maps for these names.
+  - Writes and maps preserve requested attribute roles when another prim has
+    the same attribute name with a different role. Explicitly writing an
+    already adopted semantic no longer requires schema replacement; queued
+    writes infer semantics from earlier queued creations before publication.
+  - Cloning rejects invalid source and target paths at submission with
+    `OVSTAGE_ERROR_INVALID_ARGUMENT`.
+  - Cloned and populated prims reconnect when their missing parent is created;
+    surviving children reattach when a parent is deleted. Hierarchy queries
+    include cloned prims and population-created parents and siblings, and
+    derived transforms follow the resulting connections.
+  - Concurrent GPU hierarchy computations on different instances no longer
+    crash during initialization, computation or teardown.
+  - Sparse CPU hierarchy updates preserve untouched world-transform and bounds
+    values already stored on the GPU.
+
+- **USD population**
+
+  - Prim metadata predicates re-evaluate when the selected metadata changes.
+  - Source USD edits no longer alter previously populated payloads before
+    `apply_usd_changes()` when `RENDERING` is not selected.
+  - Combined rendering/selector population preserves SPG shader tags and
+    accepts particle-field `extent` values in rendering's range representation.
+  - Rendering live edits preserve material-binding tags, update skinning and
+    subdivision tags, remove deleted transform-op columns and republish
+    relationship target changes. Updates skip rows removed in the same batch
+    and remove columns introduced by earlier live edits when their USD property
+    is deleted.
+  - Removing an applied API schema from several rendering-populated,
+    non-instance prims in one update removes stale schema tags and unauthored
+    schema properties from every affected prim.
+  - `RenderProduct.camera` and `RenderSettings.camera` retain authored prim-path
+    targets regardless of target type.
+  - Changing an instance's prototype removes obsolete proxies; prototype and
+    ancestor visibility changes reach instances, including nested instances.
+  - Population excludes instances beneath `class` or `over` prims, removes
+    rendering-populated prims that become abstract, and preserves
+    selector-populated properties when `apply_usd_changes()` rebuilds prototypes.
+  - Unloading a payload with animated transforms no longer aborts population.
+  - Rendering `UsdGeomPoints` positions use matching velocities between distinct
+    point samples; unauthored bounds follow the interpolated positions.
+
+- **Runtime**
+
+  - Loading OVStage before OVRTX applies the required USD scene-index setting.
+    The loader sets `HD_ENABLE_SCENE_INDEX_EMULATION=0`; release loaders also
+    set `TF_ENV_SETTING_ALERTS_ENABLED=0`, overriding inherited values.
+  - USD schema initialization no longer retains a bound host resolver context
+    for the process lifetime.
+
+### Limitations
+
+- Earlier limitations apply except where superseded above.
+- Selective history is experimental. The `history_selective` implementation
+  does not support device-placement APIs, including explicit CPU placement.
+- On stages populated for rendering only, `omni:xform` writes with
+  `semantic=NONE` can leave child world matrices zero or stale under
+  `GPU_GLOBAL` hierarchy computation. Explicitly pass `semantic=MATRIX`
+  when writing these transforms.
+- Rendering population changes are not fully represented in range reads;
+  this includes `usd-path` tombstones for prims removed by `RENDERING`.
+- With combined rendering and selector population, `apply_usd_time()` can
+  process pending edits that rebuild prototypes. Selector-populated properties
+  lost during that rebuild are restored by the next `apply_usd_changes()`.
+- Reconnecting hierarchy can require storage changes blocked by retained read
+  groups. Release those groups before structural writes; population may defer
+  reconnection until a subsequent population or hierarchy computation.
+- If CUDA write completion cannot be confirmed, later attribute reads, writes
+  and structural changes fail with `OVSTAGE_ERROR_OP_FAILED`. Retrying does
+  not clear this state; recreate the stage.
+
 ## [0.3.0] - 2026-10-13
 
 ### Summary
@@ -1100,6 +1322,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) 
 - Python writes do not expose `managed_tensors` ownership transfer; callers must
   keep client-managed source tensors alive until the operation completes.
 
+[0.4.0]: https://github.com/NVIDIA-Omniverse/ovstage/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/NVIDIA-Omniverse/ovstage/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/NVIDIA-Omniverse/ovstage/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/NVIDIA-Omniverse/ovstage/compare/v0.1.1...v0.2.0

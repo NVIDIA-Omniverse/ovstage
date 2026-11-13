@@ -15,7 +15,7 @@
  * This header contains the type surface that is specific to ovstage.
  * The generic vtable runtime types remain in `ovstage_api/ovstage_api_types.h`.
  *
- * @version 0.3.0
+ * @version 0.4.0
  * @date 2026-06-17
  */
 
@@ -36,6 +36,29 @@ extern "C" {
  */
 typedef struct {
     const char* name;  /**< Optional instance name for debugging. May be NULL. */
+    /** Points to the name of the implementation of the library that
+     *  ovstage_create_instance creates an instance of. NULL or an empty
+     *  string selects the default implementation. A name that no
+     *  implementation registered fails the call with
+     *  OVSTAGE_ERROR_INVALID_ARGUMENT: the call acquires no process
+     *  reference and creates no instance. The selection is per instance:
+     *  instances of different implementations share one process. Keep the
+     *  string valid until ovstage_create_instance returns.
+     *  @remark The implementations of this release are "history_latest",
+     *          the default, and "history_selective". "history_latest" keeps
+     *          history off: the instance keeps the latest value of every
+     *          cell, a read returns it, and the history selection calls
+     *          report OVSTAGE_ERROR_NOT_SUPPORTED. "history_selective" turns
+     *          history on for the pairs the application selects:
+     *          ovstage_enable_history() (ovstage_history.h) selects the
+     *          (prim, attribute) pairs that retain their earlier sealed
+     *          values, up to OVSTAGE_CONFIG_RETENTION_WINDOW. Every other
+     *          cell keeps the latest value.
+     *  @note Experimental. The implementation "history_selective" and the
+     *        history selection API of ovstage_history.h are experimental.
+     *        Their API, ABI and semantics can change between releases
+     *        without a deprecation period. */
+    const char* implementation;
 } ovstage_instance_desc_t;
 
 /**
@@ -100,8 +123,29 @@ typedef enum {
     OVSTAGE_CONFIG_KEY_TYPE_COUNT
 } ovstage_config_key_type_t;
 
-/** @brief Boolean config keys. Value type: bool. (None defined yet.) */
-typedef enum { OVSTAGE_CONFIG_BOOL_COUNT } ovstage_config_bool_t;
+/** @brief Boolean config keys. Value type: bool. */
+typedef enum {
+    /**
+     * Strict USD resolution for wholesale populations: opens
+     * (ovstage_population_open_usd_from_file / _from_string and their
+     * _with_desc forms) and ovstage_population_repopulate_usd_with_desc.
+     *
+     * When true, a wholesale population whose USD composition reports unresolved
+     * sublayer/reference/payload asset paths fails with
+     * OVSTAGE_ERROR_OP_FAILED, and ovstage_population_get_last_op_error lists
+     * up to three of the unresolved identifiers, plus a count of the rest — so
+     * automated tests can detect missing remote dependencies without scraping
+     * logs. When false (the default),
+     * unresolved dependencies are logged as warnings and the op succeeds
+     * (legacy behavior).
+     *
+     * Process-scoped, like the other config keys: supplied when acquiring the
+     * first process reference; re-specifying a different value while the
+     * process is active is an error.
+     */
+    OVSTAGE_CONFIG_POPULATION_STRICT_RESOLUTION,
+    OVSTAGE_CONFIG_BOOL_COUNT
+} ovstage_config_bool_t;
 /** @brief Int64 config keys. Value type: int64_t. (None defined yet.) */
 typedef enum { OVSTAGE_CONFIG_INT64_COUNT } ovstage_config_int64_t;
 /** @brief Uint64 config keys. Value type: uint64_t. */
@@ -121,8 +165,44 @@ typedef enum {
      * DEFAULT means no override, including while another policy is active.
      */
     OVSTAGE_CONFIG_RUNTIME_DEFAULT_ORDINAL_ADMISSION_POLICY,
+    /**
+     * Maximum number of threads one population operation may use to read what
+     * its selectors select, including the thread that runs it. 1 reads
+     * serially; N > 1 allows up to N threads; OVSTAGE_POPULATION_THREAD_LIMIT_AUTO
+     * lets the runtime choose, up to the concurrency the process allows. The
+     * runtime may use fewer threads than the limit. Opening and composing the
+     * USD stage and populating OVSTAGE_POPULATION_DOMAIN_RENDERING keep their
+     * own concurrency. Populated data does not depend on this setting.
+     *
+     * Defaults to 1. OVSTAGE_POPULATION_THREAD_LIMIT_DEFAULT (0) means no override.
+     */
+    OVSTAGE_CONFIG_POPULATION_THREAD_LIMIT,
+    /**
+     * Number of sealed ordinals retained for history-enabled attributes by new
+     * history-capable instances. Defaults to 4. Valid values are
+     * [1, SIZE_MAX - 1]. This is a process setting: while process references
+     * exist, an explicit value must match the active setting. Existing
+     * instances never resize. A history-capable instance reads the setting:
+     * it bounds the earlier sealed values that the pairs selected with
+     * ovstage_enable_history() retain. An instance that keeps history off
+     * ignores the setting: it keeps the latest value of every cell.
+     * @remark The `implementation` member of ovstage_instance_desc_t selects
+     *         the implementation: "history_selective" is history-capable,
+     *         and the default "history_latest" keeps history off.
+     * @note Experimental. This setting, the implementation "history_selective"
+     *       and the history selection API of ovstage_history.h are
+     *       experimental. Their API, ABI and semantics can change between
+     *       releases without a deprecation period.
+     */
+    OVSTAGE_CONFIG_RETENTION_WINDOW,
     OVSTAGE_CONFIG_UINT64_COUNT
 } ovstage_config_uint64_t;
+
+/** @brief OVSTAGE_CONFIG_POPULATION_THREAD_LIMIT value meaning no override. */
+#define OVSTAGE_POPULATION_THREAD_LIMIT_DEFAULT ((uint64_t)0)
+/** @brief OVSTAGE_CONFIG_POPULATION_THREAD_LIMIT value letting the runtime
+ *  choose the thread count, up to the concurrency the process allows. */
+#define OVSTAGE_POPULATION_THREAD_LIMIT_AUTO UINT64_MAX
 /** @brief Double config keys. Value type: double. (None defined yet.) */
 typedef enum { OVSTAGE_CONFIG_DOUBLE_COUNT } ovstage_config_double_t;
 /** @brief String config keys. Value type: ovx_string_t. */
@@ -203,12 +283,26 @@ typedef void (*ovstage_log_callback_t)(ovstage_log_severity_t severity,
                                        void*                  user_data);
 
 /** @brief Hierarchy handle - identifies an enqueued hierarchy lookup batch. */
-typedef uint64_t ovstage_hierarchy_handle_t;
-#define OVSTAGE_INVALID_HIERARCHY_HANDLE ((ovstage_hierarchy_handle_t)0)
+typedef struct ovstage_hierarchy_handle_t
+{
+    uint64_t raw_id;
+} ovstage_hierarchy_handle_t;
+#ifdef __cplusplus
+#define OVSTAGE_INVALID_HIERARCHY_HANDLE ovstage_hierarchy_handle_t{0}
+#else
+#define OVSTAGE_INVALID_HIERARCHY_HANDLE ((ovstage_hierarchy_handle_t){0})
+#endif
 
 /** @brief Opaque identity for a fetched hierarchy result payload. */
-typedef uint64_t ovstage_hierarchy_result_id_t;
-#define OVSTAGE_INVALID_HIERARCHY_RESULT_ID ((ovstage_hierarchy_result_id_t)0)
+typedef struct ovstage_hierarchy_result_id_t
+{
+    uint64_t raw_id;
+} ovstage_hierarchy_result_id_t;
+#ifdef __cplusplus
+#define OVSTAGE_INVALID_HIERARCHY_RESULT_ID ovstage_hierarchy_result_id_t{0}
+#else
+#define OVSTAGE_INVALID_HIERARCHY_RESULT_ID ((ovstage_hierarchy_result_id_t){0})
+#endif
 
 /**
  * @brief Public hierarchy computation model identifiers.
@@ -268,27 +362,8 @@ typedef enum {
     OVSTAGE_HIERARCHY_SIBLINGS = 2,  /**< Other prims with the same direct parent. */
 } ovstage_hierarchy_relation_t;
 
-/**
- * @brief Completion report of a finished ovstage_clone operation.
- *
- * Plain values copied out by ovstage_fetch_clone_result; nothing to release.
- * `prims_cloned` sums the sizes of the targets' scene hierarchy subtrees after
- * cloning, including each target root. It counts prims created or merged into and
- * any prims already attached beneath them. A prim whose path lies beneath a target
- * but remains detached from its scene hierarchy is not counted. For disjoint
- * targets that merge into no existing prims, it equals
- * `source_prim_count * target_count`. A zero-target clone reports
- * `{ordinal, 0, source_prim_count, 0}`.
- *
- * @remark Target paths are expected to be disjoint and outside the source
- *         subtree; a target nested under another target is counted as enumerated.
- */
-typedef struct {
-    ovstage_ordinal_t ordinal;           /**< Ordinal the clone was recorded at. */
-    size_t            target_count;      /**< `num_target_paths` as submitted. */
-    size_t            source_prim_count; /**< Prims in the source subtree, root inclusive. */
-    size_t            prims_cloned;      /**< Prims in all target scene hierarchy subtrees after cloning. */
-} ovstage_clone_result_t;
+/* ovstage_clone_result_t, the completion report of a clone, is defined in
+ * ovstage_api/ovstage_api_types.h: the clone slots of the public vtable name it. */
 
 /**
  * @brief Per-input hierarchy result metadata.
@@ -319,7 +394,7 @@ typedef struct {
     ovstage_ordinal_t             ordinal;
     const ovstage_hierarchy_item_t* items;
     size_t                        input_count;
-    const ovx_string_or_token_t*  paths;
+    const ovx_token_or_string_t*  paths;
     size_t                        path_count;
 } ovstage_hierarchy_result_t;
 
@@ -337,6 +412,14 @@ typedef struct {
 } ovstage_hierarchy_computation_model_desc_t;
 
 #ifdef __cplusplus
+}
+#endif
+
+#ifdef __cplusplus
+extern "C++"
+{
+OVX_DEFINE_HANDLE_CPP_OPERATORS(ovstage_hierarchy_handle_t)
+OVX_DEFINE_HANDLE_CPP_OPERATORS(ovstage_hierarchy_result_id_t)
 }
 #endif
 

@@ -25,9 +25,9 @@ I/O.
 Requirements
 ------------
 
-- **Python 3.10–3.13** (``requires-python = ">=3.10,<3.14"``). Recreate the
+- **Python 3.10–3.14** (``requires-python = ">=3.10,<3.15"``). Recreate the
   environment with a supported interpreter rather than editing the constraint.
-- **NumPy**, for tensor I/O (:meth:`write_attribute(tensors=...) <ovstage.Stage.write_attribute>`, :meth:`group.array(...) <ovstage.ReadGroup.array>`):
+- **NumPy**, for tensor I/O (:meth:`write_attribute(tensors=...) <ovstage.Stage.write_attribute>`, :meth:`column.array(...) <ovstage.ReadColumn.array>`):
 
   .. code-block:: bash
 
@@ -111,6 +111,102 @@ or changing either setting. Close all stages and release any other initializatio
 references and retained instance owners before selecting another policy.
 ``stage.config`` reports the original explicit entries, so an omitted policy
 remains ``None`` and an explicit ``DEFAULT`` remains ``DEFAULT``.
+
+.. _configuring-population-threads-python:
+
+Configuring Population Threads
+------------------------------
+
+Population reads what its selectors select serially by default. Set
+:py:attr:`~ovstage.StageConfig.population_thread_limit` to let a population
+operation use more threads for those reads:
+
+.. filtered-literalinclude:: ../../tests/python/test_config.py
+   :language: python
+   :start-after: # [snippet:configure-population-threads]
+   :end-before: # [/snippet:configure-population-threads]
+   :exclude-pattern: ^\s*#\s*\[/?snippet:
+   :dedent:
+
+The limit counts the thread that runs the operation: ``1`` is serial, ``N``
+allows up to ``N`` threads, and :py:data:`~ovstage.POPULATION_THREAD_LIMIT_AUTO`
+lets the runtime choose, up to the concurrency the process allows. The runtime
+may use fewer threads. Populated data is the same for every limit.
+
+The limit does not cover the rest of a population operation. Opening and
+composing the USD stage and populating the rendering domain keep their own
+concurrency, so a limit of ``1`` does not make a whole population operation
+single-threaded. Which population work the limit covers may grow between
+releases.
+
+The limit shares the process lifetime of the settings above. ``None`` and ``0``
+keep the active limit; a different limit raises :py:class:`~ovstage.OvstageError`
+until every stage and initialization reference is released.
+
+.. _selecting-the-implementation-python:
+
+Selecting the Implementation
+----------------------------
+
+.. warning::
+
+   History support is **experimental**. The ``history_selective``
+   implementation, the ``ovstage.history.v1`` selection extension behind
+   :py:meth:`~ovstage.Stage.enable_history` and the
+   :py:attr:`~ovstage.StageConfig.retention_window` setting can change between
+   releases without a deprecation period. The library does not guarantee
+   source compatibility, ABI or semantics. Isolate their use behind an
+   application adapter. Check availability at run time.
+
+A stage is an instance of the implementation that
+:py:attr:`~ovstage.StageConfig.implementation` selects. Each implementation
+of the library has a name and documents it. ``None`` or an empty name selects
+the default implementation, ``history_latest``.
+
+``history_latest`` is the default. History is off: the stage keeps the latest
+value of every cell, and a read returns it.
+:py:meth:`~ovstage.Stage.enable_history` raises
+:py:class:`~ovstage.OvstageError` with ``NOT_SUPPORTED`` on such a stage. Set
+the field to select it by name:
+
+.. code-block:: python
+
+   import ovstage
+
+   # Select the default implementation for this stage by name. History is off.
+   config = ovstage.StageConfig(implementation="history_latest")
+   with ovstage.Stage("simulation", config=config) as stage:
+       assert stage.config.implementation == "history_latest"
+
+:py:attr:`~ovstage.Stage.config` works on every stage and reports the name
+the stage was created with.
+
+``history_selective`` turns history on for the pairs the application selects.
+:py:meth:`~ovstage.Stage.enable_history` selects the ``(prim, attribute)``
+pairs that retain their earlier sealed values.
+:py:attr:`~ovstage.StageConfig.retention_window`
+(``OVSTAGE_CONFIG_RETENTION_WINDOW``, default 4) bounds the number of sealed
+ordinals each selected pair retains. Every other cell keeps the latest value.
+The stage serves the history extension ``ovstage.history.v1``. It does not
+serve the experimental device placement extension: the ``placement`` inputs
+raise :py:class:`~ovstage.OvstageError` on it. Every other operation runs as
+on a stage of ``history_latest``. See :ref:`ovstage-selective-history` for the
+complete sequence and for the recovery after a failed selection:
+
+.. code-block:: python
+
+   config = ovstage.StageConfig(implementation="history_selective", retention_window=8)
+   with ovstage.Stage("simulation", config=config) as stage:
+       assert stage.config.implementation == "history_selective"
+       # ... select pairs with stage.enable_history(query, attributes) ...
+
+The selection is per stage. Stages of different implementations share one
+process, so a stage of ``history_selective`` and a stage of ``history_latest``
+can be open together. A value that is not a string or ``None`` raises
+:py:class:`TypeError`. A name that no implementation of the library has raises
+:py:class:`~ovstage.OvstageError` with ``INVALID_ARGUMENT``, and no stage is
+created. The retention window shares the process lifetime of the settings
+above.
 
 Minimal Program
 ---------------

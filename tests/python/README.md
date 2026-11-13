@@ -14,8 +14,9 @@ wheel (not the build tree).
 - `test_population.py` — asserts USD population → query-back by usd-path, plus
   USD reference add/remove, reset, and missing-file failure (`populate-and-query`,
   `usd-reference`, `reset-usd`, `open-missing-file`).
-- `test_instancing.py` — asserts prototype-root enumeration and
-  prototype/instance-root mapping through the public wheel.
+- `test_instancing.py` — asserts batched instance-root enumeration,
+  ordered duplicate batch results, and prototype/instance-root mapping through
+  the public wheel.
 - `test_logging.py` — asserts the log-callback lifecycle + channel-filter suppression
   (`log-callback-filter`).
 - `test_support_api.py` — asserts `library_version`, native build information,
@@ -41,10 +42,11 @@ wheel (not the build tree).
 - `test_attribute_shapes.py` — asserts scalar / fixed-lane / ragged column shapes
   round-trip (`attribute-shapes-fixed`, `attribute-shapes-ragged`).
 - `test_attributes.py` — asserts every public attribute semantic through
-  `ReadGroup.semantic`, including unknown-value preservation, and keeps the
+  `ReadColumn.semantic`, including unknown-value preservation, and keeps the
   POINT / COLOR / MATRIX / TOKEN_ID workflow snippet (`semantic-roles`).
 - `test_map_attribute.py` — asserts CPU map/unmap writes existing and new
-  attributes (`map-unmap-cpu`).
+  attributes (`map-unmap-cpu`) and reserved-metadata round trips
+  (`map-reserved-metadata`).
 - `test_write_modes.py` — asserts UPSERT vs INSERT admission
   (`upsert-vs-insert`).
 - `test_sparse_writes.py` — asserts sparse `index_map` + `mask` writes
@@ -56,14 +58,21 @@ wheel (not the build tree).
   columns, an unresolved asset carries token id 0, and a byte-row payload is
   rejected.
 - `test_read_groups.py` — asserts `ReadGroup` release ownership: `with` releases the pinned
-  storage (including when the body raises), double release is rejected, a dropped group is
+  storage (including when the body raises), one multi-column group keeps every column pinned
+  until the group is released, borrowed columns do not keep a dropped group alive, DLPack
+  producers keep their owning group alive, double release is rejected, a dropped group is
   reclaimed with a `ResourceWarning`, the release still happens when `ResourceWarning` is
   escalated to an error, and a dropped group no longer blocks later writes
   (`read-group-context-manager`).
-- `test_path_lists.py` — asserts `PathList` reference ownership: the handle is still an
-  `int`, `with`/`release` drop the create reference, double release is rejected, an added
+- `test_path_lists.py` — asserts `PathList` reference ownership: the handle is a typed
+  `PrimPathList` rather than an `int`, `with`/`release` drop the create reference, double release is rejected, an added
   reference is tracked, and a dropped list is reclaimed with a `ResourceWarning`
   (`path-list-context-manager`, `path-list-loop-reuse`).
+- `test_read_patterns.py` — asserts the `"*"` and `"prefix*"` attribute selectors in
+  `read_attributes`: selection order, names added once, unmatched patterns, invalid
+  forms, built-in attributes, attributes written after the query is made, fixed past
+  ordinals, and the rejection of names with `*` in other operations
+  (`read-attribute-patterns`).
 
 Run via the cross-platform `../run_public_tests.py --wheel ...`, or directly with
 `ovstage` on `PYTHONPATH` and `libovstage` on the loader path:

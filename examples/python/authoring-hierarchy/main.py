@@ -25,7 +25,8 @@ import numpy as np
 
 import ovstage
 from ovstage import (AttributeSemantic, DLDataType, DLDataTypeCode, HierarchyComputationModel,
-                     HierarchyRelation, OrdinalRange, OvstageError, PrimMode, make_dltensor)
+                     HierarchyRelation, OrdinalRange, OvstageError, PrimMode, make_dltensor,
+)
 # [/snippet:setup]
 
 # The prototype subtree: nested paths only -- hierarchy derives from the path
@@ -54,8 +55,7 @@ def main() -> int:
     with ovstage.Stage("example.authoring-hierarchy") as stage, ovstage.PathDictionary(stage) as paths:
         proto_list = paths.create_path_list_from_strings(PROTO_PATHS)
         body_list = paths.create_path_list_from_strings(["/World/Proto/Body"])
-        with (stage.query_from_path_list(proto_list) as proto_query,
-              stage.query_from_path_list(body_list) as body_query):
+        with stage.query_from_path_list(proto_list) as proto_query, stage.query_from_path_list(body_list) as body_query:
             # ---- 1. author at ordinal 1: the prototype subtree, zero USD ----
 
             # [snippet:insert-author-subtree]
@@ -74,7 +74,7 @@ def main() -> int:
             # Stamp USD prim types client-side via the reserved "usd-prim-type"
             # attribute: one interned token id per prim (scalar uint64 column).
             # The same ids later serve usd-prim-type IN query filters.
-            type_ids = np.array([paths.intern_token(name) for name in PROTO_TYPES], dtype=np.uint64)
+            type_ids = np.array([paths.intern_token(name).raw_id for name in PROTO_TYPES], dtype=np.uint64)
             stage.write_attribute(proto_query, "usd-prim-type", ordinal=1, tensors=type_ids,
                                   is_array=False).wait()
             # [/snippet:author-prim-types]
@@ -85,7 +85,7 @@ def main() -> int:
             # a whole-set assignment -- a write replaces that prim's full schema
             # set, and an empty row clears it.
             schema_ids = np.array(
-                [paths.intern_token(name) for name in ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]],
+                [paths.intern_token(name).raw_id for name in ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]],
                 dtype=np.uint64,
             )
             stage.write_attribute(body_query, "usd-schemas", ordinal=1, tensors=schema_ids,
@@ -109,7 +109,8 @@ def main() -> int:
             print("prototype prim types:",
                   " ".join(_resolve_column_tokens(stage, paths, proto_query, prim_type, 1)))
             print("applied schemas on /World/Proto/Body:",
-                  " ".join(sorted(_resolve_column_tokens(stage, paths, body_query, schemas, 1))))
+                  " ".join(sorted(_resolve_column_tokens(stage, paths, body_query, schemas, 1))),
+            )
 
             # ---- 3. clone at ordinal 2: /World/Proto -> /World/Env_0..2 ----
             # [snippet:clone-prototype-envs]
@@ -151,7 +152,8 @@ def main() -> int:
             # and the seal then publishes a complete snapshot to readers.
             translation = _read_world_translation(stage, paths, "/World/Env_0/Body/Tip", end_ordinal=2)
             print("world matrix rows before compute_hierarchy:",
-                  "absent (derived rows are pull-computed)" if translation is None else "unexpectedly present")
+                  "absent (derived rows are pull-computed)" if translation is None else "unexpectedly present",
+            )
 
             # 5 prototype prims + 4 prims per cloned environment (Env_i, Arm, Body, Tip).
             all_paths = PROTO_PATHS + [env + suffix for env in ENV_PATHS
@@ -207,11 +209,14 @@ def main() -> int:
             # ---- 7. hierarchy lookups: parent / children / siblings ----
             # Relation paths read back unordered; print sorted.
             print("parent of /World/Proto/Body:",
-                  " ".join(sorted(_lookup(stage, paths, "/World/Proto/Body", HierarchyRelation.PARENT, 4))))
+                  " ".join(sorted(_lookup(stage, paths, "/World/Proto/Body", HierarchyRelation.PARENT, 4))),
+            )
             print("children of /World/Proto:",
-                  " ".join(sorted(_lookup(stage, paths, "/World/Proto", HierarchyRelation.CHILDREN, 4))))
+                  " ".join(sorted(_lookup(stage, paths, "/World/Proto", HierarchyRelation.CHILDREN, 4))),
+            )
             print("siblings of /World/Proto/Body:",
-                  " ".join(sorted(_lookup(stage, paths, "/World/Proto/Body", HierarchyRelation.SIBLINGS, 4))))
+                  " ".join(sorted(_lookup(stage, paths, "/World/Proto/Body", HierarchyRelation.SIBLINGS, 4))),
+            )
 
         # Happy-path cleanup: the query `with` blocks released their handles;
         # return the path-list references before the stage goes down.
@@ -260,23 +265,25 @@ def _read_world_translation(stage, paths, path, end_ordinal):
     translation = None
     with (stage.query_from_path_list(path_list) as query,
           stage.read_attributes(query, [paths.intern_token(WORLD_MATRIX)],
-                                OrdinalRange.latest(end_ordinal)) as read):
+                                OrdinalRange.latest(end_ordinal)) as read,
+    ):
         read.wait()
         group = read.fetch_next()
         if group is not None:
             # This single-prim query must yield one scalar-lane float64 4x4 matrix row.
             # Check tensor_count before touching tensor 0: a zero-tensor group
-            # would make group.tensor(0) raise instead of this diagnostic.
-            if group.tensor_count != 1:
+            # would make column.tensor(0) raise instead of this diagnostic.
+            column = group.columns[0]
+            if column.tensor_count != 1:
                 raise SystemExit(f"unexpected {WORLD_MATRIX} read-group shape for {path}")
-            tensor = group.tensor(0)
+            tensor = column.tensor(0)
             if (not tensor.data or tensor.shape_tuple != (1, 4, 4)
                     or tensor.dtype.code != DLDataTypeCode.kDLFloat
                     or tensor.dtype.bits != 64 or tensor.dtype.lanes != 1):
                 raise SystemExit(f"unexpected {WORLD_MATRIX} read-group shape for {path}")
             # A data index_map (sparse row gather) can only map to row 0 here.
-            row = group.data_row_index(0) if group.has_data_index_map else 0
-            matrix = np.asarray(group.array(0)).ravel()
+            row = column.data_row_index(0) if column.has_data_index_map else 0
+            matrix = np.asarray(column.array(0)).ravel()
             translation = (float(matrix[row * 16 + 12]), float(matrix[row * 16 + 13]),
                            float(matrix[row * 16 + 14]))
             stage.release_group(group)
@@ -290,8 +297,8 @@ def _resolve_column_tokens(stage, paths, query, attr_token, end_ordinal):
     with stage.read_attributes(query, [attr_token], OrdinalRange.latest(end_ordinal)) as read:
         read.wait()
         for group in read.groups():
-            for token_id in np.asarray(group.array(0)).ravel().tolist():
-                names.append(paths.token_to_string(int(token_id)))
+            for token_id in np.asarray(group.columns[0].array(0)).ravel().tolist():
+                names.append(paths.token_to_string(ovstage.Token(token_id)))
             stage.release_group(group)
     return names
 

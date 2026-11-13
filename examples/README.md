@@ -112,6 +112,20 @@ READMEs carry the exact build and run commands.
       <sub>Read the <a href="../docs/scene/exporting_to_usd.rst">export guide →</a></sub>
     </td>
   </tr>
+  <tr>
+    <td align="center" width="50%">
+      <b>Population</b>
+      <br>
+      <p align="left">Select USD prims, properties, and metadata, populate them at a chosen time and ordinal, and read back the results.</p>
+      <sub>Build &amp; run in: <a href="c/population/">C →</a>, <a href="python/population/">Python →</a></sub>
+    </td>
+    <td align="center" width="50%">
+      <b>Transforms</b>
+      <br>
+      <p align="left">Populate a hierarchy, write local transforms, compute world matrices, and read the results.</p>
+      <sub>Build &amp; run in: <a href="c/transforms/">C →</a>, <a href="python/transforms/">Python →</a></sub>
+    </td>
+  </tr>
 </table>
 
 ## Snippets and skills

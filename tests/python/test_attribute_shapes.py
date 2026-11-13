@@ -53,18 +53,20 @@ def test_scalar_and_fixed_lane_shapes(stage):
 
             read, group = _read_one_group(stage, query, temperature, 1)
             assert group is not None
-            scalar = group.array(0)
-            assert group.tensor(0).dtype.lanes == 1
+            column = group.columns[0]
+            scalar = column.array(0)
+            assert column.tensor(0).dtype.lanes == 1
             assert bool(np.allclose(scalar, [18.5, 19.5, 20.5]))
             stage.release_group(group)
             read.release().wait()
 
             read, group = _read_one_group(stage, query, velocity, 1)
             assert group is not None
+            column = group.columns[0]
             # A 3-lane column reads back as a flat view of prim_count * 3 values.
-            vec = np.asarray(group.array(0)).reshape(-1)
-            assert group.tensor(0).dtype.lanes == 1
-            assert group.tensor(0).shape_tuple == (3, 3)
+            vec = np.asarray(column.array(0)).reshape(-1)
+            assert column.tensor(0).dtype.lanes == 1
+            assert column.tensor(0).shape_tuple == (3, 3)
             assert vec.shape[0] == 9
             assert bool(np.allclose(vec, [1, 0, 0, 0, 1, 0, 0, 0, 1]))
             stage.release_group(group)
@@ -97,11 +99,12 @@ def test_ragged_array_shape(stage):
 
             read, group = _read_one_group(stage, query, samples, 1)
             assert group is not None
+            column = group.columns[0]
             got = {}
             for local in range(group.prim_count):
                 path = order[group.prim_index(local)]
-                row = group.data_row_index(local) if group.has_data_index_map else local
-                got[path] = [float(v) for v in np.asarray(group.array(row))]
+                row = column.data_row_index(local) if column.has_data_index_map else local
+                got[path] = [float(v) for v in np.asarray(column.array(row))]
             stage.release_group(group)
             read.release().wait()
 

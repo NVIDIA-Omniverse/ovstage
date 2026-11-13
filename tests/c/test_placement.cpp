@@ -123,7 +123,7 @@ protected:
         data.tensor_count = 1;
         data.is_array = false;
 
-        const ovx_string_or_token_t attribute{ attr_, {} };
+        const ovx_token_or_string_t attribute{ attr_, {} };
 
         return ovstage_write_attribute_on_device(
             stage_, query_, attribute, ordinal, data, OVSTAGE_PRIM_MODE_UPSERT, placement);
@@ -157,9 +157,10 @@ protected:
     void expectSeededHostGroup(ovstage_read_handle_t read)
     {
         ovstage_read_group_t group{};
-        ASSERT_EQ(ovstage_fetch_read_next(stage_, read, OVSTAGE_TIMEOUT_INFINITE, &group), OVSTAGE_OK);
-        ASSERT_EQ(group.data.tensor_count, 1u);
-        const DLTensor& tensor = group.data.tensors[0];
+        size_t fetchedReadGroupCount = 0;
+        ASSERT_EQ(ovstage_fetch_read_next(stage_, read, OVSTAGE_TIMEOUT_INFINITE, &group, 1, &fetchedReadGroupCount), OVSTAGE_OK);
+        ASSERT_EQ(group.columns[0].data.tensor_count, 1u);
+        const DLTensor& tensor = group.columns[0].data.tensors[0];
         ASSERT_NE(tensor.data, nullptr);
         ASSERT_GE(tensor.shape[0], 2);
         EXPECT_EQ(tensor.device.device_type, kDLCPU);
@@ -167,12 +168,12 @@ protected:
         std::memcpy(out, tensor.data, sizeof(out));
         EXPECT_FLOAT_EQ(out[0], 7.0f);
         EXPECT_FLOAT_EQ(out[1], 8.0f);
-        ovstage_release_group(stage_, &group);
+        ovstage_release_groups(stage_, &group, 1);
     }
 
     ovstage_instance_t* stage_ = nullptr;
     path_dictionary_instance_t* dict_ = nullptr;
-    ovx_token_t attr_ = 0;
+    ovx_token_t attr_{};
     ovx_primpath_list_t pathList_ = OVX_INVALID_PRIMPATH_LIST;
     ovstage_query_handle_t query_ = OVSTAGE_INVALID_QUERY_HANDLE;
     float values_[2] = { 7.0f, 8.0f };
@@ -213,7 +214,7 @@ namespace
 
 const ovstage_placement_extension_v1_t* g_servedTable = nullptr;
 
-ovstage_api_status_t serveTable(ovstage_context_t*, const char* name, const void** out)
+ovstage_api_status_t serveTable(ovstage_data_plane_context_t*, const char* name, const void** out)
 {
     *out = nullptr;
     if (std::strcmp(name, OVSTAGE_PLACEMENT_EXTENSION_NAME) != 0)
@@ -230,9 +231,9 @@ ovstage_api_status_t serveTable(ovstage_context_t*, const char* name, const void
 TEST(PlacementExtensionVersion, OnlyTheExactVersionIsAccepted)
 {
     ovstage_placement_extension_v1_t table{};
-    ovstage_vtable_t vtable{};
+    ovstage_data_plane_vtable_t vtable{};
     vtable.query_extension = serveTable;
-    ovstage_instance_t fake{ &vtable, nullptr };
+    ovstage_instance_t fake{ { &vtable, nullptr }, {} };
     g_servedTable = &table;
 
     table.header.struct_size = static_cast<uint32_t>(sizeof(table)) + 16u;
@@ -292,9 +293,10 @@ TEST_F(PlacementTest, CpuPlacementAgreeingWithSourceIsHonored)
     ASSERT_TRUE(waitOp(stage_, ovstage_read_attributes(stage_, query_, &attr_, 1, range, &read), "read"));
 
     ovstage_read_group_t group{};
-    ASSERT_EQ(ovstage_fetch_read_next(stage_, read, OVSTAGE_TIMEOUT_INFINITE, &group), OVSTAGE_OK);
-    ASSERT_EQ(group.data.tensor_count, 1u);
-    const DLTensor& tensor = group.data.tensors[0];
+    size_t fetchedReadGroupCount2 = 0;
+    ASSERT_EQ(ovstage_fetch_read_next(stage_, read, OVSTAGE_TIMEOUT_INFINITE, &group, 1, &fetchedReadGroupCount2), OVSTAGE_OK);
+    ASSERT_EQ(group.columns[0].data.tensor_count, 1u);
+    const DLTensor& tensor = group.columns[0].data.tensors[0];
     ASSERT_NE(tensor.data, nullptr);
     ASSERT_GE(tensor.shape[0], 2);
     float out[2] = { 0.0f, 0.0f };
@@ -304,7 +306,7 @@ TEST_F(PlacementTest, CpuPlacementAgreeingWithSourceIsHonored)
     // A CPU-placed column must report itself as CPU-resident.
     EXPECT_EQ(tensor.device.device_type, kDLCPU);
 
-    ovstage_release_group(stage_, &group);
+    ovstage_release_groups(stage_, &group, 1);
     waitOp(stage_, ovstage_release_read(stage_, read), "release_read");
 }
 
@@ -329,7 +331,7 @@ TEST_F(PlacementTest, HostPayloadMayBePlacedOnACudaDevice)
 TEST_F(PlacementTest, MapWithOutOfRangeDeviceIdIsRejected)
 {
     ovstage_map_desc_t desc{};
-    desc.attribute = ovx_string_or_token_t{ attr_, {} };
+    desc.attribute = ovx_token_or_string_t{ attr_, {} };
     desc.dtype = DLDataType{ kDLFloat, 32, 1 };
     desc.prim_mode = OVSTAGE_PRIM_MODE_UPSERT;
 
@@ -381,7 +383,7 @@ TEST_F(PlacementTest, BatchedWriteAcceptsOnePlacement)
     data.is_array = false;
 
     ovstage_attribute_write_t write{};
-    write.attribute = ovx_string_or_token_t{ attr_, {} };
+    write.attribute = ovx_token_or_string_t{ attr_, {} };
     write.data = data;
 
     ovstage_placement_t placement = OVSTAGE_PLACEMENT_INIT;

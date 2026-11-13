@@ -75,6 +75,47 @@ def test_configure_ordinal_admission(ovstage_mod):
     # [/snippet:configure-ordinal-admission]
 
 
+def test_configure_population_threads(ovstage_mod):
+    del ovstage_mod  # Fixture verifies that the produced wheel and native library load.
+
+    # [snippet:configure-population-threads]
+    import ovstage
+
+    # Let the runtime choose how many threads each population operation uses.
+    config = ovstage.StageConfig(population_thread_limit=ovstage.POPULATION_THREAD_LIMIT_AUTO)
+    with ovstage.Stage("simulation", config=config) as stage:
+        assert stage.config.population_thread_limit == ovstage.POPULATION_THREAD_LIMIT_AUTO
+    # [/snippet:configure-population-threads]
+
+
+def test_population_thread_limit_must_match_active_limit(ovstage_mod):
+    config = ovstage_mod.StageConfig(population_thread_limit=4)
+    with ovstage_mod.Stage("config.population-threads", config=config) as stage:
+        assert stage.config == config
+
+        # Omitted and zero entries keep the active limit.
+        for keep in (None, 0):
+            keep_config = ovstage_mod.StageConfig(population_thread_limit=keep)
+            with ovstage_mod.Stage("config.population-threads-keep", config=keep_config):
+                pass
+
+        with pytest.raises(ovstage_mod.OvstageError) as excinfo:
+            ovstage_mod.Stage(
+                "config.population-threads-conflict",
+                config=ovstage_mod.StageConfig(population_thread_limit=1),
+            )
+        assert excinfo.value.code == ovstage_mod.ErrorCode.INVALID_ARGUMENT
+
+
+@pytest.mark.parametrize("limit, error", [(-1, ValueError), (1 << 64, ValueError), (2.0, TypeError)])
+def test_population_thread_limit_rejects_unrepresentable_values(ovstage_mod, limit, error):
+    with pytest.raises(error):
+        ovstage_mod.Stage(
+            "config.population-threads-invalid",
+            config=ovstage_mod.StageConfig(population_thread_limit=limit),
+        )
+
+
 @pytest.mark.parametrize(
     "policy_name, admit_older, admit_equal",
     [
@@ -129,10 +170,10 @@ def test_ordinal_policy_controls_completed_writes(ovstage_mod, policy_name, admi
                             actual = {}
                             for group in read.groups():
                                 with group:
-                                    assert not group.is_delete
-                                    data = group.array(0)
+                                    assert not group.columns[0].is_delete
+                                    data = group.columns[0].array(0)
                                     for local in range(group.prim_count):
-                                        actual[group.prim_index(local)] = float(data[group.data_row_index(local)])
+                                        actual[group.prim_index(local)] = float(data[group.columns[0].data_row_index(local)])
                             assert actual == values
 
                     # Policy selection never disables the explicit write floor.

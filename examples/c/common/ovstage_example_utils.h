@@ -27,6 +27,12 @@
 #include <cstdlib>
 #include <cstring>
 
+[[noreturn]] inline void fail(const char* message)
+{
+    std::fprintf(stderr, "%s\n", message);
+    std::exit(EXIT_FAILURE);
+}
+
 // Check a synchronous ovstage call; exit on failure.
 inline void check(ovstage_instance_t* stage, ovstage_api_status_t status, const char* what)
 {
@@ -56,7 +62,7 @@ inline void checkWait(ovstage_instance_t* stage, const ovstage_op_wait_result_t&
     {
         const ovx_string_t e = ovstage_get_last_op_error(stage, wait.error_op_ids[i]);
         std::fprintf(stderr, "ovstage %s op %llu failed: %.*s\n", what,
-                     (unsigned long long)wait.error_op_ids[i], (int)e.length, e.ptr ? e.ptr : "");
+                     (unsigned long long)wait.error_op_ids[i].raw_id, (int)e.length, e.ptr ? e.ptr : "");
     }
     if (wait.error_op_id_count != 0)
         std::exit(EXIT_FAILURE);
@@ -90,7 +96,7 @@ inline void waitPop(ovstage_instance_t* stage, ovstage_population_enqueue_result
     {
         const ovx_string_t e = ovstage_population_get_last_op_error(wait.error_op_ids[i]);
         std::fprintf(stderr, "ovstage population %s op %llu failed: %.*s\n", what,
-                     (unsigned long long)wait.error_op_ids[i], (int)e.length, e.ptr ? e.ptr : "");
+                     (unsigned long long)wait.error_op_ids[i].raw_id, (int)e.length, e.ptr ? e.ptr : "");
     }
     if (code != OVSTAGE_OK)
         std::fprintf(stderr, "ovstage population %s wait failed (code %u)\n", what, code);
@@ -150,11 +156,13 @@ inline void readColumn(ovstage_instance_t* stage, ovstage_query_handle_t query, 
     ovstage_read_handle_t read = OVSTAGE_INVALID_READ_HANDLE;
     waitOp(stage, ovstage_read_attributes(stage, query, &attribute, 1, range, &read), "read_attributes");
 
+    size_t fetchedGroupCount = 0;
     ovstage_read_group_t group{};
-    check(stage, ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group), "fetch_read_next");
-    const DLTensor* tensor = group.data.tensor_count == 1 && group.data.tensors ? &group.data.tensors[0] : nullptr;
+    check(stage, ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group, 1, &fetchedGroupCount), "fetch_read_next");
+    const ovstage_read_column_t* column = group.column_count == 1 && group.columns ? &group.columns[0] : nullptr;
+    const DLTensor* tensor = column && column->data.tensor_count == 1 && column->data.tensors ? &column->data.tensors[0] : nullptr;
     const int rank = components == 1 ? 1 : 2;
-    if (!tensor || !tensor->data || !tensor->shape || group.is_array || tensor->ndim != rank ||
+    if (!tensor || !tensor->data || !tensor->shape || column->is_array || tensor->ndim != rank ||
         tensor->shape[0] != count || (rank == 2 && tensor->shape[1] != components) ||
         tensor->device.device_type != kDLCPU || tensor->dtype.code != kDLFloat ||
         tensor->dtype.bits != 32 || tensor->dtype.lanes != 1 ||
@@ -168,6 +176,6 @@ inline void readColumn(ovstage_instance_t* stage, ovstage_query_handle_t query, 
     const size_t rowStride = tensor->strides ? (size_t)tensor->strides[0] : components;
     for (int64_t row = 0; row < count; ++row)
         std::memcpy(dst + row * components, bytes + row * rowStride * sizeof(float), components * sizeof(float));
-    ovstage_release_group(stage, &group);
+    ovstage_release_groups(stage, &group, 1);
     waitOp(stage, ovstage_release_read(stage, read), "release_read");
 }

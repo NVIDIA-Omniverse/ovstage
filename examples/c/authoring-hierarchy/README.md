@@ -47,7 +47,7 @@ children of /World/Proto: /World/Proto/Arm /World/Proto/Body
 siblings of /World/Proto/Body: /World/Proto/Arm
 ```
 
-- The first two lines read back the client-stamped `usd-prim-type` (one type
+- `prototype prim types` and `applied schemas` read back the client-stamped `usd-prim-type` (one type
   token per prim) and `usd-schemas` (a token array per prim) — the prims exist
   with zero USD and no parenting call.
 - The `absent` line shows that the derived `omni:fabric:worldMatrix` column
@@ -57,7 +57,7 @@ siblings of /World/Proto/Body: /World/Proto/Arm
 - The `moved` / `recomputed` pair shows that a later edit needs another compute
   — the tip's z becomes 47.0. The computation uses the latest committed
   inputs. The current implementation ignores `input_ordinal`.
-- The last three relation lines come from `ovstage_get_hierarchy` lookups
+- `parent of`, `children of`, and `siblings of` come from `ovstage_get_hierarchy` lookups
   against the write-created prims.
 
 ## Build and run
@@ -94,18 +94,17 @@ aggregates them).
 
 ## Snippets
 
-The `[snippet:name]` markers in `main.cpp` fence regions referenced by the
-ovstage skills under `../../../skills/`; keep them intact when editing.
+The `[snippet:name]` markers in [main.cpp](main.cpp) identify the source regions described below and referenced by the [ovstage skills](../../../skills/). Keep the markers intact when editing.
 
-- `insert-author-subtree` — create prims via an INSERT (create-only) write to nested paths
-- `author-prim-types` — stamp `usd-prim-type` (scalar uint64 token ids)
-- `author-applied-schemas` — stamp `usd-schemas` (token-id array; whole-set rows)
-- `author-local-transforms` — `omni:xform` as ONE 16-lane float64 element per prim
-- `clone-prototype-envs` — clone one prototype to N environments in one call
-- `hierarchy-computation-models` — enumerate the runtime's computation models
-- `world-matrix-staleness` — absent → seed output rows → compute → seal → correct
-- `recompute-after-edit` — a later local edit needs another compute to land
-- `hierarchy-lookups` — parent/children/siblings via `ovstage_get_hierarchy`
+- `insert-author-subtree` — Calls `ovstage_write_attribute()` with `OVSTAGE_PRIM_MODE_INSERT` to create the prototype prims at nested paths. Each receives a `proto:part` value at ordinal 1; INSERT requires that the selected prims do not already exist.
+- `author-prim-types` — Interns type names such as `Xform` and `Cube`, then writes one `uint64` token per prim to `usd-prim-type`. Later reads resolve the tokens back to type names.
+- `author-applied-schemas` — Writes the `PhysicsRigidBodyAPI` and `PhysicsMassAPI` tokens as an array on `/World/Proto/Body`. Each `usd-schemas` write replaces the prim's complete applied-schema set; an empty array clears it.
+- `author-local-transforms` — Uses `writeMatrixRows()` to write one 16-lane float64 matrix per prim to `omni:xform` with the matrix semantic. It advances the write floor to 1 so readers can access the completed authoring step.
+- `clone-prototype-envs` — Calls `ovstage_clone()` once to copy `/World/Proto` to three environment paths, then waits for completion. `writeLocalTranslation()` gives each new root a different X translation before the write floor advances to 2.
+- `hierarchy-computation-models` — Calls `ovstage_get_hierarchy_computation_models()` and prints the available model names. This example selects GPU incremental computation for its client-authored hierarchy and requires a CUDA-capable GPU.
+- `world-matrix-staleness` — Checks the example's initially absent world matrices, writes placeholders, then waits for `ovstage_compute_hierarchy()` at ordinal 3. Reading the computed translations gives `(100, 100, 7)` for `/World/Env_0/Body/Tip`.
+- `recompute-after-edit` — Moves `/World/Env_1` at ordinal 4, waits for another hierarchy computation, and advances the write floor before reading. The updated tip translation is `(200, 100, 47)`.
+- `hierarchy-lookups` — `lookupHierarchyPaths()` submits `ovstage_get_hierarchy()` for a parent, children, or siblings relation and copies the fetched path strings into its return value. It releases the result, lookup handle, and path list; the caller sorts the strings because relation results have no guaranteed order.
 
 ## Notes
 

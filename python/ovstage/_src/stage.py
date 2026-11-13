@@ -18,9 +18,12 @@ Tensor data flows as numpy arrays (CPU) via DLPack.
 import ctypes
 from typing import List, Optional, Sequence, TypeVar, Union
 
+from ..handles import MapHandle, OpId, PrimPathList, Token
 from . import bindings as _b
 from .dlpack import DLDataType, DLTensor, make_dltensor
 from .types import (
+    TIMEOUT_INFINITE,
+    AttributeMode,
     AttributeSemantic,
     CloneOperation,
     CloneResult,
@@ -36,27 +39,49 @@ from .types import (
     OvstageError,
     Placement,
     PrimMode,
-    AttributeMode,
     QueryResult,
     ReadGroup,
     Scope,
     StageConfig,
-    TIMEOUT_INFINITE,
     WriteDesc,
     _warn_dropped_resource,
     check_element_sizes,
     check_enum,
     check_enum_member,
-    check_handle,
     check_index_map,
     check_mask,
     check_ordinal,
+    check_path_list,
     check_timeout,
     check_token_sequence,
+    check_uint64,
     check_write_count,
 )
 
 __all__ = ["Stage", "Query", "Read", "Map", "OrdinalQuery", "Hierarchy"]
+
+# ``ovstage.history.v1`` (ovstage_history.h): the selection table of a stage
+# of ``history_selective``, discovered through the query_extension slot of the
+# data plane.
+_HISTORY_EXTENSION_NAME = b"ovstage.history.v1"
+_HISTORY_EXTENSION_VERSION = 1
+_HISTORY_SELECT_FN = ctypes.CFUNCTYPE(
+    _b.ovstage_api_status_t,
+    _b.ovstage_data_plane_context_p,
+    _b.ovstage_query_handle_t,
+    ctypes.POINTER(_b.ovx_token_or_string_t),
+    ctypes.c_size_t,
+)
+
+
+class _HistoryExtensionV1(ctypes.Structure):
+    _fields_ = [
+        ("struct_size", ctypes.c_uint32),
+        ("version", ctypes.c_uint32),
+        ("enable", _HISTORY_SELECT_FN),
+        ("disable", _HISTORY_SELECT_FN),
+    ]
+
 
 _TensorLike = Union[DLTensor, "object"]  # DLTensor or numpy array
 
@@ -66,11 +91,12 @@ _TensorLike = Union[DLTensor, "object"]  # DLTensor or numpy array
 _HandleT = TypeVar("_HandleT", bound="_HandleObject")
 
 
-def _handle(value) -> int:
-    """Accept a handle wrapper (``.handle``) or a raw int handle."""
+def _handle(value, kind):
+    """Accept a live resource wrapper or an identity of the required handle kind."""
+    handle = kind._require(getattr(value, "handle", value), "handle")
     if hasattr(value, "_ensure_active"):
         value._ensure_active()
-    return check_handle(getattr(value, "handle", value), "handle")
+    return handle
 
 
 def _require_placement(placement: Placement) -> Placement:
@@ -93,9 +119,19 @@ class Stage:
 
     Args:
         name: Optional instance name used for diagnostics.
-        config: Optional process configuration. Its runtime-default hierarchy
-            model controls automatic transform updates; its ordinal admission
-            policy controls mutation ordering. Both are captured by this instance.
+        config: Optional configuration. Its runtime-default hierarchy
+            model controls automatic transform updates. Its ordinal admission
+            policy controls mutation ordering. Both are process settings that
+            this instance captures. Its implementation field is an instance
+            setting: it selects, by name, the implementation this stage is
+            created with (see :attr:`StageConfig.implementation`).
+            ``history_latest``, the default, keeps history off: the stage
+            keeps the latest value of every cell. ``history_selective`` turns
+            history on for the pairs that :meth:`enable_history` selects.
+            **Experimental.** The history selection API and the
+            ``history_selective`` implementation are experimental. Their API,
+            ABI and semantics can change between releases without a
+            deprecation period.
     """
 
     def __init__(self, name: Optional[str] = None, config: Optional[StageConfig] = None):
@@ -103,16 +139,29 @@ class Stage:
             raise TypeError(f"config must be a StageConfig or None, got {type(config).__name__}")
 
         self._lib = _b.load()
-        # Data-plane calls dispatch through the instance vtable; _api forwards
-        # instance->context to the resolved slot. Flat symbols (create/destroy,
-        # ovstage_instancing_*, ovstage_population_*) are still called directly
-        # on self._lib.
+        # The facade serves every ovstage_* function of the instance by name. A
+        # data-plane slot receives instance->data_plane.context. A function of
+        # the hierarchy, population, usd and instancing families receives the
+        # context of its pair,
+        # instance->ext_instances.<family>.context. The lifecycle functions, the
+        # process functions and ovstage_create_instance are flat symbols called
+        # on self._lib through the facade or directly.
         self._api = _b.instance_api(self._lib, self._invalid_instance_error)
         self._inst = _b.ovstage_instance_p()
         self._holds_process_ref = False
         self._name_bytes = name.encode("utf-8") if name is not None else None
+        # The descriptor selects the implementation of this instance. The
+        # implementation is not a process configuration entry, and
+        # ovstage_get_config does not report it, so the stage keeps the name
+        # it passed.
+        implementation = config.implementation if config is not None else None
+        if implementation is not None and not isinstance(implementation, str):
+            raise TypeError(f"implementation must be a str or None, got {type(implementation).__name__}")
+        self._implementation = implementation
+        self._implementation_bytes = implementation.encode("utf-8") if implementation is not None else None
         desc = _b.ovstage_instance_desc_t()
         desc.name = self._name_bytes
+        desc.implementation = self._implementation_bytes
 
         if config is not None:
             native_config = self._to_c_config(config)
@@ -169,12 +218,41 @@ class Stage:
                     policy,
                 )
             )
+        thread_limit = config.population_thread_limit
+        if thread_limit is not None:
+            thread_limit = check_uint64(thread_limit, "population_thread_limit")
+            entries.append(
+                _b.ovstage_config_entry_uint64(
+                    _b.OVSTAGE_CONFIG_POPULATION_THREAD_LIMIT,
+                    thread_limit,
+                )
+            )
+        strict = config.population_strict_resolution
+        if strict is not None:
+            if not isinstance(strict, bool):
+                raise TypeError(f"population_strict_resolution must be a bool or None, got {type(strict).__name__}")
+            entries.append(_b.ovstage_config_entry_bool(_b.OVSTAGE_CONFIG_POPULATION_STRICT_RESOLUTION, strict))
+        retention_window = config.retention_window
+        if retention_window is not None:
+            # bool is an int subclass, so operator.index(True) is 1: a boolean
+            # would silently configure a one-ordinal window. Reject it by type.
+            if isinstance(retention_window, bool):
+                raise TypeError("retention_window must be an int, got bool")
+            # The native range is [1, SIZE_MAX - 1]; a wrapped or out-of-range
+            # value must be rejected here because ctypes coerces silently.
+            capacity = check_uint64(retention_window, "retention_window")
+            if capacity == 0 or capacity >= 2**64 - 1:
+                raise ValueError("retention_window must be in [1, 2**64 - 2]")
+            entries.append(_b.ovstage_config_entry_uint64(_b.OVSTAGE_CONFIG_RETENTION_WINDOW, capacity))
         return _b.ovstage_config_t(entries)
 
     @staticmethod
     def _from_c_config(config: _b.ovstage_config_t) -> StageConfig:
         model = None
+        retention_window = None
         policy = None
+        thread_limit = None
+        strict = None
         for i in range(config.entry_count):
             entry = config.entries[i]
             if (
@@ -184,12 +262,30 @@ class Stage:
                 model = HierarchyComputationModel(entry.value.uint_value)
             elif (
                 entry.key_type == _b.OVSTAGE_CONFIG_KEY_TYPE_UINT64
+                and entry.key.uint64_key == _b.OVSTAGE_CONFIG_RETENTION_WINDOW
+            ):
+                retention_window = int(entry.value.uint_value)
+            elif (
+                entry.key_type == _b.OVSTAGE_CONFIG_KEY_TYPE_UINT64
                 and entry.key.uint64_key == _b.OVSTAGE_CONFIG_RUNTIME_DEFAULT_ORDINAL_ADMISSION_POLICY
             ):
                 policy = OrdinalAdmissionPolicy(entry.value.uint_value)
+            elif (
+                entry.key_type == _b.OVSTAGE_CONFIG_KEY_TYPE_UINT64
+                and entry.key.uint64_key == _b.OVSTAGE_CONFIG_POPULATION_THREAD_LIMIT
+            ):
+                thread_limit = entry.value.uint_value
+            elif (
+                entry.key_type == _b.OVSTAGE_CONFIG_KEY_TYPE_BOOL
+                and entry.key.bool_key == _b.OVSTAGE_CONFIG_POPULATION_STRICT_RESOLUTION
+            ):
+                strict = bool(entry.value.bool_value)
         return StageConfig(
             runtime_default_hierarchy_computation_model=model,
             runtime_default_ordinal_admission_policy=policy,
+            population_thread_limit=thread_limit,
+            population_strict_resolution=strict,
+            retention_window=retention_window,
         )
 
     @property
@@ -200,10 +296,14 @@ class Stage:
         snapshot does not expand them into the resolved runtime defaults.
         """
         native_config = _b.ovstage_config_t([])
-        code = self._lib.ovstage_get_config(self._require_inst(), ctypes.byref(native_config))
+        code = self._api.ovstage_get_config(self._require_inst(), ctypes.byref(native_config))
         if code != _b.OVSTAGE_OK:
             raise OvstageError(code, self._last_error())
-        return self._from_c_config(native_config)
+        config = self._from_c_config(native_config)
+        # The implementation field is not a process configuration entry. The
+        # snapshot reports the name this stage was created with.
+        config.implementation = self._implementation
+        return config
 
     @staticmethod
     def get_version() -> tuple:
@@ -215,7 +315,8 @@ class Stage:
             # ovstage_population's per-stage state (including any held USD-runtime
             # reference) is released automatically by ovstage_destroy_instance —
             # no manual detach is required (see ovstage_population.h lifecycle).
-            code = self._lib.ovstage_destroy_instance(self._inst)
+            # The facade serves it through the lifecycle family vtable of the instance.
+            code = self._api.ovstage_destroy_instance(self._inst)
             if code != _b.OVSTAGE_OK:
                 raise OvstageError(code, self._last_error())
             self._inst = _b.ovstage_instance_p()
@@ -244,7 +345,7 @@ class Stage:
         # readable even when create failed and there is no bundle to dispatch on.
         return str(self._api.ovstage_get_last_error())
 
-    def _last_op_error(self, op_id: int) -> str:
+    def _last_op_error(self, op_id: _b.ovstage_op_id_t) -> str:
         # Returns an ovx_string_t ({NULL, 0} when the op id is unknown / did not
         # fail); ovx_string_t.__str__ yields "" for the empty view. A synchronous
         # rejection carries OVSTAGE_INVALID_OP_ID and records its detail in the
@@ -261,21 +362,16 @@ class Stage:
         if code != _b.OVSTAGE_OK:
             raise OvstageError(code, self._last_error())
 
-    def _flat_symbol(self, name: str):
-        if not hasattr(self._lib, name):
-            raise OvstageError(_b.OVSTAGE_ERROR_NOT_SUPPORTED, f"libovstage does not export {name}")
-        return getattr(self._lib, name)
-
     @staticmethod
     def _invalid_instance_error(symbol: str) -> OvstageError:
         return OvstageError(_b.OVSTAGE_ERROR_INVALID_HANDLE, f"{symbol} called after Stage was destroyed")
 
     def _require_inst(self):
         if not self._inst:
-            raise self._invalid_instance_error("flat ovstage API")
+            raise self._invalid_instance_error("ovstage API")
         return self._inst
 
-    def _wait_and_release(self, op_id: int, timeout: int, on_complete=None) -> None:
+    def _wait_and_release(self, op_id: _b.ovstage_op_id_t, timeout: int, on_complete=None) -> None:
         """Wait for ``op_id``, run ``on_complete`` while the completed op is still live, release it."""
         wait = _b.ovstage_op_wait_result_t()
         code = self._api.ovstage_wait_op(self._inst, op_id, timeout, ctypes.byref(wait))
@@ -286,7 +382,7 @@ class Stage:
             # it tracked so a later wait can observe it.
             raise OvstageError(
                 code,
-                f"operation {op_id} is still pending (lowest pending op id {int(wait.lowest_pending_op_id)})",
+                f"operation {op_id} is still pending (lowest pending op id {wait.lowest_pending_op_id})",
             )
         # Ops that ran and failed -- the waited op or a failed producer in its
         # dependency chain -- are reported through wait.error_op_ids, and the
@@ -297,7 +393,7 @@ class Stage:
         # producer failed for it.
         error_count = int(wait.error_op_id_count) if wait.error_op_ids else 0
         if code != _b.OVSTAGE_OK or error_count != 0:
-            failed_id = int(wait.error_op_ids[0]) if error_count else op_id
+            failed_id = wait.error_op_ids[0] if error_count else op_id
             msg = self._last_op_error(failed_id)
             self._api.ovstage_release_op(self._inst, op_id)  # best effort
             raise OvstageError(code if code != _b.OVSTAGE_OK else _b.OVSTAGE_ERROR_OP_FAILED, msg)
@@ -311,16 +407,16 @@ class Stage:
         if rc != _b.OVSTAGE_OK:
             raise OvstageError(rc, self._last_op_error(op_id))
 
-    def wait_op_raw(self, op_id: int, timeout: int = TIMEOUT_INFINITE) -> int:
+    def wait_op_raw(self, op_id: OpId, timeout: int = TIMEOUT_INFINITE) -> int:
         """Wait without raising or releasing; returns the raw ``ovstage_api_status_t``."""
         wait = _b.ovstage_op_wait_result_t()
         return int(
             self._api.ovstage_wait_op(
-                self._inst, check_handle(op_id, "op_id"), check_timeout(timeout), ctypes.byref(wait)
+                self._inst, _b.ovstage_op_id_t._require(op_id, "op_id"), check_timeout(timeout), ctypes.byref(wait)
             )
         )
 
-    def wait_op(self, op_id: int, timeout: int = TIMEOUT_INFINITE):
+    def wait_op(self, op_id: OpId, timeout: int = TIMEOUT_INFINITE):
         """Low-level wait: returns ``(code, error_op_ids, lowest_pending_op_id)``.
 
         Does not release the op. Lets callers inspect the wait result struct
@@ -330,25 +426,25 @@ class Stage:
         wait = _b.ovstage_op_wait_result_t()
         code = int(
             self._api.ovstage_wait_op(
-                self._inst, check_handle(op_id, "op_id"), check_timeout(timeout), ctypes.byref(wait)
+                self._inst, _b.ovstage_op_id_t._require(op_id, "op_id"), check_timeout(timeout), ctypes.byref(wait)
             )
         )
         error_op_ids = (
-            [int(wait.error_op_ids[i]) for i in range(int(wait.error_op_id_count))]
+            [_b.ovstage_op_id_t(wait.error_op_ids[i]) for i in range(int(wait.error_op_id_count))]
             if wait.error_op_ids
             else []
         )
-        return code, error_op_ids, int(wait.lowest_pending_op_id)
+        return code, error_op_ids, wait.lowest_pending_op_id
 
-    def release_op(self, op_id: int) -> int:
+    def release_op(self, op_id: OpId) -> int:
         """Release op tracking state; returns the raw ``ovstage_api_status_t``."""
-        return int(self._api.ovstage_release_op(self._inst, check_handle(op_id, "op_id")))
+        return int(self._api.ovstage_release_op(self._inst, _b.ovstage_op_id_t._require(op_id, "op_id")))
 
     # ── query ───────────────────────────────────────────────────────────────
     def query(
         self,
         filter: Optional[Filter] = None,
-        attrs: Optional[Sequence[int]] = None,
+        attrs: Optional[Sequence[Token]] = None,
     ) -> "Query":
         """Enqueue a filter query. ``attrs`` scopes attribute discovery (tokens)."""
         keep: list = []
@@ -368,9 +464,9 @@ class Stage:
             attr_count = len(tokens)
         handle = _b.ovstage_query_handle_t()
         res = self._api.ovstage_query(self._inst, filt_ref, attr_ptr, attr_count, ctypes.byref(handle))
-        return Query(self, int(handle.value), Operation(self, res.status, res.op_index, keepalive=keep))
+        return Query(self, handle, Operation(self, res.status, res.op_index, keepalive=keep))
 
-    def query_from_path_list(self, path_list: int) -> "Query":
+    def query_from_path_list(self, path_list: PrimPathList) -> "Query":
         """Create a query handle from an interned prim path list (synchronous).
 
         The handle wraps a **caller-owned** list (see ``query_from_path_list`` in
@@ -387,15 +483,13 @@ class Stage:
         not release your list. Passing a freshly created list inline —
         ``stage.query_from_path_list(paths.create_path_list_from_strings(...))`` —
         leaves no handle to release, so the list is eventually reclaimed by
-        :meth:`PathList.__del__` with a :class:`ResourceWarning`. Bind it.
+        ``PathList.__del__`` with a :class:`ResourceWarning`. Bind it.
         """
         handle = _b.ovstage_query_handle_t()
         self._check(
-            self._api.ovstage_query_from_path_list(
-                self._inst, check_handle(path_list, "path_list"), ctypes.byref(handle)
-            )
+            self._api.ovstage_query_from_path_list(self._inst, check_path_list(path_list), ctypes.byref(handle))
         )
-        query = Query(self, int(handle.value), None)
+        query = Query(self, handle, None)
         # Keepalive only — the reference stays the caller's to release.
         query._path_list = path_list
         return query
@@ -404,20 +498,22 @@ class Stage:
         """Fetch (and release) a query result, copying out its scalar summary."""
         res = _b.ovstage_query_result_t()
         self._check(
-            self._api.ovstage_fetch_query_result(self._inst, _handle(query), check_timeout(timeout), ctypes.byref(res))
+            self._api.ovstage_fetch_query_result(
+                self._inst, _handle(query, _b.ovstage_query_handle_t), check_timeout(timeout), ctypes.byref(res)
+            )
         )
-        attributes = [int(res.attributes[i]) for i in range(int(res.attribute_count))]
+        attributes = [_b.ovx_token_t(res.attributes[i]) for i in range(int(res.attribute_count))]
         out = QueryResult(
             attributes=attributes,
             total_prim_count=int(res.total_prim_count),
-            all_handle=int(res.all_handle),
+            all_handle=_b.ovstage_query_handle_t(res.all_handle),
         )
         self._check(self._api.ovstage_release_query_result(self._inst, ctypes.byref(res)))
         return out
 
     def release_query(self, query) -> Operation:
-        claimed = isinstance(query, _HandleObject)
-        handle = query._claim_release() if claimed else _handle(query)
+        claimed = isinstance(query, Query)
+        handle = query._claim_release() if claimed else _handle(query, _b.ovstage_query_handle_t)
         try:
             res = self._api.ovstage_release_query(self._inst, handle)
         except Exception:
@@ -441,7 +537,7 @@ class Stage:
     def read_attributes(
         self,
         query,
-        attrs: Sequence[int],
+        attrs: Sequence[Token],
         ordinal_range: OrdinalRange,
         *,
         placement: Optional[Placement] = None,
@@ -477,6 +573,53 @@ class Stage:
         caller never issued -- a write still in flight ahead of the read. A read
         served without a transfer records the event too, so a caller never has
         to know which case they got, and a wait on it never hangs.
+
+        Each token in ``attrs`` is an attribute selector: an attribute name,
+        ``"*"`` (every attribute that the read can return), or a prefix followed
+        by ``*``, such as ``"primvars:*"``. A pattern has exactly one ``*``, as
+        its last character, and the match is case sensitive. Other forms that
+        contain ``*`` raise :class:`OvstageError` with ``INVALID_ARGUMENT``.
+
+        Each read finds the matching names again, so it includes names written
+        after the query was made. Explicit attribute names enter the selection
+        first, in the order of ``attrs`` after exact-token deduplication. Then
+        come the names that the patterns add, sorted by name. A pattern does not
+        add a name that the selection already has. A pattern that matches no name
+        gives no groups.
+
+        Names that start with ``_`` or ``usd-`` are hidden, except
+        ``usd-path``. A pattern selects a hidden name only when its prefix
+        starts with the same namespace, for example ``"_*"`` or ``"usd-*"``.
+        A latest read with ``"usd-*"`` selects ``usd-path``, ``usd-parent``,
+        ``usd-children``, ``usd-prim-type``, ``usd-schemas``, and
+        ``usd-ancestor-types``. A range read selects ``usd-path`` (tombstones
+        of prims deleted whole in the range) and the recorded built-ins that
+        changed in the range, but never ``usd-parent`` or ``usd-children``.
+        Patterns never match ``usd-active``.
+
+        A latest read with an end below ``ORDINAL_MAX`` fails with
+        ``OUT_OF_RANGE`` when a matching name changed, or was deleted, after
+        the end. This is the same check as for a name in ``attrs``.
+
+        A range read with a pattern has two more checks:
+
+        - It fails with ``WRITE_FLOOR_VIOLATION`` while the stage-wide floor is
+          below the range end, also when every matched name has a higher floor.
+          A pattern can match a name that no prim has yet, and only the
+          stage-wide floor seals that name. Advance the floor with
+          ``Scope.ALL`` before the read.
+        - It fails with ``OUT_OF_RANGE`` when the range start is below
+          :meth:`get_oldest_preserved_ordinal`, because the pattern could miss
+          a deleted name.
+
+        The C header documents the complete contract. The current limits are
+        in the limitations page of the documentation.
+
+        Names that contain ``*`` are reserved for read selection. Writes, maps,
+        deletes, query filters and attribute lists,
+        :meth:`get_attribute_write_floor`, and the attribute lists of
+        ``Scope.INCLUDE`` and ``Scope.EXCLUDE`` floor advances reject them with
+        ``INVALID_ARGUMENT``.
         """
         attr_list = check_token_sequence(attrs, "attrs entries")
         arr = (_b.ovx_token_t * len(attr_list))(*attr_list)
@@ -485,8 +628,12 @@ class Stage:
         attrs_ptr = ctypes.cast(arr, ctypes.POINTER(_b.ovx_token_t))
         if placement is None:
             res = self._api.ovstage_read_attributes(
-                self._inst, _handle(query), attrs_ptr,
-                len(attr_list), ordinal_range.to_c(), ctypes.byref(handle),
+                self._inst,
+                _handle(query, _b.ovstage_query_handle_t),
+                attrs_ptr,
+                len(attr_list),
+                ordinal_range.to_c(),
+                ctypes.byref(handle),
             )
         else:
             # Like the placed map slot, this one takes the placement *before* the
@@ -496,15 +643,23 @@ class Stage:
             c_placement = _require_placement(placement)._to_c()
             keep.append(c_placement)
             res = self._api.ovstage_read_attributes_on_device(
-                self._inst, _handle(query), attrs_ptr,
-                len(attr_list), ordinal_range.to_c(), ctypes.byref(c_placement), ctypes.byref(handle),
+                self._inst,
+                _handle(query, _b.ovstage_query_handle_t),
+                attrs_ptr,
+                len(attr_list),
+                ordinal_range.to_c(),
+                ctypes.byref(c_placement),
+                ctypes.byref(handle),
             )
-        return Read(self, int(handle.value), Operation(self, res.status, res.op_index, keepalive=keep))
+        return Read(self, handle, Operation(self, res.status, res.op_index, keepalive=keep))
 
     def fetch_read_next(self, read, timeout: int = TIMEOUT_INFINITE) -> Optional[ReadGroup]:
         """Fetch the next read group, or ``None`` at end of iteration."""
         grp = _b.ovstage_read_group_t()
-        code = self._api.ovstage_fetch_read_next(self._inst, _handle(read), check_timeout(timeout), ctypes.byref(grp))
+        count = ctypes.c_size_t()
+        code = self._api.ovstage_fetch_read_next(
+            self._inst, _handle(read, _b.ovstage_read_handle_t), check_timeout(timeout), ctypes.byref(grp), 1, ctypes.byref(count)
+        )
         if code == _b.OVSTAGE_ERROR_END_OF_ITERATION:
             return None
         if code != _b.OVSTAGE_OK:
@@ -521,23 +676,23 @@ class Stage:
         Release state is tracked on every :class:`ReadGroup`, including one a
         caller constructed themselves (no owning stage). Such a group has no
         finalizer, but it still needs the flag: without it a second
-        ``release_group`` would reach the C API, and :meth:`ReadGroup.tensor` /
-        :meth:`ReadGroup.prim_index` would keep reading storage that has been
-        handed back.
+        ``release_group`` would reach the C API, and
+        :meth:`ReadColumn.tensor` / :meth:`ReadGroup.prim_index` would keep
+        reading storage that has been handed back.
         """
         claimed = isinstance(group, ReadGroup)
         if claimed:
             group._claim_release()
         try:
-            self._check(self._api.ovstage_release_group(self._inst, ctypes.byref(group.raw)))
+            self._check(self._api.ovstage_release_groups(self._inst, ctypes.byref(group.raw), 1))
         except Exception:
             if claimed:
                 group._rollback_release()  # nothing was reclaimed; stay releasable
             raise
 
     def release_read(self, read) -> Operation:
-        claimed = isinstance(read, _HandleObject)
-        handle = read._claim_release() if claimed else _handle(read)
+        claimed = isinstance(read, Read)
+        handle = read._claim_release() if claimed else _handle(read, _b.ovstage_read_handle_t)
         try:
             res = self._api.ovstage_release_read(self._inst, handle)
         except Exception:
@@ -550,7 +705,15 @@ class Stage:
 
     # ── write / delete ────────────────────────────────────────────────────────
     def _build_write_data(
-        self, tensors, is_array, index_map, mask, count, cuda_event, cuda_stream, semantic=AttributeSemantic.NONE,
+        self,
+        tensors,
+        is_array,
+        index_map,
+        mask,
+        count,
+        cuda_event,
+        cuda_stream,
+        semantic=AttributeSemantic.NONE,
         attribute_mode=AttributeMode.REJECT,
     ) -> "tuple[_b.ovstage_write_data_t, list]":
         if not isinstance(is_array, bool):
@@ -618,9 +781,7 @@ class Stage:
             # build a payload the runtime rejects with no way for the caller to
             # see why, so ask for the count instead.
             if count is None:
-                raise ValueError(
-                    "mask requires an explicit count (the number of logical elements the mask indexes)"
-                )
+                raise ValueError("mask requires an explicit count (the number of logical elements the mask indexes)")
             if count == 0:
                 raise ValueError(
                     "mask requires a non-zero count; count=0 is the contract's 'every prim the query "
@@ -664,7 +825,7 @@ class Stage:
     def write_attribute(
         self,
         query,
-        attribute: Union[int, str],
+        attribute: Union[Token, str],
         ordinal: int,
         tensors,
         *,
@@ -741,7 +902,9 @@ class Stage:
         Reserved metadata uses the same contract: ``usd-prim-type`` requires
         ``is_array=False``; ``usd-schemas`` and ``usd-ancestor-types`` require ``is_array=True``.
         None is implicitly broadcast; use ``index_map`` when
-        target rows intentionally share source data.
+        target rows intentionally share source data. A write of any of the
+        three is refused while any attribute of a target prim has an outstanding
+        read, because the change restructures the prim's storage.
 
         ``count`` is the number of logical elements the write addresses — the
         leading ``count`` prims of the query, in query order. With neither
@@ -804,13 +967,13 @@ class Stage:
         wd, keep = self._build_write_data(
             tensors, is_array, index_map, mask, count, cuda_event, cuda_stream, semantic, attribute_mode
         )
-        sot = _b.make_string_or_token(attribute)
+        sot = _b.make_token_or_string(attribute)
         keep.append(sot)
         checked_ordinal = check_ordinal(ordinal)
         checked_prim_mode = check_enum_member(prim_mode, PrimMode, "prim_mode")
         if placement is None:
             res = self._api.ovstage_write_attribute(
-                self._inst, _handle(query), sot, checked_ordinal, wd, checked_prim_mode
+                self._inst, _handle(query, _b.ovstage_query_handle_t), sot, checked_ordinal, wd, checked_prim_mode
             )
         else:
             # Keep the placement struct alive until the op completes: the native
@@ -819,7 +982,12 @@ class Stage:
             c_placement = _require_placement(placement)._to_c()
             keep.append(c_placement)
             res = self._api.ovstage_write_attribute_on_device(
-                self._inst, _handle(query), sot, checked_ordinal, wd, checked_prim_mode,
+                self._inst,
+                _handle(query, _b.ovstage_query_handle_t),
+                sot,
+                checked_ordinal,
+                wd,
+                checked_prim_mode,
                 ctypes.byref(c_placement),
             )
         return Operation(self, res.status, res.op_index, keepalive=keep)
@@ -890,36 +1058,49 @@ class Stage:
             if not isinstance(item, WriteDesc):
                 raise TypeError("writes must contain WriteDesc instances")
             wd, data_keep = self._build_write_data(
-                item.tensors, item.is_array, item.index_map, item.mask, item.count,
-                item.cuda_event, item.cuda_stream, item.semantic, item.attribute_mode
+                item.tensors,
+                item.is_array,
+                item.index_map,
+                item.mask,
+                item.count,
+                item.cuda_event,
+                item.cuda_stream,
+                item.semantic,
+                item.attribute_mode,
             )
-            sot = _b.make_string_or_token(item.attribute)
+            sot = _b.make_token_or_string(item.attribute)
             write_array[index].attribute = sot
             write_array[index].data = wd
             keep.append(sot)
             keep.extend(data_keep)
 
-        writes_ptr = (
-            ctypes.cast(write_array, ctypes.POINTER(_b.ovstage_attribute_write_t))
-            if items
-            else None
-        )
+        writes_ptr = ctypes.cast(write_array, ctypes.POINTER(_b.ovstage_attribute_write_t)) if items else None
         checked_ordinal = check_ordinal(ordinal)
         checked_prim_mode = check_enum_member(prim_mode, PrimMode, "prim_mode")
         if placement is None:
             res = self._api.ovstage_write_attributes(
-                self._inst, _handle(query), writes_ptr, len(items), checked_ordinal, checked_prim_mode,
+                self._inst,
+                _handle(query, _b.ovstage_query_handle_t),
+                writes_ptr,
+                len(items),
+                checked_ordinal,
+                checked_prim_mode,
             )
         else:
             c_placement = _require_placement(placement)._to_c()
             keep.append(c_placement)
             res = self._api.ovstage_write_attributes_on_device(
-                self._inst, _handle(query), writes_ptr, len(items), checked_ordinal, checked_prim_mode,
+                self._inst,
+                _handle(query, _b.ovstage_query_handle_t),
+                writes_ptr,
+                len(items),
+                checked_ordinal,
+                checked_prim_mode,
                 ctypes.byref(c_placement),
             )
         return Operation(self, res.status, res.op_index, keepalive=keep)
 
-    def delete_attributes(self, query, attributes: Sequence[Union[int, str]], ordinal: int) -> Operation:
+    def delete_attributes(self, query, attributes: Sequence[Union[Token, str]], ordinal: int) -> Operation:
         """Enqueue a delete. Empty ``attributes`` deletes entire prims.
 
         The ordinal must exceed applicable floors. The admission policy described
@@ -932,14 +1113,16 @@ class Stage:
         keep: list = []
         attr_ptr = None
         if attrs:
-            arr = (_b.ovx_string_or_token_t * len(attrs))()
+            arr = (_b.ovx_token_or_string_t * len(attrs))()
             for i, a in enumerate(attrs):
-                sot = _b.make_string_or_token(a)
+                sot = _b.make_token_or_string(a)
                 arr[i] = sot
                 keep.append(sot)
             keep.append(arr)
-            attr_ptr = ctypes.cast(arr, ctypes.POINTER(_b.ovx_string_or_token_t))
-        res = self._api.ovstage_delete_attributes(self._inst, _handle(query), attr_ptr, len(attrs), check_ordinal(ordinal))
+            attr_ptr = ctypes.cast(arr, ctypes.POINTER(_b.ovx_token_or_string_t))
+        res = self._api.ovstage_delete_attributes(
+            self._inst, _handle(query, _b.ovstage_query_handle_t), attr_ptr, len(attrs), check_ordinal(ordinal)
+        )
         return Operation(self, res.status, res.op_index, keepalive=keep)
 
     # ── clone (subtree clone) ───────────────────────────────────────────────
@@ -965,9 +1148,12 @@ class Stage:
         same ordinal while it remains above applicable floors. Disjoint target
         cells may share an ordinal.
 
-        The source must exist; each target must not already exist, and a target
-        path may appear only once, independently of the admission policy. Returns
-        the clone's :class:`CloneResult`. Execution failure raises
+        The source must exist. Supply canonical absolute source and target paths.
+        The source may be the stage root; targets must be prim, variant-selection,
+        or property paths. The default ``history_latest`` implementation rejects
+        invalid paths at submission. Each target must be new and may appear only
+        once, independently of the admission policy. Returns the clone's
+        :class:`CloneResult`. Execution failure raises
         :class:`OvstageError`; use :meth:`fetch_clone_result` with the low-level
         async path to inspect the clone's underlying error code.
         """
@@ -995,7 +1181,7 @@ class Stage:
                 keep.append(s)
             keep.append(arr)
             tgt_ptr = ctypes.cast(arr, ctypes.POINTER(_b.ovx_string_t))
-        res = self._lib.ovstage_clone(self._require_inst(), src, tgt_ptr, len(targets), check_ordinal(ordinal))
+        res = self._api.ovstage_clone(self._require_inst(), src, tgt_ptr, len(targets), check_ordinal(ordinal))
         return CloneOperation(self, res.status, res.op_index, keepalive=keep)
 
     def fetch_clone_result(self, op_or_id, timeout: int = TIMEOUT_INFINITE) -> CloneResult:
@@ -1008,16 +1194,17 @@ class Stage:
         :meth:`CloneOperation.wait`, which releases the op, it raises
         ``INVALID_HANDLE``; use :meth:`CloneOperation.result` there instead.
 
-        :param op_or_id: the :class:`CloneOperation` or its integer op id.
+        :param op_or_id: the :class:`CloneOperation` or its typed :class:`OpId`.
         :param timeout: max nanoseconds to wait for completion; ``0`` polls.
         :raises OvstageError: ``TIMEOUT`` while the clone is pending (it stays
             waitable), ``INVALID_HANDLE`` for an id that is not a live clone op, or
             the clone's own failure code with its message.
         """
-        op_id = check_handle(getattr(op_or_id, "op_id", op_or_id), "op_id")
-        fn = self._flat_symbol("ovstage_fetch_clone_result")
+        op_id = _b.ovstage_op_id_t._require(getattr(op_or_id, "op_id", op_or_id), "op_id")
         raw = _b.ovstage_clone_result_t()
-        code = fn(self._require_inst(), op_id, check_timeout(timeout), ctypes.byref(raw))
+        code = self._api.ovstage_fetch_clone_result(
+            self._require_inst(), op_id, check_timeout(timeout), ctypes.byref(raw)
+        )
         if code != _b.OVSTAGE_OK:
             # Synchronous rejections record their detail in the thread-local slot;
             # a clone that ran and failed left its message on the op.
@@ -1033,10 +1220,13 @@ class Stage:
     # -- hierarchy ---------------------------------------------------------
     def get_hierarchy_computation_models(self) -> List[HierarchyComputationModelDesc]:
         """Return the hierarchy computation models supported by this runtime."""
-        fn = self._flat_symbol("ovstage_get_hierarchy_computation_models")
         models = ctypes.POINTER(_b.ovstage_hierarchy_computation_model_desc_t)()
         count = ctypes.c_size_t()
-        self._check(fn(self._require_inst(), ctypes.byref(models), ctypes.byref(count)))
+        self._check(
+            self._api.ovstage_get_hierarchy_computation_models(
+                self._require_inst(), ctypes.byref(models), ctypes.byref(count)
+            )
+        )
         return [
             HierarchyComputationModelDesc(
                 model_id=int(models[i].model_id),
@@ -1079,17 +1269,18 @@ class Stage:
         consumers need a complete snapshot at that ordinal. The current
         implementation ignores ``input_ordinal``.
         """
-        fn = self._flat_symbol("ovstage_compute_hierarchy")
-        res = fn(
+        res = self._api.ovstage_compute_hierarchy(
             # Range-only on purpose: model ids are discovered at runtime via
             # get_hierarchy_computation_models, so they must not be checked
             # against the enum this wheel happens to ship.
-            self._require_inst(), check_enum(model, "model"),
-            check_ordinal(input_ordinal), check_ordinal(output_ordinal),
+            self._require_inst(),
+            check_enum(model, "model"),
+            check_ordinal(input_ordinal),
+            check_ordinal(output_ordinal),
         )
         return Operation(self, res.status, res.op_index)
 
-    def get_hierarchy(self, path_list: int, ordinal: int, relation: int) -> HierarchyResult:
+    def get_hierarchy(self, path_list: PrimPathList, ordinal: int, relation: int) -> HierarchyResult:
         """Return parent/children/siblings for an ordered path list (blocking).
 
         This reads the current committed hierarchy when the operation
@@ -1101,7 +1292,7 @@ class Stage:
             hierarchy.wait()
             result = hierarchy.result()
         except Exception:
-            if hierarchy.handle:
+            if hierarchy.handle != _b.OVSTAGE_INVALID_HIERARCHY_HANDLE:
                 try:
                     hierarchy.release().wait()
                 except Exception:
@@ -1111,25 +1302,28 @@ class Stage:
             hierarchy.release().wait()
             return result
 
-    def get_hierarchy_async(self, path_list: int, ordinal: int, relation: int) -> "Hierarchy":
+    def get_hierarchy_async(self, path_list: PrimPathList, ordinal: int, relation: int) -> "Hierarchy":
         """Enqueue a parent/children/siblings lookup for an ordered path list."""
-        fn = self._flat_symbol("ovstage_get_hierarchy")
         handle = _b.ovstage_hierarchy_handle_t()
-        res = fn(
-            self._require_inst(), check_handle(path_list, "path_list"), check_ordinal(ordinal),
+        res = self._api.ovstage_get_hierarchy(
+            self._require_inst(),
+            check_path_list(path_list),
+            check_ordinal(ordinal),
             # Range-only on purpose: test_get_hierarchy_validates_relation_and_release
             # pins that the *runtime* rejects an unknown relation, returning
             # INVALID_ARGUMENT with a zero handle. Pre-rejecting here would make
             # that native path unreachable from Python. Same treatment as `model`.
-            check_enum(relation, "relation"), ctypes.byref(handle),
+            check_enum(relation, "relation"),
+            ctypes.byref(handle),
         )
-        return Hierarchy(self, int(handle.value), Operation(self, res.status, res.op_index))
+        return Hierarchy(self, handle, Operation(self, res.status, res.op_index))
 
     @staticmethod
-    def _hierarchy_path(path: _b.ovx_string_or_token_t) -> str:
-        if path.token:
-            return str(int(path.token))
-        return str(path.string)
+    def _hierarchy_path(path: _b.ovx_token_or_string_t) -> str:
+        # ctypes exposes a non-null empty C string as b"", so test for None explicitly.
+        if path.string.ptr is not None:
+            return str(path.string)
+        return str(path.token.raw_id) if path.token.raw_id else ""
 
     @staticmethod
     def _copy_hierarchy_result(raw: _b.ovstage_hierarchy_result_t) -> HierarchyResult:
@@ -1149,22 +1343,23 @@ class Stage:
     def fetch_hierarchy_result(self, hierarchy) -> HierarchyResult:
         """Fetch, copy, and release a completed hierarchy lookup result payload."""
         raw = _b.ovstage_hierarchy_result_t()
-        fn_fetch = self._flat_symbol("ovstage_fetch_hierarchy_result")
-        fn_release = self._flat_symbol("ovstage_release_hierarchy_result")
-        self._check(fn_fetch(self._require_inst(), _handle(hierarchy), ctypes.byref(raw)))
+        self._check(
+            self._api.ovstage_fetch_hierarchy_result(
+                self._require_inst(), _handle(hierarchy, _b.ovstage_hierarchy_handle_t), ctypes.byref(raw)
+            )
+        )
         try:
             result = self._copy_hierarchy_result(raw)
         finally:
-            release_code = fn_release(self._require_inst(), ctypes.byref(raw))
+            release_code = self._api.ovstage_release_hierarchy_result(self._require_inst(), ctypes.byref(raw))
         self._check(release_code)
         return result
 
     def release_hierarchy(self, hierarchy) -> Operation:
-        claimed = isinstance(hierarchy, _HandleObject)
-        handle = hierarchy._claim_release() if claimed else _handle(hierarchy)
-        fn = self._flat_symbol("ovstage_release_hierarchy")
+        claimed = isinstance(hierarchy, Hierarchy)
+        handle = hierarchy._claim_release() if claimed else _handle(hierarchy, _b.ovstage_hierarchy_handle_t)
         try:
-            res = fn(self._require_inst(), handle)
+            res = self._api.ovstage_release_hierarchy(self._require_inst(), handle)
         except Exception:
             if claimed:
                 hierarchy._rollback_release()
@@ -1177,7 +1372,7 @@ class Stage:
     def map_attribute(
         self,
         query,
-        attribute: Union[int, str],
+        attribute: Union[Token, str],
         ordinal: int,
         *,
         prim_mode: PrimMode = PrimMode.UPSERT,
@@ -1217,6 +1412,18 @@ class Stage:
         ``CONNECTION_PATH_ID`` uses ``dtype = (kDLUInt, 64, 2)``).
         ``element_sizes`` gives per-prim element counts for ragged columns.
 
+        The reserved metadata ``usd-prim-type``, ``usd-schemas`` and
+        ``usd-ancestor-types`` maps like any recorded column: fill the buffer
+        with interned token ids (``dtype`` omitted or ``(kDLUInt, 64, 1)``,
+        semantic ``NONE``; ``element_sizes`` for the two array names only, an
+        empty row clearing the set) and each unmap lowers them to the prim's
+        tags like :meth:`write_attribute`, so reads and filters observe the
+        mapped value. Release outstanding reads of the mapped prims before
+        committing, as for :meth:`write_attribute` of these names. A row whose
+        ids name nothing fails the commit before any tag changes and ends the
+        session; a CUDA placement or a query that names a prim twice is
+        rejected.
+
         Setup and publication use the admission policy described by
         :meth:`write_attribute`, against the affected cells and applicable prim
         lifecycles. Every policy retains the applicable write-floor checks.
@@ -1243,7 +1450,7 @@ class Stage:
             # Length of the materialized list: it is the array the runtime reads,
             # so the count it is paired with should be derived from the same thing.
             sizes_count = len(entries)
-        sot = _b.make_string_or_token(attribute)
+        sot = _b.make_token_or_string(attribute)
         keep.append(sot)  # keeps sot._string_ref (the attribute string buffer) alive
         desc = _b.ovstage_map_desc_t()
         desc.attribute = sot
@@ -1257,22 +1464,35 @@ class Stage:
         handle = _b.ovstage_map_handle_t()
         if placement is None:
             res = self._api.ovstage_map_attribute(
-                self._inst, _handle(query), ctypes.byref(desc), check_ordinal(ordinal),
-                sizes_ptr, sizes_count, ctypes.byref(handle),
+                self._inst,
+                _handle(query, _b.ovstage_query_handle_t),
+                ctypes.byref(desc),
+                check_ordinal(ordinal),
+                sizes_ptr,
+                sizes_count,
+                ctypes.byref(handle),
             )
         else:
             # The placed map takes the placement *before* out_map_handle.
             c_placement = _require_placement(placement)._to_c()
             keep.append(c_placement)
             res = self._api.ovstage_map_attribute_on_device(
-                self._inst, _handle(query), ctypes.byref(desc), check_ordinal(ordinal),
-                sizes_ptr, sizes_count, ctypes.byref(c_placement), ctypes.byref(handle),
+                self._inst,
+                _handle(query, _b.ovstage_query_handle_t),
+                ctypes.byref(desc),
+                check_ordinal(ordinal),
+                sizes_ptr,
+                sizes_count,
+                ctypes.byref(c_placement),
+                ctypes.byref(handle),
             )
-        return Map(self, int(handle.value), Operation(self, res.status, res.op_index, keepalive=keep))
+        return Map(self, handle, Operation(self, res.status, res.op_index, keepalive=keep))
 
     def fetch_map_next(self, mapping, timeout: int = TIMEOUT_INFINITE) -> Optional[MapGroup]:
         grp = _b.ovstage_map_group_t()
-        code = self._api.ovstage_fetch_map_next(self._inst, _handle(mapping), check_timeout(timeout), ctypes.byref(grp))
+        code = self._api.ovstage_fetch_map_next(
+            self._inst, _handle(mapping, _b.ovstage_map_handle_t), check_timeout(timeout), ctypes.byref(grp)
+        )
         if code == _b.OVSTAGE_ERROR_END_OF_ITERATION:
             return None
         if code != _b.OVSTAGE_OK:
@@ -1301,7 +1521,7 @@ class Stage:
         does not inspect the handoff.
         """
         sync = _b.ovstage_cuda_sync_t(cuda_stream or 0, cuda_event or 0)
-        handle = _handle(mapping)
+        handle = _handle(mapping, _b.ovstage_map_handle_t)
         group._claim_unmap()
         try:
             res = self._api.ovstage_unmap_group(self._inst, handle, ctypes.byref(group.raw), sync)
@@ -1336,7 +1556,7 @@ class Stage:
         does not inspect the handoff.
         """
         claimed = isinstance(mapping, Map)
-        handle = mapping._claim_unmap() if claimed else _handle(mapping)
+        handle = mapping._claim_unmap() if claimed else _handle(mapping, _b.ovstage_map_handle_t)
         sync = _b.ovstage_cuda_sync_t(cuda_stream or 0, cuda_event or 0)
         try:
             res = self._api.ovstage_unmap_attribute(self._inst, handle, sync)
@@ -1348,12 +1568,103 @@ class Stage:
             mapping._rollback_unmap()
         return Operation(self, res.status, res.op_index)
 
+    # ── history selection ───────────────────────────────────────────────────
+    def _history_extension(self) -> _HistoryExtensionV1:
+        bundle = self._require_inst().contents
+        table = ctypes.c_void_p()
+        # A null vtable or a null slot must answer NOT_SUPPORTED, not a null
+        # pointer access.
+        if not bundle.data_plane.vtable or not bundle.data_plane.vtable.contents.query_extension:
+            raise OvstageError(
+                _b.OVSTAGE_ERROR_NOT_SUPPORTED,
+                "this stage exposes no query_extension slot, so it is not history-capable",
+            )
+        code = bundle.data_plane.vtable.contents.query_extension(
+            bundle.data_plane.context, _HISTORY_EXTENSION_NAME, ctypes.byref(table)
+        )
+        if code == _b.OVSTAGE_ERROR_NOT_FOUND or (code == _b.OVSTAGE_OK and not table.value):
+            raise OvstageError(
+                _b.OVSTAGE_ERROR_NOT_SUPPORTED,
+                'this stage is not history-capable. Create it with StageConfig(implementation="history_selective") to turn history on',
+            )
+        self._check(code)
+        extension = ctypes.cast(table, ctypes.POINTER(_HistoryExtensionV1)).contents
+        if (
+            extension.version != _HISTORY_EXTENSION_VERSION
+            or extension.struct_size < ctypes.sizeof(_HistoryExtensionV1)
+            or not extension.enable
+            or not extension.disable
+        ):
+            raise OvstageError(_b.OVSTAGE_ERROR_NOT_SUPPORTED, "unsupported history selection extension version")
+        return extension
+
+    def _apply_history(self, query, attributes: Sequence[Union[Token, str]], enabled: bool) -> None:
+        handle = _handle(query, _b.ovstage_query_handle_t)
+        if isinstance(attributes, (str, bytes)) or not isinstance(attributes, Sequence):
+            raise TypeError("attributes must be a sequence of attribute tokens or names")
+        items = [_b.make_token_or_string(attribute) for attribute in attributes]
+        if not items:
+            raise ValueError("attributes must name at least one attribute")
+        array = (_b.ovx_token_or_string_t * len(items))(*items)
+        extension = self._history_extension()
+        select = extension.enable if enabled else extension.disable
+        # ``items`` keeps the string buffers alive for the synchronous call.
+        code = select(
+            self._inst.contents.data_plane.context,
+            handle,
+            ctypes.cast(array, ctypes.POINTER(_b.ovx_token_or_string_t)),
+            len(items),
+        )
+        self._check(code)
+        del items
+
+    def enable_history(self, query, attributes: Sequence[Union[Token, str]]) -> None:
+        """Retain earlier values of ``attributes`` on the prims matched by ``query``.
+
+        **Experimental.** The history selection API and the ``history_selective``
+        implementation are experimental. Their API, ABI and semantics can change
+        between releases without a deprecation period.
+
+        The call turns history on for the selected ``(prim, attribute)`` pairs:
+        they retain their earlier sealed values, up to
+        :attr:`StageConfig.retention_window`. The stage must be a stage of
+        ``history_selective`` (``StageConfig(implementation="history_selective")``).
+        A stage of ``history_latest``, the default, keeps history off and raises
+        :class:`OvstageError` with ``ErrorCode.NOT_SUPPORTED``.
+        ``query`` is a completed :class:`Query` (or raw handle). Its resolved prim
+        membership is copied once, so later matches of the same filter are not
+        enrolled. ``attributes`` names the retained attributes by token or name and
+        must not be empty. Enabling is additive and idempotent. Call it on a
+        quiescent, globally sealed stage with no live reads, groups or maps.
+
+        If the baseline copy fails, the call raises :class:`OvstageError`, and
+        every mutation and publication of the stage is refused until the
+        identical selection is retried with success, or until the stage is
+        destroyed. A failed copy activates no partial selection.
+        """
+        self._apply_history(query, attributes, True)
+
+    def disable_history(self, query, attributes: Sequence[Union[Token, str]]) -> None:
+        """Stop retaining ``attributes`` on the prims matched by ``query``.
+
+        **Experimental.** The history selection API and the ``history_selective``
+        implementation are experimental. Their API, ABI and semantics can change
+        between releases without a deprecation period.
+
+        The call turns history off for the selected pairs. It discards their
+        retained history and preserves their live values. A later
+        :meth:`enable_history` starts a fresh baseline. Same preconditions and
+        errors as :meth:`enable_history`: a stage of ``history_latest`` raises
+        :class:`OvstageError` with ``ErrorCode.NOT_SUPPORTED``.
+        """
+        self._apply_history(query, attributes, False)
+
     # ── ordinal management / write floor ────────────────────────────────────
     def advance_write_floor(
         self,
         ordinal: int,
         scope: Scope = Scope.ALL,
-        attributes: Optional[Sequence[int]] = None,
+        attributes: Optional[Sequence[Token]] = None,
     ) -> Operation:
         """Advance the write floor; ``scope`` selects the affected attributes (see :class:`Scope`).
 
@@ -1380,28 +1691,35 @@ class Stage:
     def get_oldest_preserved_ordinal(self) -> "OrdinalQuery":
         handle = _b.ovstage_ordinal_query_handle_t()
         res = self._api.ovstage_get_oldest_preserved_ordinal(self._inst, ctypes.byref(handle))
-        return OrdinalQuery(self, int(handle.value), Operation(self, res.status, res.op_index))
+        return OrdinalQuery(self, handle, Operation(self, res.status, res.op_index))
 
-    def get_attribute_write_floor(self, attribute: Optional[Union[int, str]] = None) -> "OrdinalQuery":
+    def get_attribute_write_floor(self, attribute: Optional[Union[Token, str]] = None) -> "OrdinalQuery":
         """Query a per-attribute write floor, or the global write floor if ``attribute`` is ``None``.
 
         Aliases of one stored column report the same floor.
         """
-        sot = _b.ovx_string_or_token_t() if attribute is None else _b.make_string_or_token(attribute)
+        sot = _b.ovx_token_or_string_t() if attribute is None else _b.make_token_or_string(attribute)
         handle = _b.ovstage_ordinal_query_handle_t()
         res = self._api.ovstage_get_attribute_write_floor(self._inst, sot, ctypes.byref(handle))
-        return OrdinalQuery(self, int(handle.value), Operation(self, res.status, res.op_index))
+        return OrdinalQuery(self, handle, Operation(self, res.status, res.op_index))
 
     def fetch_ordinal(self, ordinal_query, timeout: int = TIMEOUT_INFINITE) -> int:
         value = _b.ovstage_ordinal_t()
         self._check(
-            self._api.ovstage_fetch_ordinal(self._inst, _handle(ordinal_query), check_timeout(timeout), ctypes.byref(value))
+            self._api.ovstage_fetch_ordinal(
+                self._inst,
+                _handle(ordinal_query, _b.ovstage_ordinal_query_handle_t),
+                check_timeout(timeout),
+                ctypes.byref(value),
+            )
         )
         return int(value.value)
 
     def release_ordinal_query(self, ordinal_query) -> Operation:
-        claimed = isinstance(ordinal_query, _HandleObject)
-        handle = ordinal_query._claim_release() if claimed else _handle(ordinal_query)
+        claimed = isinstance(ordinal_query, OrdinalQuery)
+        handle = (
+            ordinal_query._claim_release() if claimed else _handle(ordinal_query, _b.ovstage_ordinal_query_handle_t)
+        )
         try:
             res = self._api.ovstage_release_ordinal_query(self._inst, handle)
         except Exception:
@@ -1428,6 +1746,7 @@ class Stage:
             raise OvstageError(_b.OVSTAGE_ERROR_NOT_SUPPORTED, "no path dictionary available for this instance")
         return pd
 
+
 class _HandleObject:
     """Common base for handle wrappers carrying their reserving op.
 
@@ -1447,9 +1766,10 @@ class _HandleObject:
     this teardown with its own unmap-based lifecycle.)
     """
 
-    def __init__(self, stage: Stage, handle: int, op: Optional[Operation]):
+    def __init__(self, stage: Stage, handle, op: Optional[Operation]):
         self._stage = stage
-        self.handle = check_handle(handle, "handle")
+        self._released = True
+        self.handle = self._handle_kind(self._handle_kind._require(handle, "handle"))
         self.op = op
         self._released = False
 
@@ -1466,7 +1786,7 @@ class _HandleObject:
                 "its C-side handle is no longer valid",
             )
 
-    def _claim_release(self) -> int:
+    def _claim_release(self):
         self._ensure_active()
         self._released = True
         return self.handle
@@ -1489,14 +1809,11 @@ class _HandleObject:
             self.op.wait(timeout)
         return self
 
-    def __int__(self) -> int:
-        return self.handle
-
     def __enter__(self: _HandleT) -> _HandleT:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        if self._released or not self.handle:
+        if self._released or self.handle == self._invalid_handle:
             return
         op = self.release()  # subclass hits the matching release_* slot
         if exc_type is None:
@@ -1513,7 +1830,7 @@ class _HandleObject:
         # Safety net only. Skip if already released, if the reservation never
         # succeeded (invalid handle, so nothing to reclaim), or if the owning
         # instance is gone (e.g. interpreter shutdown), where dispatch is unsafe.
-        if self._released or not self.handle or not getattr(self._stage, "_inst", None):
+        if self._released or self.handle == self._invalid_handle or not getattr(self._stage, "_inst", None):
             return
         # Release BEFORE warning: warnings.warn raises when the caller escalates
         # ResourceWarning (-W error::ResourceWarning), so warning first would skip
@@ -1530,6 +1847,9 @@ class _HandleObject:
 
 
 class Query(_HandleObject):
+    _handle_kind = _b.ovstage_query_handle_t
+    _invalid_handle = _b.OVSTAGE_INVALID_QUERY_HANDLE
+
     def result(self, timeout: int = TIMEOUT_INFINITE) -> QueryResult:
         """Fetch (and release) the query result.
 
@@ -1545,6 +1865,9 @@ class Query(_HandleObject):
 
 
 class Read(_HandleObject):
+    _handle_kind = _b.ovstage_read_handle_t
+    _invalid_handle = _b.OVSTAGE_INVALID_READ_HANDLE
+
     def fetch_next(self, timeout: int = TIMEOUT_INFINITE) -> Optional[ReadGroup]:
         """Fetch the next read group, or ``None`` at end of iteration.
 
@@ -1616,13 +1939,17 @@ class Map(_HandleObject):
     commit failure, final unmap attempts to commit whatever the remaining buffers
     hold. An exception mid-fill can therefore commit partially filled buffers if
     finalization succeeds. If a session is dropped without unmapping,
-    :meth:`__del__` issues a best-effort unmap and a
+    ``__del__`` issues a best-effort unmap and a
     :class:`ResourceWarning`; it does not wait for or report asynchronous commit
     failures. Normal context-manager exit waits and reports errors; explicit
     ``unmap().wait()`` also observes completion.
     """
 
-    def __init__(self, stage: Stage, handle: int, op: Optional[Operation]):
+    _handle_kind = _b.ovstage_map_handle_t
+    _invalid_handle = _b.OVSTAGE_INVALID_MAP_HANDLE
+
+    def __init__(self, stage: Stage, handle: MapHandle, op: Optional[Operation]):
+        self._unmapped = True
         super().__init__(stage, handle, op)
         self._unmapped = False
 
@@ -1634,7 +1961,7 @@ class Map(_HandleObject):
                 f"Map (handle={self.handle}) has been unmapped; its C-side handle is no longer valid",
             )
 
-    def _claim_unmap(self) -> int:
+    def _claim_unmap(self) -> _b.ovstage_map_handle_t:
         self._ensure_active()
         self._unmapped = True
         return self.handle
@@ -1670,12 +1997,12 @@ class Map(_HandleObject):
         return self._stage.unmap_attribute(self, cuda_event, cuda_stream)
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        # `not self.handle` matches _HandleObject.__exit__ and Map.__del__: a
+        # `self.handle == self._invalid_handle` matches _HandleObject.__exit__ and Map.__del__: a
         # synchronously rejected map_attribute returns Map(handle=0), and
         # unmapping handle 0 fails with INVALID_ARGUMENT, masking the real setup
         # error. The failed unmap also rolls _unmapped back to False, so without
         # this guard an explicit unmap() leaves the bogus call to repeat here.
-        if self._unmapped or not self.handle:
+        if self._unmapped or self.handle == self._invalid_handle:
             return
         op = self.unmap()
         if exc_type is None:
@@ -1692,7 +2019,7 @@ class Map(_HandleObject):
         # Safety net only. Skip if already unmapped, if the reservation never
         # succeeded (invalid handle, so no session to release), or if the owning
         # instance is gone (e.g. interpreter shutdown), where dispatch is unsafe.
-        if self._unmapped or not self.handle or not getattr(self._stage, "_inst", None):
+        if self._unmapped or self.handle == self._invalid_handle or not getattr(self._stage, "_inst", None):
             return
         # Unmap BEFORE warning, for the same reason as _HandleObject.__del__:
         # warnings.warn raises under -W error::ResourceWarning, and warning first
@@ -1709,6 +2036,9 @@ class Map(_HandleObject):
 
 
 class OrdinalQuery(_HandleObject):
+    _handle_kind = _b.ovstage_ordinal_query_handle_t
+    _invalid_handle = _b.OVSTAGE_INVALID_ORDINAL_QUERY_HANDLE
+
     def fetch(self, timeout: int = TIMEOUT_INFINITE) -> int:
         """Fetch the queried ordinal value.
 
@@ -1724,6 +2054,9 @@ class OrdinalQuery(_HandleObject):
 
 
 class Hierarchy(_HandleObject):
+    _handle_kind = _b.ovstage_hierarchy_handle_t
+    _invalid_handle = _b.OVSTAGE_INVALID_HIERARCHY_HANDLE
+
     def result(self) -> HierarchyResult:
         return self._stage.fetch_hierarchy_result(self)
 

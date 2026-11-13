@@ -11,12 +11,9 @@
 NVIDIA ovstage
 ==============
 
-**ovstage** is a vectorized, GPU-native runtime stage for OpenUSD data — a shared,
-high-performance data substrate for OV Libraries spanning physics, rendering, sensors,
-animation, and graph. It provides a unified **C API** for reading, writing, querying, and
-managing simulation data such as transforms, velocities, materials, hierarchy, and
-metadata across CPU and GPU memory, with zero-copy data paths and DLPack tensor
-interchange. Reads and maps use CPU buffers by default. The experimental
+ovstage is a standalone C and Python library that gives simulation and visualization applications one shared, in-process store for scene and simulation data. Applications can author data directly or populate it from OpenUSD, then let physics, rendering, sensors, and other consumers query, read, and update that data through a common API. The application controls execution and when updates become visible, while ovstage provides bulk data access, shared scene identities, and change tracking so each consumer can read the state it needs.
+
+Reads and maps use CPU buffers by default. The experimental
 :ref:`device-placement extension <ovstage-device-placement>` also supports CUDA
 buffers; reading a copy already current on the requested device avoids migration.
 
@@ -24,8 +21,11 @@ In this documentation you will find getting started guides for C and Python, API
 references, and example projects.
 
 * :doc:`Start here: ovstage overview <concepts/overview>` — the data model, ordinals, watermarks, and reads.
-* :doc:`Getting started in C <c_api/getting_started>` — the validated bring-up path today.
+* :doc:`Getting started in C <c_api/getting_started>` — the C API bring-up path.
 * :doc:`Getting started in Python <python_api/getting_started>` — the ctypes bindings over the same C API.
+* :doc:`Upgrading from 0.3 <guides/upgrading_from_0_3>` — what changed in 0.4 and how to migrate.
+* :doc:`Upgrading from 0.2 <guides/upgrading_from_0_2>` — what changed in 0.3 and how to migrate.
+* :doc:`Limitations <concepts/limitations>` — current behavior that may change before GA.
 
 .. note::
 
@@ -61,7 +61,10 @@ The software and materials are governed by the `NVIDIA Software License Agreemen
    concepts/overview
    concepts/application_flow
    concepts/async_model
+   concepts/choosing_api
    concepts/error_handling
+   concepts/threading_lifetime
+   concepts/limitations
    concepts/string_handling
    concepts/dlpack_tensors
 
@@ -87,6 +90,8 @@ The software and materials are governed by the `NVIDIA Software License Agreemen
    :caption: Guides and Examples
 
    guides/runtime_loop
+   guides/upgrading_from_0_3
+   guides/upgrading_from_0_2
    guides/benchmarking
    examples/index
 

@@ -41,7 +41,7 @@ long returned tensor data stays valid.
 Resolve inputs in this order: existing repository files and referenced snippets, explicit user request, then broader agent context.
 
 - Direction: **copy-in** write (`write_attribute` + `ovstage_write_data_t`), **copy-out**
-  read (`read_attributes` → `fetch_read_next` → `ovstage_read_group_t.data`), or **mapped
+  read (`read_attributes` → `fetch_read_next` → `ovstage_read_group_t.columns[i].data`), or **mapped
   staging** write (`map_attribute` → `fetch_map_next` → fill → `unmap_*`).
 - Residency: CPU (`DLDevice{ kDLCPU, 0 }`) or CUDA (`DLDevice{ kDLCUDA, device_ordinal }`),
   and whether a producing/consuming GPU kernel needs a `cuda_sync`.
@@ -86,14 +86,14 @@ Resolve inputs in this order: existing repository files and referenced snippets,
    your producing kernel — ovstage waits on it before copying in — and `.stream` to the CUDA
    stream it was recorded on (`0` = none, `1` = the default stream, `>1` = a specific
    `cudaStream_t`). Leave `cuda_sync` `{0, 0}` for CPU or already-synchronized data.
-5. **Read (copy-out):** read groups report `group.data.cuda_sync = {0, 0}`.
+5. **Read (copy-out):** read groups report `column.data.cuda_sync = {0, 0}`.
    Unplaced reads and placed reads without an availability event are ready on a
    successful fetch. With `placement.availability_event`, successfully fetch a
    group first, then wait on that event or order its consumer on the placement
    stream before accessing the payload. Stream `2` is the worker's per-thread
    default stream; use the event to order work on the caller's thread. Treat the
-   data as valid only for the current snapshot — copy/retain it to use beyond the immediate
-   read. Release the group with `release_group`. Releasing the *read* does not reclaim a
+   data as borrowed from its owning group. Finish all accesses before releasing the
+   group; copy data that must outlive it. Release the group with `release_groups`. Releasing the *read* does not reclaim a
    group: an unreleased group stays pinned for the life of the stage and keeps failing later
    writes to the same prims with an "overlapping outstanding read" error. In Python, prefer
    the context manager so an exception in the processing body cannot strand it:
@@ -157,9 +157,10 @@ This skill has no scripts.
   ingest with warp** (`gpu-warp-ingest`, write-flavors — GPU-gated at runtime).
   The C CUDA ingest example is in `examples/c/write-flavors/cuda_ingest.cpp`;
   `tests/c/test_placement.cpp` covers the experimental placement extension.
-- **Latest-snapshot build:** returned tensor data is valid only for the latest committed
-  snapshot. To use it later you must take explicit ownership (copy / retain / transfer) — do
-  not hold a borrowed pointer across further commits.
+- **Read-buffer lifetime:** keep the owning group and stage alive while using returned
+  tensors, including until GPU consumers finish. Release groups before overlapping
+  mutations; copy values that must survive release. An unrelated commit does not
+  invalidate a held group.
 - **GPU sync is the caller's responsibility** — ovstage coordinates via `cuda_sync` but does
   not own or synchronize your streams.
 - **Python `managed_tensors` transfer is not exposed** — DLPack ingest/export (incl. CUDA) is
@@ -232,7 +233,8 @@ from arbitrary multidimensional scalar arrays.
 ## C — write and read (copy-in / copy-out)
 
 The minimal example builds a CPU `DLTensor`, writes it through `ovstage_write_data_t`, seals
-it by advancing the write floor, and reads the column back from `group.data.tensors[0].data`
+it by advancing the write floor, and reads the column back from
+`group.columns[0].data.tensors[0].data`
 — the end-to-end CPU shape for both directions:
 
 > **Source:** `examples/c/minimal/main.cpp` snippet `minimal-write-read`
@@ -318,7 +320,7 @@ is absent and reconnect after that parent's successful commit.
 ### Read-only vs writable exports
 
 `dlpack(i)` takes a `readonly` keyword that sets the DLPack read-only flag on the exported
-capsule. The defaults follow the group kind: a `ReadGroup` exports `readonly=True`, a
+capsule. The defaults follow the owner kind: a `ReadColumn` exports `readonly=True`, a
 (writable) `MapGroup` exports `readonly=False`. Pass `readonly=True` on a map group to hand a
 view to code that must not write through it — the consumer then refuses the write instead of
 silently corrupting the mapped buffer:
@@ -343,7 +345,8 @@ Two caveats:
 | `DLTensor` | the interchange unit: `data`, `device` (`kDLCPU` / `kDLCUDA`), `ndim`, `dtype` (`{code,bits,lanes}`), `shape`, `strides`, `byte_offset` |
 | `ovstage_write_data_t { tensors \| managed_tensors; tensor_count; is_array; count; index_map; mask; cuda_sync; semantic }` | copy-in payload (exactly one of `tensors`/`managed_tensors`; `is_array` declares fixed vs array kind, never inferred) |
 | `ovstage_data_t { tensors; tensor_count; count; index_map; mask; cuda_sync }` | read / map-group payload (same shape, read or writable) |
-| `ovstage_read_group_t { …; data; meta; is_delete; is_array; semantic }` | one read result group; data in `.data` |
+| `ovstage_read_column_t { attribute; ordinal; is_delete; is_array; semantic; data; meta }` | one borrowed attribute column and its independent value mapping |
+| `ovstage_read_group_t { read_group_id; prims; columns; column_count }` | one shared logical prim-row layout and its ordered read columns |
 | `ovstage_map_group_t { prims; data; meta }` | one writable map group; fill `.data.tensors[i].data` |
 | `ovstage_map_desc_t { attribute; dtype; semantic; prim_mode }` | descriptor for a map session |
 | `ovstage_cuda_sync_t { uintptr_t stream; uintptr_t wait_event; }` | GPU sync; `{0,0}` = CPU/synced; `wait_event` (a `cudaEvent_t`) = event to wait on before access; `stream` 0 = none, 1 = default stream, >1 = a specific `cudaStream_t` |
@@ -355,9 +358,9 @@ Two caveats:
   before waiting on the placement availability event; the returned `cuda_sync` is zero.
   On write/unmap, provide the producer's `cuda_sync.wait_event` recorded after its
   kernel. Observe operation errors separately from event completion.
-- **Use-after-free of read data** — returned tensors are valid only for the latest snapshot.
-  Copy (or otherwise take ownership of) the bytes if they must outlive the read; don't hold
-  the borrowed pointer across further commits.
+- **Use-after-free of read data** — returned tensors borrow storage from their group.
+  Finish CPU/GPU accesses before releasing that group, or copy the bytes into
+  application-owned storage while the group is still valid.
 - **`tensors` vs `managed_tensors`** — set exactly one. Use `tensors` for client-owned memory
   that stays valid until the op completes (with a placement `availability_event`, until that
   event completes, or, if the event could not be recorded, until the synchronization
@@ -399,6 +402,13 @@ Two caveats:
   target prim/name fails — delete the attribute first and map/write the new schema at a later
   ordinal, or set `attribute_mode` to `OVSTAGE_ATTRIBUTE_MODE_FORCE` (Python `AttributeMode.FORCE`;
   a map also needs `dtype`) to replace that schema as one change at the same ordinal.
+- **Mapped `usd-prim-type` / `usd-schemas` / `usd-ancestor-types` did not take, or the commit
+  failed with `contains an invalid token id`** — these names lower to the prim's tags at unmap, so
+  every staged row must hold interned token ids (dtype omitted or `{kDLUInt, 64, 1}`, semantic
+  NONE, `element_sizes` for the two array names only, host placement). An unfilled row is the
+  empty token and fails the whole commit before any tag changes. Builds up to ovstage 0.3.0
+  silently stored the ids in a shadow column instead; read back through the reserved name to
+  tell the two apart.
 - **Mapped values start empty or unspecified instead of matching the attribute** — expected
   in the current implementation: mapping allocates write-only staging and does not load the
   existing payload. Populate every value you intend to commit before unmapping.
@@ -417,7 +427,7 @@ surface and `error-handling` (Python) for the exception types.
   — the returned `Operation` holds it for you until `.wait()`. For fixed-size attributes, a
   NumPy `(N, 3)` point array or `(N, 4, 4)` matrix array is a convenience write layout; the
   raw read and map results share typed shapes with scalar lanes.
-- **Read:** `ReadGroup.array(i)` returns a zero-copy **read-only** NumPy view (CPU). Its
+- **Read:** `ReadColumn.array(i)` returns a zero-copy **read-only** NumPy view (CPU). Its
   `WRITEABLE` flag is `False` and cannot be re-enabled, so direct writes through the returned
   array are rejected. Copy it if you need a mutable array.
 - **Map:** `MapGroup.array(i)` returns a zero-copy **writable** NumPy view (CPU) — fill it in
@@ -439,8 +449,8 @@ surface and `error-handling` (Python) for the exception types.
   arrays. If the fold consumes every source axis (for example `(3,)`, `lanes=1` to `float3`), the
   adapter returns `shape=(1,)`, `ndim=1`. Explicit overrides for that view must match `shape=[1]`,
   `ndim=1`, and compact `strides=[1]`.
-- **Read / map (export):** `ReadGroup.dlpack(i)` / `MapGroup.dlpack(i)` return a `ManagedDLTensor`
-  implementing `__dlpack__` / `__dlpack_device__`, so `np.from_dlpack(group.dlpack(i))`,
+- **Read / map (export):** `ReadColumn.dlpack(i)` / `MapGroup.dlpack(i)` return a `ManagedDLTensor`
+  implementing `__dlpack__` / `__dlpack_device__`, so `np.from_dlpack(column.dlpack(i))`,
   `wp.from_dlpack(...)`, `torch.from_dlpack(...)` consume it zero-copy on a compatible
   device. Unplaced reads/maps return CPU buffers; placement can select CUDA. Honor
   availability events before consuming payloads and keep groups alive through device work. A read

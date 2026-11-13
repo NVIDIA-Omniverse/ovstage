@@ -23,8 +23,15 @@ def main():
     # [snippet:population-setup]
     scene = str(Path(__file__).with_name("scene.usda"))
     with ovstage.Stage("example.population") as stage, ovstage.PathDictionary(stage) as paths:
-        # Select physics data, including Body's rigid-body API and its ancestors.
-        population.open_usd(stage, scene, ordinal=1, domains=PopulationDomain.PHYSICS)
+        # Select the prims that apply a physics API, with their physics properties. Their
+        # ancestors are populated too.
+        physics = population.Selector(
+            prim_predicate=population.PrimPredicate.has_applied_schema("PhysicsRigidBodyAPI", "PhysicsCollisionAPI"),
+            property_predicate=population.PropertyPredicate.in_namespace("physics"),
+        )
+        population.open_usd_with_desc(
+            stage, scene, ordinal=1, time=population.DEFAULT_TIME, descs=[population.Desc(selectors=[physics])]
+        )
         stage.advance_write_floor(ordinal=1).wait()
         # Continue the following examples inside these context managers.
     # [/snippet:population-setup]
@@ -64,8 +71,14 @@ def main():
                     read.wait()
                     for group in read.groups():
                         with group:
-                            print(float(group.array(0).ravel()[0]))
-                            # 2.0
+                            for column in group.columns:
+                                if column.is_delete:
+                                    continue
+                                values = column.array(0)
+                                for i in range(group.prim_count):
+                                    row = column.data_row_index(i) if column.has_data_index_map else i
+                                    print(float(values[row]))
+                                    # 2.0
         # [/snippet:population-default]
 
         # [snippet:population-numeric]
@@ -75,8 +88,14 @@ def main():
                     read.wait()
                     for group in read.groups():
                         with group:
-                            print(float(group.array(0).ravel()[0]))
-                            # 20.0
+                            for column in group.columns:
+                                if column.is_delete:
+                                    continue
+                                values = column.array(0)
+                                for i in range(group.prim_count):
+                                    row = column.data_row_index(i) if column.has_data_index_map else i
+                                    print(float(values[row]))
+                                    # 20.0
         # [/snippet:population-numeric]
 
         # [snippet:population-strings]
@@ -86,9 +105,15 @@ def main():
                     read.wait()
                     for group in read.groups():
                         with group:
-                            token = int(group.array(0).ravel()[0])
-                            print(paths.token_to_string(token))
-                            # ready
+                            for column in group.columns:
+                                if column.is_delete:
+                                    continue
+                                values = column.array(0)
+                                for i in range(group.prim_count):
+                                    row = column.data_row_index(i) if column.has_data_index_map else i
+                                    token = ovstage.Token(values[row])
+                                    print(paths.token_to_string(token))
+                                    # ready
         # [/snippet:population-strings]
 
         # [snippet:population-arrays]
@@ -98,8 +123,13 @@ def main():
                     read.wait()
                     for group in read.groups():
                         with group:
-                            print(group.array(0).reshape(-1, 3).tolist())
-                            # [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
+                            for column in group.columns:
+                                if column.is_delete:
+                                    continue
+                                for i in range(group.prim_count):
+                                    row = column.data_row_index(i) if column.has_data_index_map else i
+                                    print(column.array(row).reshape(-1, 3).tolist())
+                                    # [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
         # [/snippet:population-arrays]
 
         # [snippet:population-empty]
@@ -109,8 +139,14 @@ def main():
                     read.wait()
                     for group in read.groups():
                         with group:
-                            print(int(group.array(0).ravel()[0]))
-                            # 0
+                            for column in group.columns:
+                                if column.is_delete:
+                                    continue
+                                values = column.array(0)
+                                for i in range(group.prim_count):
+                                    row = column.data_row_index(i) if column.has_data_index_map else i
+                                    print(int(values[row]))
+                                    # 0
         # [/snippet:population-empty]
 
         # [snippet:population-empty-array]
@@ -120,8 +156,13 @@ def main():
                     read.wait()
                     for group in read.groups():
                         with group:
-                            print(group.array(0).tolist())
-                            # []
+                            for column in group.columns:
+                                if column.is_delete:
+                                    continue
+                                for i in range(group.prim_count):
+                                    row = column.data_row_index(i) if column.has_data_index_map else i
+                                    print(column.array(row).tolist())
+                                    # []
         # [/snippet:population-empty-array]
 
         # [snippet:population-extent]
@@ -131,8 +172,14 @@ def main():
                     read.wait()
                     for group in read.groups():
                         with group:
-                            print(group.array(0).dtype, group.array(0).reshape(-1, 6).tolist())
-                            # float64 [[-1.0, -1.0, -1.0, 1.0, 1.0, 1.0]]
+                            for column in group.columns:
+                                if column.is_delete:
+                                    continue
+                                values = column.array(0).reshape(-1, 6)
+                                for i in range(group.prim_count):
+                                    row = column.data_row_index(i) if column.has_data_index_map else i
+                                    print(values.dtype, values[row:row + 1].tolist())
+                                    # float64 [[-1.0, -1.0, -1.0, 1.0, 1.0, 1.0]]
         # [/snippet:population-extent]
 
         # [snippet:population-stage-metadata-read]
@@ -142,8 +189,14 @@ def main():
                     read.wait()
                     for group in read.groups():
                         with group:
-                            print(float(group.array(0).ravel()[0]))
-                            # 24.0
+                            for column in group.columns:
+                                if column.is_delete:
+                                    continue
+                                values = column.array(0)
+                                for i in range(group.prim_count):
+                                    row = column.data_row_index(i) if column.has_data_index_map else i
+                                    print(float(values[row]))
+                                    # 24.0
         # [/snippet:population-stage-metadata-read]
 
         # [snippet:population-property-metadata-read]
@@ -153,8 +206,14 @@ def main():
                     read.wait()
                     for group in read.groups():
                         with group:
-                            print(paths.token_to_string(int(group.array(0).ravel()[0])))
-                            # C
+                            for column in group.columns:
+                                if column.is_delete:
+                                    continue
+                                values = column.array(0)
+                                for i in range(group.prim_count):
+                                    row = column.data_row_index(i) if column.has_data_index_map else i
+                                    print(paths.token_to_string(ovstage.Token(values[row])))
+                                    # C
         # [/snippet:population-property-metadata-read]
 
         # [snippet:population-prim-metadata-read]
@@ -164,8 +223,14 @@ def main():
                     read.wait()
                     for group in read.groups():
                         with group:
-                            print(paths.token_to_string(int(group.array(0).ravel()[0])))
-                            # robot
+                            for column in group.columns:
+                                if column.is_delete:
+                                    continue
+                                values = column.array(0)
+                                for i in range(group.prim_count):
+                                    row = column.data_row_index(i) if column.has_data_index_map else i
+                                    print(paths.token_to_string(ovstage.Token(values[row])))
+                                    # robot
         # [/snippet:population-prim-metadata-read]
 
         # [snippet:population-reserved]
@@ -175,8 +240,14 @@ def main():
                     read.wait()
                     for group in read.groups():
                         with group:
-                            print(paths.token_to_string(int(group.array(0).ravel()[0])))
-                            # Cube
+                            for column in group.columns:
+                                if column.is_delete:
+                                    continue
+                                values = column.array(0)
+                                for i in range(group.prim_count):
+                                    row = column.data_row_index(i) if column.has_data_index_map else i
+                                    print(paths.token_to_string(ovstage.Token(values[row])))
+                                    # Cube
         # [/snippet:population-reserved]
 
         # [snippet:population-schemas]
@@ -186,8 +257,13 @@ def main():
                     read.wait()
                     for group in read.groups():
                         with group:
-                            print([paths.token_to_string(int(token)) for token in group.array(0).ravel()])
-                            # ['PhysicsRigidBodyAPI']
+                            for column in group.columns:
+                                if column.is_delete:
+                                    continue
+                                for i in range(group.prim_count):
+                                    row = column.data_row_index(i) if column.has_data_index_map else i
+                                    print([paths.token_to_string(ovstage.Token(token)) for token in column.array(row)])
+                                    # ['PhysicsRigidBodyAPI']
         # [/snippet:population-schemas]
 
         # [snippet:population-ancestor]
@@ -197,8 +273,14 @@ def main():
                     read.wait()
                     for group in read.groups():
                         with group:
-                            print(group.array(0).reshape(4, 4)[3, :3].tolist())
-                            # [10.0, 0.0, 0.0]
+                            for column in group.columns:
+                                if column.is_delete:
+                                    continue
+                                matrices = column.array(0).reshape(-1, 4, 4)
+                                for i in range(group.prim_count):
+                                    row = column.data_row_index(i) if column.has_data_index_map else i
+                                    print(matrices[row, 3, :3].tolist())
+                                    # [10.0, 0.0, 0.0]
         # [/snippet:population-ancestor]
 
         # [snippet:population-time]
@@ -211,8 +293,14 @@ def main():
                     read.wait()
                     for group in read.groups():
                         with group:
-                            print(float(group.array(0).ravel()[0]))
-                            # 30.0
+                            for column in group.columns:
+                                if column.is_delete:
+                                    continue
+                                values = column.array(0)
+                                for i in range(group.prim_count):
+                                    row = column.data_row_index(i) if column.has_data_index_map else i
+                                    print(float(values[row]))
+                                    # 30.0
         # [/snippet:population-time]
 
         # [snippet:population-ordinals]
@@ -226,7 +314,7 @@ def main():
 
 
         # [snippet:population-subtree]
-        # Add size for Cube prims below /World to the predefined physics selection.
+        # Add size for Cube prims below /World to the physics selection.
         subtree_selector = population.Selector(
             prim_predicate=population.PrimPredicate.and_(
                 population.PrimPredicate.is_under_path("/World"),
@@ -236,7 +324,7 @@ def main():
         )
         population.open_usd_with_desc(
             stage, scene, ordinal=7, time=population.DEFAULT_TIME,
-            descs=[population.Desc(domains=PopulationDomain.PHYSICS, selectors=[subtree_selector])],
+            descs=[population.Desc(selectors=[physics, subtree_selector])],
         )
         stage.advance_write_floor(ordinal=7).wait()
         # [/snippet:population-subtree]
@@ -247,7 +335,7 @@ def main():
         ordinal = 1
         try:
             operation = population.open_usd_async(
-                stage, scene + ".missing", ordinal=ordinal, domains=PopulationDomain.PHYSICS
+                stage, scene + ".missing", ordinal=ordinal, domains=PopulationDomain.RENDERING
             )
         except ovstage.OvstageError:
             # Rejected at submission: no writes ran, so this ordinal can be reused.
@@ -261,7 +349,7 @@ def main():
             else:
                 raise RuntimeError("Expected the missing file to fail")
         # Fix the input and retry at the chosen ordinal.
-        population.open_usd(stage, scene, ordinal=retry_ordinal, domains=PopulationDomain.PHYSICS)
+        population.open_usd(stage, scene, ordinal=retry_ordinal, domains=PopulationDomain.RENDERING)
         stage.advance_write_floor(ordinal=retry_ordinal).wait()
         # [/snippet:population-failure]
 

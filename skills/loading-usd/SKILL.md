@@ -47,8 +47,8 @@ file, reusable destination, or host-owned identifier — use `exporting-to-usd`.
 Resolve inputs in this order: existing repository files and referenced snippets, explicit user request, then broader agent context.
 
 - USD source: a file/URL path, or an inline USDA string.
-- Data domains to populate: RENDERING, PHYSICS, or ALL (bitmask). `0`
-  (`DOMAIN_NONE`) authors nothing.
+- Data domains to populate: RENDERING (bitmask). `0` (`DOMAIN_NONE`) authors nothing.
+  Other data, such as physics, comes from a description's selectors.
 - The caller-assigned `ordinal` for each population operation (a tick may use
   several; population never chooses, increments, or seals one itself).
 - Whether this is a one-shot open or a running loop with live edits
@@ -65,6 +65,9 @@ Resolve inputs in this order: existing repository files and referenced snippets,
   enqueues return an op id; wait on it to confirm materialization and check errors.
 - **Ordinal ownership:** the caller (frame coordinator) owns the ordinal and the
   write floor; population is invoked against a caller-provided ordinal.
+- If the USD source needs a context-dependent OpenUSD resolver, put its resolver
+  context in place (and select the primary resolver) before creating the instance;
+  see *Context-Dependent Resolvers* in `docs/scene/population.rst`.
 
 ## Instructions
 
@@ -111,8 +114,10 @@ picked up by `apply_usd_changes` (structural) and `apply_usd_time` (time-sampled
 `ovstage_population_domain_t` is a bitmask — OR values together:
 
 - `RENDERING` — meshes, lights, materials, and cameras.
-- `PHYSICS` — colliders, rigid bodies, joints, articulations, physics schema attrs.
-- `ALL` — both. `NONE` (0) authors nothing.
+- `NONE` (0) authors nothing.
+
+A bit that names no domain is ignored. Physics data is populated through a description's
+selectors, not a domain.
 
 Stage metadata is populated onto the root prim, under the `usd-metadata:<path>` column
 prefix, when something asks for it: a selected domain may bring its own, and a
@@ -126,13 +131,11 @@ their properties), and selectors compose: a prim is in scope if any selector mat
 its properties are the union over the selectors that did. Selectors go in a desc alongside
 `domains`, so a caller's own selection unions with a built-in domain in one traversal.
 
-Predicate kinds accepted today — prim: `NONE`, `ALL`, `AND`, `OR`, `NOT`, `HAS_SCHEMA`,
-`HAS_TYPE`, `IS_A_TYPE`, `HAS_APPLIED_SCHEMA`, `HAS_APPLIED_SCHEMA_IN_NAMESPACE`, `HAS_PATH`,
-`IS_UNDER_PATH`, `HAS_KIND`, `HAS_PURPOSE`, `HAS_METADATA`, `HAS_PARENT`, `HAS_ANCESTOR`,
-`HAS_PROPERTY`;
-property: `NONE`, `ALL`, `AND`, `OR`, `NOT`, `DECLARED_BY_SCHEMA`, `HAS_NAME`, `IN_NAMESPACE`,
-`HAS_METADATA`, `IS_ATTRIBUTE`, `IS_RELATIONSHIP`, `IS_CUSTOM`, `IS_AUTHORED` — the whole declared
-vocabulary. A `kind` outside either enum is rejected at enqueue with `NOT_SUPPORTED`, as is a
+Common prim predicates include `HAS_SCHEMA`, `IS_UNDER_PATH`, and `HAS_PROPERTY`;
+property predicates include `DECLARED_BY_SCHEMA`, `HAS_NAME`, and `IS_AUTHORED`.
+Both support `AND`, `OR`, and `NOT`. See the
+[population guide](../../docs/scene/population.rst) for the full selection
+contract, including descendant, instance, and relationship-target predicates. A `kind` outside either enum is rejected at enqueue with `NOT_SUPPORTED`, as is a
 malformed graph, so a description cannot silently populate nothing through a kind the build
 cannot honour. Values are not checked against any registry: a schema or type name nothing
 registers is accepted and matches nothing, so spell those from the stage you are populating.
@@ -259,16 +262,21 @@ This skill has no scripts.
   the added content.
 - **Surviving-anchor removal (current-build implementation gap).** Removing a reference from an existing prim or a
   root sublayer may leave stale descendants; removal works when the resync root disappears.
-- **Ordinals are caller-owned.** Assign each population call an ordinal above
-  applicable floors; a new stage's floor is 0, so start at 1 or higher. Under the
+- **Ordinals are caller-owned.** Assign each population call an ordinal strictly above
+  applicable floors. A new stage starts at `OVSTAGE_ORDINAL_MIN` (Python:
+  `ovstage.ORDINAL_MIN`); negative ordinals above that minimum and zero are valid. Under the
   `STRICTLY_INCREASING` policy, overlapping cell or prim-lifecycle
   changes need newer ordinals even before sealing. `NONDECREASING` permits equal
   retained ordinals and `FLOOR_ONLY` skips retained-history admission; every
   policy still enforces applicable floors. Disjoint effects may share an
   ordinal. Seal completed updates yourself; no helper increments the ordinal.
-- **Latest-snapshot payloads.** Do not design a flow around historical payloads;
-  bounded older change membership is available only at or above the reported
-  retention frontier.
+- **Latest-snapshot payloads by default.** History is off by default. Do not design a flow
+  around historical payloads unless the flow creates an instance of `history_selective`
+  (`ovstage_instance_desc_t.implementation` set to `history_selective`). Such a flow selects the
+  exact pairs with `ovstage_enable_history()`. History support (the `history_selective`
+  implementation and `ovstage_enable_history()`) is experimental and can change between
+  releases without a deprecation period. Bounded older change membership is
+  available only at or above the reported retention frontier.
 - **⚠️ Draft — API in flux.** Treat exact symbols/ordering as provisional against the
   shipped headers.
 

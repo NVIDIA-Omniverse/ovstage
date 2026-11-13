@@ -14,11 +14,12 @@
 
 [project]
 name = "ovstage-public-tests-python"
-version = "0.3.0"
+version = "0.4.0"
 description = "ovstage public Python tests (CPU-only)"
 requires-python = ">=3.10,<3.14"
 dependencies = [
     "numpy>=1.24",
-    "pytest>=8",
+    "pytest>=9.2.0,<10",
+    "Pygments>=2.21.0",
 ]
 

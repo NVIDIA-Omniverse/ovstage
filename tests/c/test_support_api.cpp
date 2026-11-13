@@ -118,6 +118,47 @@ TEST(ProcessConfig, RejectsUnknownKey)
     EXPECT_EQ(ovstage_initialize(&config), OVSTAGE_ERROR_INVALID_ARGUMENT);
 }
 
+TEST(ProcessConfig, PopulationThreadLimit)
+{
+    // [snippet:configure-population-threads-c]
+    // Let the runtime choose how many threads each population operation uses.
+    // Choose the limit before the first initialize or instance in this lifetime.
+    const ovstage_config_entry_t entry =
+        ovstage_config_entry_population_thread_limit(OVSTAGE_POPULATION_THREAD_LIMIT_AUTO);
+    const ovstage_config_t config{ &entry, 1 };
+    ASSERT_EQ(ovstage_initialize(&config), OVSTAGE_OK);
+    // [/snippet:configure-population-threads-c]
+
+    // While this process state is live, a different limit is rejected and the runtime default
+    // entry is ignored.
+    const ovstage_config_entry_t serial = ovstage_config_entry_population_thread_limit(1);
+    const ovstage_config_t serialConfig{ &serial, 1 };
+    EXPECT_EQ(ovstage_initialize(&serialConfig), OVSTAGE_ERROR_INVALID_ARGUMENT);
+    const ovstage_config_entry_t keep =
+        ovstage_config_entry_population_thread_limit(OVSTAGE_POPULATION_THREAD_LIMIT_DEFAULT);
+    const ovstage_config_t keepConfig{ &keep, 1 };
+    const bool kept = ovstage_initialize(&keepConfig) == OVSTAGE_OK;
+    EXPECT_TRUE(kept);
+
+    ovstage_instance_desc_t desc{};
+    desc.name = "test.ovstage.population-thread-limit";
+    ovstage_instance_t* stage = nullptr;
+    EXPECT_EQ(ovstage_create_instance(&desc, &stage), OVSTAGE_OK);
+    if (stage)
+    {
+        ovstage_config_t captured{};
+        EXPECT_EQ(ovstage_get_config(stage, &captured), OVSTAGE_OK);
+        ASSERT_EQ(captured.entry_count, 1u);
+        EXPECT_EQ(captured.entries[0].key_type, OVSTAGE_CONFIG_KEY_TYPE_UINT64);
+        EXPECT_EQ(captured.entries[0].key.uint64_key, OVSTAGE_CONFIG_POPULATION_THREAD_LIMIT);
+        EXPECT_EQ(captured.entries[0].value.uint_value, OVSTAGE_POPULATION_THREAD_LIMIT_AUTO);
+        EXPECT_EQ(ovstage_destroy_instance(stage), OVSTAGE_OK);
+    }
+    if (kept)
+        EXPECT_EQ(ovstage_shutdown(), OVSTAGE_OK);
+    EXPECT_EQ(ovstage_shutdown(), OVSTAGE_OK);
+}
+
 } // namespace
 
 namespace
@@ -225,12 +266,13 @@ TEST_F(OrdinalAdmissionConfigTest, ConfiguresAndEnforcesNondecreasing)
     ovstage_read_handle_t read = OVSTAGE_INVALID_READ_HANDLE;
     ASSERT_EQ(complete(ovstage_read_attributes(stage_, query, &attribute, 1, range, &read)), OVSTAGE_OK);
     ovstage_read_group_t group{};
-    ASSERT_EQ(ovstage_fetch_read_next(stage_, read, OVSTAGE_TIMEOUT_INFINITE, &group), OVSTAGE_OK);
-    ASSERT_EQ(group.data.tensor_count, 1u);
-    ASSERT_NE(group.data.tensors, nullptr);
-    ASSERT_NE(group.data.tensors[0].data, nullptr);
-    EXPECT_FLOAT_EQ(*static_cast<const float*>(group.data.tensors[0].data), 20.0f);
-    EXPECT_EQ(ovstage_release_group(stage_, &group), OVSTAGE_OK);
+    size_t fetchedReadGroupCount = 0;
+    ASSERT_EQ(ovstage_fetch_read_next(stage_, read, OVSTAGE_TIMEOUT_INFINITE, &group, 1, &fetchedReadGroupCount), OVSTAGE_OK);
+    ASSERT_EQ(group.columns[0].data.tensor_count, 1u);
+    ASSERT_NE(group.columns[0].data.tensors, nullptr);
+    ASSERT_NE(group.columns[0].data.tensors[0].data, nullptr);
+    EXPECT_FLOAT_EQ(*static_cast<const float*>(group.columns[0].data.tensors[0].data), 20.0f);
+    EXPECT_EQ(ovstage_release_groups(stage_, &group, 1), OVSTAGE_OK);
     EXPECT_EQ(complete(ovstage_release_read(stage_, read)), OVSTAGE_OK);
     EXPECT_EQ(complete(ovstage_release_query(stage_, query)), OVSTAGE_OK);
 }

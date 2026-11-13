@@ -97,8 +97,7 @@ This skill has no scripts.
   returning the most recent thread-local synchronous error as an `ovx_string_t` — readable
   even when `ovstage_create_instance` itself failed.
 - **Python:** covered in the Python section — failures surface as `OvstageError` /
-  `OvxError` exceptions (both `RuntimeError`); async errors raise from `.wait()`. Inline
-  Python pending a shipping Python example to snippet-source.
+  `OvxError` exceptions (both `RuntimeError`); async errors raise from `.wait()`.
 - **Snippets** are sourced from the shipping example `examples/c/minimal/main.cpp`.
 
 ## Overview
@@ -117,19 +116,21 @@ most recent thread-local error is also available as an `ovx_string_t` via
 |------|---------|
 | `OVSTAGE_OK` (0) | success |
 | `OVSTAGE_ERROR_INVALID_ARGUMENT` (1) | NULL pointer or invalid parameter |
-| `OVSTAGE_ERROR_INVALID_HANDLE` (2) | stale/invalid handle |
+| `OVSTAGE_ERROR_INVALID_HANDLE` (2) | stale/invalid handle (already released, unknown, or from another instance); release each handle once |
 | `OVSTAGE_ERROR_NOT_FOUND` (3) | token/path/list not found |
 | `OVSTAGE_ERROR_PRIM_NOT_FOUND` (4) | INSERT mode and prim already exists |
-| `OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION` (5) | mutation blocked by a floor or the configured admission policy, or read selecting an unsealed change at/before its end |
+| `OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION` (5) | mutation blocked by a floor or the configured admission policy, or read selecting an unsealed change at/before its end  Writes must satisfy the current floor and configured policy. Reads require sealing the selected changes. A failed execution observed through `ovstage_wait_op` reports `OP_FAILED`; inspect its diagnostic. |
 | `OVSTAGE_ERROR_NOT_SUPPORTED` (6) | unsupported operation |
-| `OVSTAGE_ERROR_QUEUE_FULL` (7) | backpressure: submit queue full |
+| `OVSTAGE_ERROR_QUEUE_FULL` (7) | a history reconciliation or presentation operation is already active — wait for it to finish before retrying; see [selective history](../../docs/scene/reading_attributes.rst#earlier-values-of-selected-pairs) |
 | `OVSTAGE_ERROR_END_OF_ITERATION` (8) | no more groups to iterate |
 | `OVSTAGE_ERROR_OUT_OF_MEMORY` (9) | allocation failure |
 | `OVSTAGE_ERROR_LAYOUT_CHANGED` (10) | layout changed during map |
 | `OVSTAGE_ERROR_TIMEOUT` (11) | fetch/wait did not complete within timeout |
-| `OVSTAGE_ERROR_OP_FAILED` (12) | an enqueued op failed; see `ovstage_get_last_op_error` |
-| `OVSTAGE_ERROR_OUT_OF_RANGE` (13) | older values requested by the read are no longer available |
+| `OVSTAGE_ERROR_OP_FAILED` (12) | an enqueued op failed; see `ovstage_get_last_op_error`. Also returned when an op overlaps a still-held read group, map, or pending write: release fetched groups (`release_groups`) and the read before writing that data |
+| `OVSTAGE_ERROR_OUT_OF_RANGE` (13) | requested ordinal range cannot be materialized from retained payloads; with `history_latest`, a selected prim/attribute changed again after the range end — read through the later ordinal or read latest |
 | `OVSTAGE_ERROR_INTERNAL` (99) | internal error |
+
+Error messages are per thread: copy `ovstage_get_last_error` / `ovstage_get_last_op_error` text immediately on the same thread; a later wait (including internal waits) can clear it.
 
 ## C — synchronous calls
 
@@ -242,13 +243,17 @@ A timeout surfaces as the `OVSTAGE_ERROR_TIMEOUT` code (`timeout=0` polls,
   an unsealed change at or before its end. Snapshots select all queried paths; change ranges
   select `(attribute, path)` pairs changed in the requested interval. See
   [Ordinal Admission Policies](../../docs/scene/writing_attributes.rst) when diagnosing
-  retained-history conflicts. The effective floor starts at 0. `advance_write_floor` itself never
-  raises this: backwards advances clamp via `max(...)` rather than rejecting.
-- `OVSTAGE_ERROR_OUT_OF_RANGE` means a selected `(attribute, path)` has a recorded change
-  after the requested end, sealed or not, and older values are not retained. For each attribute,
-  the read checks for the write-floor violation above first. If newer values are acceptable,
-  move the end forward or use `UINT64_MAX` (Python: `(1 << 64) - 1`) to request current values,
+  retained-history conflicts. A new stage starts sealed through `OVSTAGE_ORDINAL_MIN`
+  (Python: `ovstage.ORDINAL_MIN`); mutations must use ordinals strictly above the
+  applicable floors. `advance_write_floor` itself never raises this: backwards
+  advances clamp via `max(...)` rather than rejecting.
+- `OVSTAGE_ERROR_OUT_OF_RANGE` means values needed for the requested snapshot or
+  change range are no longer available. This can happen even when history is enabled,
+  because retained values can be discarded. If newer values are acceptable,
+  move the end forward or use `OVSTAGE_ORDINAL_MAX` (Python: `ovstage.ORDINAL_MAX`) to request current values,
   but a selected unsealed change still returns `WRITE_FLOOR_VIOLATION`. Sealing alone does not restore older values.
+  For experimental `history_selective`, see
+  [selective history](../../docs/scene/reading_attributes.rst#earlier-values-of-selected-pairs).
 - Call `ovstage_release_op` once an op is known complete; afterwards the `op_id` must not
   be reused with `ovstage_wait_op` or `ovstage_get_last_op_error`.
 

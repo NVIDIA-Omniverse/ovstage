@@ -64,9 +64,9 @@ def main() -> int:
         count_tok = paths.intern_token("example:count")
 
         # ---- 1. populate the scene and list the populated prims ----
-        # Populate everything (domain ALL) at ordinal 1 and seal it; the two
-        # instanceable references land as XformInstance prims.
-        population.open_usd(stage, str(SCENE), ordinal=1, domains=PopulationDomain.ALL)
+        # Populate the rendering domain at ordinal 1 and seal it; the two
+        # instanceable references land as instance roots of their authored type.
+        population.open_usd(stage, str(SCENE), ordinal=1, domains=PopulationDomain.RENDERING)
         stage.advance_write_floor(ordinal=1).wait()
 
         scene_list = paths.create_path_list_from_strings(SCENE_PRIMS)
@@ -75,7 +75,7 @@ def main() -> int:
 
         # Example plumbing: the usd-prim-type values are tokens -- resolve each
         # to its name and print "path = Type", sorted for deterministic output.
-        scene_lines = sorted(f"{path} = {paths.token_to_string(int(token))}"
+        scene_lines = sorted(f"{path} = {paths.token_to_string(ovstage.Token(token))}"
                              for path, token in scene_rows)
         print("populated prims (usd-prim-type):")
         for line in scene_lines:
@@ -150,6 +150,19 @@ def main() -> int:
         # Prims with points and faceVertexCounts: 2
         # [/snippet:query-required-attributes]
 
+        # [snippet:query-excluded-attribute]
+        # Match meshes, leaving out every prim that has example:count.
+        excluded_filter = Filter([
+            Predicate("usd-prim-type", FilterOp.IN, ["Mesh"]),
+            Predicate("example:count", FilterOp.NOT_HAS),
+        ])
+        with stage.query(filter=excluded_filter) as query:
+            query.wait()
+            excluded_count = query.result().total_prim_count
+        print("Meshes without example:count:", excluded_count)
+        # Meshes without example:count: 1
+        # [/snippet:query-excluded-attribute]
+
         # [snippet:query-matched-paths]
         # Query the direct children, then read their current path identifiers.
         children_filter = Filter([
@@ -163,10 +176,13 @@ def main() -> int:
                 read.wait()
                 for group in read.groups():
                     with group:  # Release every group after resolving its identifiers.
-                        path_ids = group.array(0)
-                        for i in range(group.prim_count):
-                            row = group.data_row_index(i) if group.has_data_index_map else i
-                            matched_paths.append(paths.path_to_string(int(path_ids[row])))
+                        for column in group.columns:
+                            if column.is_delete:
+                                continue
+                            path_ids = column.array(0)
+                            for i in range(group.prim_count):
+                                row = column.data_row_index(i) if column.has_data_index_map else i
+                                matched_paths.append(paths.path_to_string(ovstage.PrimPath(path_ids[row])))
         print("Matched paths:", " ".join(sorted(matched_paths)))
         # Matched paths: /World/Group/Left /World/Group/Right
         # [/snippet:query-matched-paths]
@@ -192,10 +208,14 @@ def main() -> int:
                 read.wait()
                 for group in read.groups():
                     with group:
-                        # Array attributes return a separate tensor for each prim.
-                        for i in range(group.prim_count):
-                            for token in group.array(i):
-                                schema_names.append(paths.token_to_string(int(token)))
+                        for column in group.columns:
+                            if column.is_delete:
+                                continue
+                            # Array attributes return a tensor for each physical data row.
+                            for i in range(group.prim_count):
+                                row = column.data_row_index(i) if column.has_data_index_map else i
+                                for token in column.array(row):
+                                    schema_names.append(paths.token_to_string(ovstage.Token(token)))
         print("APIs on /World/Group/Right:", " ".join(sorted(schema_names)))
         # APIs on /World/Group/Right: MaterialBindingAPI MeshSubdivision ShadowAPI
         # [/snippet:query-list-schemas]
@@ -210,19 +230,24 @@ def main() -> int:
         # accepts. Values are always strings; predicates in one Filter AND
         # together.
         _run_filter_query(stage, paths, Predicate("usd-prim-type", FilterOp.IN, ["Mesh"]),
-                          prim_type, END_ORDINAL, "usd-prim-type IN {Mesh}")
+                          prim_type, END_ORDINAL, "usd-prim-type IN {Mesh}",
+        )
         _run_filter_query(stage, paths, Predicate("usd-path", FilterOp.PREFIX, ["/World/Group"]),
-                          prim_type, END_ORDINAL, "usd-path PREFIX {/World/Group}")  # subtree
+                          prim_type, END_ORDINAL, "usd-path PREFIX {/World/Group}",
+        )  # subtree
         _run_filter_query(stage, paths, Predicate("usd-parent", FilterOp.IN, ["/World/Group"]),
-                          prim_type, END_ORDINAL, "usd-parent IN {/World/Group}")  # direct children
+                          prim_type, END_ORDINAL, "usd-parent IN {/World/Group}",
+        )  # direct children
         _run_filter_query(stage, paths,
                           Predicate("usd-children", FilterOp.CONTAINS, ["/World/Group/Left"]),
-                          prim_type, END_ORDINAL, "usd-children CONTAINS {/World/Group/Left}")
+                          prim_type, END_ORDINAL, "usd-children CONTAINS {/World/Group/Left}",
+        )
         # ShadowAPI is authored on /World/Group/Right only. Population applies
         # schemas of its own (e.g. MaterialBindingAPI lands on every gprim),
         # so filter on a schema that is selective in your scene.
         _run_filter_query(stage, paths, Predicate("usd-schemas", FilterOp.CONTAINS, ["ShadowAPI"]),
-                          prim_type, END_ORDINAL, "usd-schemas CONTAINS {ShadowAPI}")
+                          prim_type, END_ORDINAL, "usd-schemas CONTAINS {ShadowAPI}",
+        )
         _run_filter_query(stage, paths, Predicate(count_tok, FilterOp.HAS),
                           prim_type, END_ORDINAL, "HAS example:count")  # presence; no values
         # [/snippet:filter-predicates]
@@ -270,9 +295,14 @@ def main() -> int:
     # Use a separate scene to demonstrate instances inside other instances.
     with ovstage.Stage("example.nested-instancing") as stage:
         # [snippet:instancing-timing]
-        population.open_usd(stage, str(SCENE.with_name("nested.usda")),
-                            ordinal=1, domains=PopulationDomain.PHYSICS)
-        # open_usd() waits by default. Make its changes available for reads.
+        # The prims that apply a physics API, and their ancestors.
+        physics = population.Selector(
+            prim_predicate=population.PrimPredicate.has_applied_schema("PhysicsRigidBodyAPI", "PhysicsCollisionAPI"),
+            property_predicate=population.PropertyPredicate.in_namespace("physics"),
+        )
+        population.open_usd_with_desc(stage, str(SCENE.with_name("nested.usda")), ordinal=1,
+                                      time=population.DEFAULT_TIME, descs=[population.Desc(selectors=[physics])])
+        # open_usd_with_desc() waits by default. Make its changes available for reads.
         stage.advance_write_floor(ordinal=1).wait()
         # [/snippet:instancing-timing]
 
@@ -332,11 +362,12 @@ def _rows(stage, paths, query, attribute, end_ordinal):
     with stage.read_attributes(query, [attribute], OrdinalRange.latest(end_ordinal)) as read:
         read.wait()
         for group in read.groups():
+            column = group.columns[0]
             handles = paths.get_paths(group.prim_list)
-            values = group.array(0)
+            values = column.array(0)
             for local in range(group.prim_count):
                 path = paths.path_to_string(handles[group.prim_index(local)])
-                row = group.data_row_index(local) if group.has_data_index_map else local
+                row = column.data_row_index(local) if column.has_data_index_map else local
                 yield path, values[row]
             stage.release_group(group)
 # [/snippet:resolve-matched-prims]

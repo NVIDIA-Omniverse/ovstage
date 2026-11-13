@@ -69,12 +69,15 @@ def main():
                     read.wait()
                     for group in read.groups():
                         with group:
-                            world_matrices = group.array(0).reshape(-1, 4, 4)
-                            for i in range(group.prim_count):
-                                row = group.data_row_index(i) if group.has_data_index_map else i
-                                print("Wheel world x:", float(world_matrices[row, 3, 0]))
-                                # Wheel world x: 4.0
-                                found = True
+                            for column in group.columns:
+                                if column.is_delete:
+                                    continue
+                                world_matrices = column.array(0).reshape(-1, 4, 4)
+                                for i in range(group.prim_count):
+                                    row = column.data_row_index(i) if column.has_data_index_map else i
+                                    print("Wheel world x:", float(world_matrices[row, 3, 0]))
+                                    # Wheel world x: 4.0
+                                    found = True
                 if not found:
                     print("No derived world-matrix row is available.")
                     # No derived world-matrix row is available.

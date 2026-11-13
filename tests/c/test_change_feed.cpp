@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <array>
+#include <tuple>
 #include <cstdint>
 #include <cstring>
 #include <initializer_list>
@@ -62,7 +63,7 @@ bool waitOp(ovstage_instance_t* stage, ovstage_enqueue_result_t enq, const char*
 
 // One structural change row: (attribute, prim path, token value). Plain uint64
 // handles, so rows sort and compare directly.
-using TokenRow = std::array<uint64_t, 3>;
+using TokenRow = std::tuple<ovx_token_t, ovx_primpath_t, ovx_token_t>;
 // One value row: (attribute, prim path, float value).
 using FloatRow = std::tuple<ovx_token_t, ovx_primpath_t, float>;
 
@@ -338,8 +339,10 @@ protected:
         ovstage_api_status_t status = OVSTAGE_OK;
         for (;;)
         {
+            size_t fetchedGroupCount = 0;
             ovstage_read_group_t group{};
-            const ovstage_api_status_t fetch = ovstage_fetch_read_next(stage_, read, OVSTAGE_TIMEOUT_INFINITE, &group);
+            const ovstage_api_status_t fetch =
+                ovstage_fetch_read_next(stage_, read, OVSTAGE_TIMEOUT_INFINITE, &group, 1, &fetchedGroupCount);
             if (fetch == OVSTAGE_ERROR_END_OF_ITERATION)
                 break;
             if (fetch != OVSTAGE_OK)
@@ -348,7 +351,7 @@ protected:
                 break;
             }
             visit(group);
-            ovstage_release_group(stage_, &group);
+            ovstage_release_groups(stage_, &group, 1);
         }
         ovstage_op_wait_result_t wait{};
         const ovstage_api_status_t waited = ovstage_wait_op(stage_, enqueue.op_index, OVSTAGE_TIMEOUT_INFINITE, &wait);
@@ -370,22 +373,33 @@ protected:
         rows->clear();
         const std::vector<ovx_token_t> attrs{ schemas_, primType_ };
         const ovstage_api_status_t status = readRange(query, attrs, first, last, [&](const ovstage_read_group_t& group) {
-            EXPECT_FALSE(group.is_delete);
             const std::vector<ovx_primpath_t> covered = groupPaths(group.prims);
-            for (size_t i = 0; i < covered.size(); ++i)
+            for (size_t c = 0; c < group.column_count; ++c)
             {
-                const size_t dataRow = group.data.index_map ? group.data.index_map[i] : i;
-                const size_t tensorIndex = group.is_array ? dataRow : 0;
-                const size_t element = group.is_array ? 0 : dataRow;
-                if (tensorIndex >= group.data.tensor_count || group.data.tensors[tensorIndex].data == nullptr ||
-                    group.data.tensors[tensorIndex].shape == nullptr ||
-                    element >= static_cast<size_t>(group.data.tensors[tensorIndex].shape[0]))
-                {
-                    ADD_FAILURE() << "structural group row " << i << " has no payload";
+                const ovstage_read_column_t& column = group.columns[c];
+                EXPECT_FALSE(column.is_delete);
+                if (column.is_delete)
                     continue;
+                for (size_t i = 0; i < covered.size(); ++i)
+                {
+                    if (column.data.mask && !(column.data.mask[i / 64] & (uint64_t{ 1 } << (i % 64))))
+                        continue;
+                    const size_t dataRow = column.data.index_map ? column.data.index_map[i] : i;
+                    const size_t tensorIndex = column.is_array ? dataRow : 0;
+                    const size_t element = column.is_array ? 0 : dataRow;
+                    if (tensorIndex >= column.data.tensor_count || column.data.tensors == nullptr ||
+                        column.data.tensors[tensorIndex].data == nullptr ||
+                        column.data.tensors[tensorIndex].shape == nullptr ||
+                        element >= static_cast<size_t>(column.data.tensors[tensorIndex].shape[0]))
+                    {
+                        ADD_FAILURE() << "structural column row " << i << " has no payload";
+                        continue;
+                    }
+                    const DLTensor& tensor = column.data.tensors[tensorIndex];
+                    const auto* tokens = reinterpret_cast<const ovx_token_t*>(
+                        static_cast<const uint8_t*>(tensor.data) + tensor.byte_offset);
+                    rows->push_back(TokenRow{ column.attribute, covered[i], tokens[element] });
                 }
-                const auto* tokens = static_cast<const ovx_token_t*>(group.data.tensors[tensorIndex].data);
-                rows->push_back(TokenRow{ group.attribute, covered[i], tokens[element] });
             }
         });
         std::sort(rows->begin(), rows->end());
@@ -399,26 +413,35 @@ protected:
     {
         rows->clear();
         const ovstage_api_status_t status = readRange(query, attrs, first, last, [&](const ovstage_read_group_t& group) {
-            EXPECT_FALSE(group.is_delete);
-            EXPECT_FALSE(group.is_array);
-            if (group.data.tensor_count != 1 || group.data.tensors[0].data == nullptr ||
-                group.data.tensors[0].shape == nullptr)
-            {
-                ADD_FAILURE() << "value group without a payload tensor";
-                return;
-            }
-            const DLTensor& tensor = group.data.tensors[0];
-            const auto* values = static_cast<const float*>(tensor.data);
             const std::vector<ovx_primpath_t> covered = groupPaths(group.prims);
-            for (size_t i = 0; i < covered.size(); ++i)
+            for (size_t c = 0; c < group.column_count; ++c)
             {
-                const size_t dataRow = group.data.index_map ? group.data.index_map[i] : i;
-                if (dataRow >= static_cast<size_t>(tensor.shape[0]))
+                const ovstage_read_column_t& column = group.columns[c];
+                EXPECT_FALSE(column.is_delete);
+                EXPECT_FALSE(column.is_array);
+                if (column.is_delete || column.is_array)
+                    continue;
+                if (column.data.tensor_count != 1 || column.data.tensors == nullptr ||
+                    column.data.tensors[0].data == nullptr || column.data.tensors[0].shape == nullptr)
                 {
-                    ADD_FAILURE() << "value row " << dataRow << " outside the tensor";
+                    ADD_FAILURE() << "value column without a payload tensor";
                     continue;
                 }
-                rows->push_back(FloatRow{ group.attribute, covered[i], values[dataRow] });
+                const DLTensor& tensor = column.data.tensors[0];
+                const auto* values = reinterpret_cast<const float*>(
+                    static_cast<const uint8_t*>(tensor.data) + tensor.byte_offset);
+                for (size_t i = 0; i < covered.size(); ++i)
+                {
+                    if (column.data.mask && !(column.data.mask[i / 64] & (uint64_t{ 1 } << (i % 64))))
+                        continue;
+                    const size_t dataRow = column.data.index_map ? column.data.index_map[i] : i;
+                    if (dataRow >= static_cast<size_t>(tensor.shape[0]))
+                    {
+                        ADD_FAILURE() << "value row " << dataRow << " outside the tensor";
+                        continue;
+                    }
+                    rows->push_back(FloatRow{ column.attribute, covered[i], values[dataRow] });
+                }
             }
         });
         std::sort(rows->begin(), rows->end());

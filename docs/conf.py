@@ -73,6 +73,15 @@ extensions = [
     "filtered_literalinclude",
 ]
 
+# Extra extensions supplied by the surrounding repository's tooling (for example
+# maintainers' consistency checks). A plain source checkout sets neither variable
+# and builds with the list above only.
+_extra_extension_paths = os.environ.get("OVSTAGE_DOCS_EXTRA_EXTENSIONS_PATH", "")
+for _extra_path in filter(None, _extra_extension_paths.split(os.pathsep)):
+    sys.path.insert(0, os.path.abspath(_extra_path))
+_extra_extensions = os.environ.get("OVSTAGE_DOCS_EXTRA_EXTENSIONS", "")
+extensions += [_name.strip() for _name in _extra_extensions.split(",") if _name.strip()]
+
 # -- Options for Breathe (C API documentation) -------------------------------
 breathe_projects = {"ovstage": "_doxygen/xml"}
 breathe_default_project = "ovstage"
@@ -298,5 +307,22 @@ def convert_markdown_codeblocks(app, what, name, obj, options, lines):
     lines.extend(result)
 
 
+# -- Hide builtin type docstrings on bare constants ---------------------------
+def drop_builtin_type_docstrings(app, what, name, obj, options, lines):
+    """Blank the body of a ``data`` entry whose only docstring is its type's.
+
+    A plain ``int``/``str`` constant has no docstring of its own, so autodoc falls
+    back to ``type(obj).__doc__`` and every such constant would render the
+    ``int(...)`` / ``str(...)`` help text. Show just the name and value instead; a
+    ``#:`` doc comment or attribute docstring on the assignment is kept.
+    """
+    if what != "data" or type(obj).__module__ != "builtins":
+        return
+    type_doc = (type(obj).__doc__ or "").strip().splitlines()
+    if type_doc and lines and lines[0].strip() == type_doc[0].strip():
+        lines.clear()
+
+
 def setup(app):
     app.connect("autodoc-process-docstring", convert_markdown_codeblocks)
+    app.connect("autodoc-process-docstring", drop_builtin_type_docstrings)

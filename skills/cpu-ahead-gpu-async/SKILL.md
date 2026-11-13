@@ -77,7 +77,7 @@ Resolve inputs in this order: existing repository files and referenced snippets,
    `wait_op` (or `fetch_*` with a timeout) when you actually need a result. This pipelines work
    but does not guarantee concurrent backend execution.
 6. Before submitting an operation that overlaps the same canonical attribute and prim paths, release fetched
-   read groups with `release_group` and finish active maps with `unmap_*`. If a read overlaps a
+   read groups with `release_groups` and finish active maps with `unmap_*`. If a read overlaps a
    pending write, wait for the write, then retry the read.
 7. Release op-tracking state with `ovstage_release_op` once an op is known complete.
 8. When changing code, run the narrow example/test that exercises the op whenever practical.
@@ -115,13 +115,15 @@ This skill has no scripts.
   versions instead of rejecting. Do not confuse this policy with genuine contract-level failures
   such as write-floor violations, INSERT conflicts, schema mismatches, or a map whose layout
   actually changed.
-- **Current-value payloads:** this build retains only the current committed payload. A
+- **Current-value payloads:** the default `history_latest` implementation retains only the current committed payload. A
   change-range consumer may let its *start* lag down to the frontier reported by
   `ovstage_get_oldest_preserved_ordinal`. The requested *end* cannot lag: a snapshot or
   change range returns `OUT_OF_RANGE` if a selected `(attribute, path)` has a recorded
   change after that end, and a snapshot selects every queried path. If newer values are
-  acceptable, use end `UINT64_MAX` (Python: `(1 << 64) - 1`) to request current values;
+  acceptable, use end `OVSTAGE_ORDINAL_MAX` (Python: `ovstage.ORDINAL_MAX`) to request current values;
   a selected unsealed change still returns `WRITE_FLOOR_VIOLATION`.
+  For retained earlier values, opt into experimental
+  [selective history](../../docs/scene/reading_attributes.rst#earlier-values-of-selected-pairs).
 
 ## Overview
 

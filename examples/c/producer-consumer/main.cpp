@@ -25,9 +25,13 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <map>
+#include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -60,7 +64,17 @@ static const size_t kDeletedSensor = 2;
 static const int64_t kScalarShape[] = { 1 };
 static const int64_t kScalarStrides[] = { 1 };
 
-// State shared by both roles: the instance, the interned attribute token, the
+// Concurrent mode (--threads) only. Its overlap phase runs at the sealed
+// ordinal kOverlapTick: the consumer keeps that tick's temperature read group
+// borrowed while the producer updates S0's "humidity" -- an unrelated
+// attribute, created before the threads start -- at the next ordinal.
+// kWatchdog is a diagnostic timeout for the coordination waits (waiting for
+// the peer); it is not a process-wide execution deadline.
+static const int kOverlapTick = 3;
+static const size_t kHumiditySensor = 0;
+static const std::chrono::seconds kWatchdog(30);
+
+// State shared by both roles: the instance, the interned attribute tokens, the
 // consumer's query over all four sensors, and one single-prim query per sensor
 // so each producer tick can target just its subset.
 struct Example
@@ -68,23 +82,33 @@ struct Example
     ovstage_instance_t* stage = nullptr;
     path_dictionary_instance_t* dict = nullptr;
     ovx_token_t temperature = OVX_INVALID_TOKEN;
+    ovx_token_t humidity = OVX_INVALID_TOKEN; // written only by the concurrent mode's overlap phase
     ovstage_query_handle_t allQuery = OVSTAGE_INVALID_QUERY_HANDLE;
-    ovstage_query_handle_t sensorQueries[kSensorCount] = {};
+    ovstage_query_handle_t sensorQueries[kSensorCount] = {
+        OVSTAGE_INVALID_QUERY_HANDLE, OVSTAGE_INVALID_QUERY_HANDLE,
+        OVSTAGE_INVALID_QUERY_HANDLE, OVSTAGE_INVALID_QUERY_HANDLE
+    };
 };
 
 // Non-exiting sibling of waitOp: drive the op to completion and report any
-// failure, but RETURN it instead of exiting. In --threads mode a producer
-// write can be rejected when it overlaps an outstanding consumer read (an
-// expected race under load), and the failing role -- EITHER role -- must
-// coordinate a shutdown with its peer thread: std::exit from one thread would
-// tear the process down under the other's blocking ovstage wait. Both roles'
-// ovstage calls therefore route through this and tryCheck below.
+// failure, but RETURN it instead of exiting. In --threads mode a failure in
+// EITHER role must coordinate a shutdown with the peer thread: std::exit from
+// one thread would tear the process down under the other's blocking ovstage
+// wait. Both roles' ovstage calls therefore route through this and tryCheck
+// below.
 static bool tryWaitOp(ovstage_instance_t* stage, ovstage_enqueue_result_t enq, const char* what)
 {
     if (enq.status != OVSTAGE_OK)
     {
-        std::fprintf(stderr, "ovstage %s failed (code %u): %s\n", what, enq.status,
-                     ovstage_get_error_string(stage, enq.status));
+        // A synchronous rejection leaves its detail in the thread-local
+        // last-error slot, valid until the next API call on this thread.
+        const ovx_string_t detail = ovstage_get_last_error();
+        if (detail.ptr && detail.length)
+            std::fprintf(stderr, "ovstage %s failed (code %u): %.*s\n", what, enq.status, (int)detail.length,
+                         detail.ptr);
+        else
+            std::fprintf(stderr, "ovstage %s failed (code %u): %s\n", what, enq.status,
+                         ovstage_get_error_string(stage, enq.status));
         return false;
     }
     ovstage_op_wait_result_t wait{};
@@ -93,7 +117,7 @@ static bool tryWaitOp(ovstage_instance_t* stage, ovstage_enqueue_result_t enq, c
     {
         const ovx_string_t e = ovstage_get_last_op_error(stage, wait.error_op_ids[i]);
         std::fprintf(stderr, "ovstage %s op %llu failed: %.*s\n", what,
-                     (unsigned long long)wait.error_op_ids[i], (int)e.length, e.ptr ? e.ptr : "");
+                     (unsigned long long)wait.error_op_ids[i].raw_id, (int)e.length, e.ptr ? e.ptr : "");
     }
     ovstage_release_op(stage, enq.op_index);
     if (code != OVSTAGE_OK)
@@ -196,7 +220,7 @@ static bool runProducerTick(const Example& ex, int tick)
 // policy; the handle is released either way.
 static bool fetchGlobalFloor(ovstage_instance_t* stage, ovstage_ordinal_t* outFloor)
 {
-    ovx_string_or_token_t globalAttr{}; // token 0 + empty string selects the global floor
+    ovx_token_or_string_t globalAttr{}; // token 0 + empty string selects the global floor
     ovstage_ordinal_query_handle_t handle = OVSTAGE_INVALID_ORDINAL_QUERY_HANDLE;
     ovstage_enqueue_result_t enq = ovstage_get_attribute_write_floor(stage, globalAttr, &handle);
     if (!tryWaitOp(stage, enq, "get_attribute_write_floor"))
@@ -210,13 +234,8 @@ static bool fetchGlobalFloor(ovstage_instance_t* stage, ovstage_ordinal_t* outFl
 // [/snippet:poll-write-floor]
 
 // [snippet:consume-delta]
-// Resolve the local-th prim of a read group to its display name (the last
-// path component, "S0".."S3"). The list-relative position is
-// prims.index_map[local] when an index_map is present, else
-// prims.offset + local; the group's list handle is the query's pinned copy
-// (not necessarily the query's own path-list handle), so look the path id up
-// in the group's list, then decompose it into its name tokens and resolve the
-// last one.
+/// Return the display name (S0..S3) for the local-th prim in a valid read group, using ex.dict to resolve its path.
+/// Apply prims.index_map when present, otherwise prims.offset + local, and look up the path in the group's own list.
 static std::string sensorName(const Example& ex, const ovstage_prim_group_t& prims, uint32_t local)
 {
     const uint32_t listIndex = prims.index_map ? prims.index_map[local] : prims.offset + local;
@@ -236,8 +255,7 @@ static std::string sensorName(const Example& ex, const ovstage_prim_group_t& pri
     checkOvx(ex.dict, ovxResult, "get_tokens_from_paths");
     if (numProcessed == 0 || numTokens[0] == 0 || !tokensPerPath[0])
     {
-        std::fprintf(stderr, "could not decompose a prim path into tokens\n");
-        std::exit(EXIT_FAILURE);
+        fail("could not decompose a prim path into tokens");
     }
     ovx_string_t name{};
     ovxResult = path_dictionary_get_strings_from_tokens(ex.dict, &tokensPerPath[0][numTokens[0] - 1], 1, &name);
@@ -257,13 +275,46 @@ struct DeltaGroup
     std::vector<float> values; // one per covered prim; empty for a tombstone group
 };
 
+// Copy one fetched group into application-owned storage. The value row for
+// the local-th prim honors data.index_map when present. Copying is what lets
+// the caller release the group promptly: a borrowed group blocks every
+// overlapping write for as long as it is held.
+static bool copyGroup(const Example& ex, const ovstage_read_group_t& group, DeltaGroup* out)
+{
+    if (group.column_count != 1 || !group.columns)
+    {
+        std::fprintf(stderr, "single-attribute read returned an unexpected column layout\n");
+        return false;
+    }
+    const ovstage_read_column_t& column = group.columns[0];
+    out->ordinal = column.ordinal;
+    out->isDelete = column.is_delete;
+    out->names.clear();
+    out->values.clear();
+    for (uint32_t local = 0; local < group.prims.count; ++local)
+        out->names.push_back(sensorName(ex, group.prims, local));
+    if (column.is_delete)
+        return true;
+    if (column.data.tensor_count != 1 || !column.data.tensors[0].data)
+    {
+        std::fprintf(stderr, "unexpected read-group layout (want one tensor row per covered prim)\n");
+        return false;
+    }
+    const float* cells = static_cast<const float*>(column.data.tensors[0].data);
+    for (uint32_t local = 0; local < group.prims.count; ++local)
+    {
+        const uint32_t row = column.data.index_map ? column.data.index_map[local] : local;
+        out->values.push_back(cells[row]);
+    }
+    return true;
+}
+
 // Range-read [startOrdinal, endOrdinal] over all four sensors and return the
-// fetched groups as-is in outGroups. The EXPLICIT-BEGIN range makes it a
+// fetched groups, copied, in outGroups. The EXPLICIT-BEGIN range makes it a
 // delta ("what changed since startOrdinal - 1"); an open begin would be a
 // snapshot read. Each fetched group covers the prims that changed in the
 // range for one attribute. If a selected (attribute, path) changed again after
-// endOrdinal, the read returns OUT_OF_RANGE. The value row for the local-th
-// prim honors data.index_map when present.
+// endOrdinal, the read returns OUT_OF_RANGE.
 // Returns false on a failed op (already reported) so the caller decides the
 // policy; the group and read handles are released either way.
 static bool consumeDelta(const Example& ex, ovstage_ordinal_t startOrdinal, ovstage_ordinal_t endOrdinal,
@@ -282,8 +333,10 @@ static bool consumeDelta(const Example& ex, ovstage_ordinal_t startOrdinal, ovst
     bool ok = true;
     for (;;)
     {
+        size_t fetchedGroupCount = 0;
         ovstage_read_group_t group{};
-        const ovstage_api_status_t fetch = ovstage_fetch_read_next(ex.stage, read, OVSTAGE_TIMEOUT_INFINITE, &group);
+        const ovstage_api_status_t fetch =
+            ovstage_fetch_read_next(ex.stage, read, OVSTAGE_TIMEOUT_INFINITE, &group, 1, &fetchedGroupCount);
         if (fetch == OVSTAGE_ERROR_END_OF_ITERATION)
             break;
         ok = tryCheck(ex.stage, fetch, "fetch_read_next");
@@ -291,31 +344,11 @@ static bool consumeDelta(const Example& ex, ovstage_ordinal_t startOrdinal, ovst
             break;
 
         DeltaGroup rows;
-        rows.ordinal = group.ordinal;
-        rows.isDelete = group.is_delete;
-        for (uint32_t local = 0; local < group.prims.count; ++local)
-            rows.names.push_back(sensorName(ex, group.prims, local));
-        if (!group.is_delete)
-        {
-            if (group.data.tensor_count != 1 || !group.data.tensors[0].data)
-            {
-                std::fprintf(stderr, "unexpected read-group layout (want one tensor row per covered prim)\n");
-                ok = false; // shut down like any failed op: the group still gets released below
-            }
-            else
-            {
-                const float* cells = static_cast<const float*>(group.data.tensors[0].data);
-                for (uint32_t local = 0; local < group.prims.count; ++local)
-                {
-                    const uint32_t row = group.data.index_map ? group.data.index_map[local] : local;
-                    rows.values.push_back(cells[row]);
-                }
-            }
-        }
+        ok = copyGroup(ex, group, &rows); // on failure, shut down like any failed op: the group is still released
         if (ok)
             outGroups->push_back(rows);
-        const ovstage_api_status_t status = ovstage_release_group(ex.stage, &group);
-        ok = tryCheck(ex.stage, status, "release_group") && ok;
+        const ovstage_api_status_t status = ovstage_release_groups(ex.stage, &group, 1);
+        ok = tryCheck(ex.stage, status, "release_groups") && ok;
         if (!ok)
             break;
     }
@@ -324,10 +357,39 @@ static bool consumeDelta(const Example& ex, ovstage_ordinal_t startOrdinal, ovst
     return ok;
 }
 
-// One consumer catch-up (both catch-ups and the threaded consumer run this):
-// fetch the global floor; if it moved past last_seen, consume the delta
-// [last_seen + 1, floor] and advance the cursor. False means an op failed
-// and was already reported.
+// Example plumbing: report the range a catch-up covered, each copied group
+// (value or tombstone), and the batch size in prim changes.
+static void reportDelta(const std::vector<DeltaGroup>& groups, ovstage_ordinal_t floor, ovstage_ordinal_t lastSeen)
+{
+    std::printf("consumer: floor %llu, last_seen %llu -> reading delta [%llu, %llu]\n", (unsigned long long)floor,
+                (unsigned long long)lastSeen, (unsigned long long)(lastSeen + 1), (unsigned long long)floor);
+    uint32_t changes = 0;
+    for (const DeltaGroup& group : groups)
+    {
+        if (group.isDelete)
+        {
+            std::printf("  tombstone group (ordinal %lld):", (long long)group.ordinal);
+            for (size_t i = 0; i < group.names.size(); ++i)
+                std::printf(i ? ", %s" : " %s", group.names[i].c_str());
+            std::printf(" deleted\n");
+        }
+        else
+        {
+            std::printf("  value group (ordinal %lld):", (long long)group.ordinal);
+            for (size_t i = 0; i < group.names.size(); ++i)
+                std::printf(i ? ", %s = %.1f" : " %s = %.1f", group.names[i].c_str(), group.values[i]);
+            std::printf("\n");
+        }
+        changes += static_cast<uint32_t>(group.names.size());
+    }
+    std::printf("  delta batch: %u prim changes\n", changes);
+    std::printf("consumer: last_seen -> %llu\n", (unsigned long long)floor);
+}
+
+// One consumer catch-up (the deterministic mode runs this): fetch the global
+// floor; if it moved past last_seen, consume the delta [last_seen + 1, floor],
+// report it and advance the cursor. False means an op failed and was already
+// reported.
 static bool consumerCatchUp(const Example& ex, ovstage_ordinal_t* lastSeen)
 {
     ovstage_ordinal_t floor = 0;
@@ -339,32 +401,7 @@ static bool consumerCatchUp(const Example& ex, ovstage_ordinal_t* lastSeen)
     std::vector<DeltaGroup> groups;
     if (!consumeDelta(ex, *lastSeen + 1, floor, &groups))
         return false;
-
-    // Example plumbing: report the range this catch-up covered, each fetched
-    // group (value or tombstone), and the batch size in prim changes.
-    std::printf("consumer: floor %llu, last_seen %llu -> reading delta [%llu, %llu]\n", (unsigned long long)floor,
-                (unsigned long long)*lastSeen, (unsigned long long)(*lastSeen + 1), (unsigned long long)floor);
-    uint32_t changes = 0;
-    for (const DeltaGroup& group : groups)
-    {
-        if (group.isDelete)
-        {
-            std::printf("  tombstone group (ordinal %llu):", (unsigned long long)group.ordinal);
-            for (size_t i = 0; i < group.names.size(); ++i)
-                std::printf(i ? ", %s" : " %s", group.names[i].c_str());
-            std::printf(" deleted\n");
-        }
-        else
-        {
-            std::printf("  value group (ordinal %llu):", (unsigned long long)group.ordinal);
-            for (size_t i = 0; i < group.names.size(); ++i)
-                std::printf(i ? ", %s = %.1f" : " %s = %.1f", group.names[i].c_str(), group.values[i]);
-            std::printf("\n");
-        }
-        changes += static_cast<uint32_t>(group.names.size());
-    }
-    std::printf("  delta batch: %u prim changes\n", changes);
-    std::printf("consumer: last_seen -> %llu\n", (unsigned long long)floor);
+    reportDelta(groups, floor, *lastSeen);
 
     *lastSeen = floor; // the consumer's cursor: the next catch-up starts at floor + 1
     return true;
@@ -372,59 +409,366 @@ static bool consumerCatchUp(const Example& ex, ovstage_ordinal_t* lastSeen)
 // [/snippet:consume-delta]
 
 // [snippet:threaded-producer-consumer]
+// Shared state of the concurrent mode (--threads); see runThreaded. `guard`
+// protects the temperature access scope -- an application choice for this
+// example's four-sensor access set, not a stage-wide requirement -- and
+// `progress` publishes the newest sealed tick. `failed` is set by whichever role fails; fail() wakes every
+// waiter so both roles shut down. The one-time overlap phase has its own lock
+// (the consumer holds `guard` while it waits for the unrelated write) plus the
+// observed order of its steps.
+struct Coordination
+{
+    std::mutex guard;
+    std::condition_variable progress;
+    ovstage_ordinal_t published = 0; // newest sealed tick
+    bool done = false;               // the producer finished
+    std::atomic<bool> failed{ false };
+
+    std::mutex phaseMutex;
+    std::condition_variable phaseCv;
+    bool readHeld = false;        // the consumer borrowed the overlap-phase read
+    bool humidityWritten = false; // the producer's unrelated write completed
+    std::vector<std::string> events;
+
+    void fail()
+    {
+        // Flag first and wake the phase waiters without the guard: the consumer
+        // holds the guard while it waits for the unrelated write, so taking it
+        // first would delay the shutdown until its watchdog expired. The brief
+        // guard acquisition before notifying `progress` serializes with the
+        // consumer's predicate check, so that wake-up cannot be lost.
+        failed = true;
+        {
+            std::lock_guard<std::mutex> lock(phaseMutex);
+            readHeld = humidityWritten = true; // wake a waiter of either phase step; it re-checks `failed`
+        }
+        phaseCv.notify_all();
+        {
+            std::lock_guard<std::mutex> lock(guard);
+        }
+        progress.notify_all();
+    }
+
+    void finish()
+    {
+        {
+            std::lock_guard<std::mutex> lock(guard);
+            done = true;
+        }
+        progress.notify_all();
+    }
+};
+
+static bool writeUnrelatedWhileReadHeld(const Example& ex, Coordination& co, int tick);
+static bool consumeDeltaHoldingRead(const Example& ex, Coordination& co, ovstage_ordinal_t startOrdinal,
+                                    ovstage_ordinal_t endOrdinal, std::vector<DeltaGroup>* outGroups);
+static bool checkThreadedResults(Coordination& co, const std::map<std::string, float>& latest,
+                                 const std::set<std::string>& deleted);
+
 // Concurrent mode (--threads): producer and consumer run on the SAME instance
 // from two threads -- every ovstage_api slot is thread-safe when called on a
-// shared instance (see the Thread Safety section in ovstage_api.h). The
-// consumer reads change membership only through a floor it fetched. A pending
-// overlapping write makes the read fail with OP_FAILED. Once committed, a later
-// change to the same selected (attribute, path) after the requested end makes
-// the read fail with OUT_OF_RANGE whether or not that later change is sealed. A
-// selected in-range unsealed change instead reports WRITE_FLOOR_VIOLATION. When
-// no overlap rejection occurs, only the batching varies, which is why this
-// mode's output is not part of the expected-output block. This demo treats any
-// race failure as terminal: a stalled floor would hang the consumer, so either
-// role flags the failure and both shut down.
+// shared instance (see the Thread Safety section in ovstage_api.h). Both roles
+// touch the "temperature" column, so the example coordinates the accesses that
+// conflict instead of discovering them through rejected submissions: a write
+// that overlaps a borrowed read group is rejected, and a payload that a newer
+// write replaced cannot be read back at an older ordinal.
+//  * The producer holds the guard across a tick's temperature writes (or the
+//    delete) and the floor advance that seals them, then publishes the tick.
+//  * The consumer waits for a tick newer than its cursor and holds the guard
+//    from polling the floor through reading the delta, copying every value
+//    and tombstone, and releasing every group and the read handle; it reports
+//    the copies outside the guard. A lagging consumer simply reads a larger
+//    interval. The normal loop needs no per-tick acknowledgment: the producer
+//    may publish several ticks before a catch-up and keeps writing while the
+//    consumer processes its copies; conflicting accesses wait for the guard.
+//  * The overlap phase shows what does NOT conflict: while the consumer holds
+//    the temperature read group of kOverlapTick, the producer writes S0's
+//    pre-created humidity outside the guard, and that write completes. It is
+//    an ordinary value update to a pre-existing, disjoint attribute; adding an
+//    attribute or deleting a prim would be a broader structural change.
+// A failure on either side wakes the other and the run exits nonzero. kWatchdog
+// is a diagnostic timeout for the coordination waits, not a process-wide
+// execution deadline. Batching varies run to run, which is why this mode's
+// output is not part of the expected-output block.
 static bool runThreaded(const Example& ex)
 {
-    std::atomic<bool> failed{ false };
+    Coordination co;
+    {
+        // Pre-create the overlap phase's unrelated attribute before the threads
+        // start: adding a column is a structural change that conflicts with
+        // every borrowed read of the prim, while updating an existing value does
+        // not.
+        float initial = 0.0f;
+        DLTensor tensor = cpuFloatTensor(&initial, kScalarShape, kScalarStrides, 1);
+        ovstage_write_data_t write = writeData(&tensor);
+        ovstage_enqueue_result_t enq = ovstage_write_attribute(ex.stage, ex.sensorQueries[kHumiditySensor],
+                                                               { ex.humidity, {} }, 1, write, OVSTAGE_PRIM_MODE_UPSERT);
+        if (!tryWaitOp(ex.stage, enq, "write_attribute"))
+            return false;
+    }
+
     std::thread producer(
-        [&ex, &failed]
+        [&ex, &co]
         {
-            for (int tick = 1; tick <= kTickCount && !failed; ++tick)
+            for (int tick = 1; tick <= kTickCount && !co.failed; ++tick)
             {
-                if (!runProducerTick(ex, tick))
+                if (tick == kOverlapTick + 1 && !writeUnrelatedWhileReadHeld(ex, co, tick))
                 {
-                    failed = true; // flag first: the consumer polls this
+                    co.fail();
                     std::fprintf(stderr, "producer failed: stopping both roles\n");
+                    co.finish();
                     return;
                 }
-                // The producer's "own rate": stall between ticks so catch-ups interleave.
+                bool ok;
+                {
+                    // The tick's writes and the floor advance that seals them are
+                    // one protected interval.
+                    std::lock_guard<std::mutex> lock(co.guard);
+                    ok = !co.failed && runProducerTick(ex, tick);
+                    if (ok)
+                        co.published = static_cast<ovstage_ordinal_t>(tick);
+                }
+                co.progress.notify_all();
+                if (!ok)
+                {
+                    co.fail();
+                    std::fprintf(stderr, "producer failed: stopping both roles\n");
+                    co.finish();
+                    return;
+                }
+                // The producer's "own rate": stall between ticks; the consumer may lag several ticks.
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
+            co.finish();
         });
 
+    std::map<std::string, float> latest; // sensor name -> the latest value the consumer copied
+    std::set<std::string> deleted;       // sensor names the consumer saw as tombstones
     ovstage_ordinal_t lastSeen = 0;
-    while (lastSeen < static_cast<ovstage_ordinal_t>(kTickCount) && !failed)
+    for (;;)
     {
-        if (!consumerCatchUp(ex, &lastSeen))
+        std::vector<DeltaGroup> groups;
+        ovstage_ordinal_t floor = 0;
+        const ovstage_ordinal_t before = lastSeen;
+        bool ok = true;
+        bool finished = false;
         {
-            failed = true; // flag first: the producer polls this between ticks
+            std::unique_lock<std::mutex> lock(co.guard);
+            if (!co.progress.wait_for(lock, kWatchdog,
+                                      [&] { return co.published > lastSeen || co.done || co.failed; }))
+            {
+                std::fprintf(stderr, "consumer: no producer progress for %lld s\n", (long long)kWatchdog.count());
+                ok = false;
+            }
+            else if (co.failed || co.published <= lastSeen)
+            {
+                finished = true; // the producer failed (already reported), or finished and the final interval is drained
+            }
+            else
+            {
+                // Under the guard: the floor cannot move between the poll and the
+                // read, and no write can touch the borrowed groups.
+                ok = fetchGlobalFloor(ex.stage, &floor) &&
+                     (floor == static_cast<ovstage_ordinal_t>(kOverlapTick) ?
+                          consumeDeltaHoldingRead(ex, co, lastSeen + 1, floor, &groups) :
+                          consumeDelta(ex, lastSeen + 1, floor, &groups));
+                if (ok)
+                    lastSeen = floor;
+            }
+        }
+        if (!ok)
+        {
+            co.fail(); // flag first: the producer polls this between ticks
             std::fprintf(stderr, "consumer failed: stopping both roles\n");
             break;
         }
-        if (lastSeen < static_cast<ovstage_ordinal_t>(kTickCount))
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        if (finished)
+            break;
+        reportDelta(groups, floor, before); // outside the guard: the producer may write meanwhile
+        for (const DeltaGroup& group : groups)
+        {
+            for (size_t i = 0; i < group.names.size(); ++i)
+            {
+                if (group.isDelete)
+                {
+                    deleted.insert(group.names[i]);
+                    latest.erase(group.names[i]);
+                }
+                else
+                {
+                    latest[group.names[i]] = group.values[i];
+                }
+            }
+        }
     }
     producer.join();
-    return !failed;
+    if (co.failed)
+        return false;
+    return checkThreadedResults(co, latest, deleted);
 }
 // [/snippet:threaded-producer-consumer]
+
+// Producer side of the overlap phase. Wait until the consumer has borrowed the
+// temperature read group of kOverlapTick, then update S0's humidity at `tick`
+// (kOverlapTick + 1) OUTSIDE the guard and wait for the write to complete.
+// humidity is a different column that already exists on S0, so the write does
+// not overlap the borrowed read: the runtime admits and completes it while that
+// read is held.
+static bool writeUnrelatedWhileReadHeld(const Example& ex, Coordination& co, int tick)
+{
+    {
+        std::unique_lock<std::mutex> lock(co.phaseMutex);
+        if (!co.phaseCv.wait_for(lock, kWatchdog, [&] { return co.readHeld; }))
+        {
+            std::fprintf(stderr, "producer: the consumer did not borrow the overlap-phase read within %lld s\n",
+                         (long long)kWatchdog.count());
+            return false;
+        }
+    }
+    if (co.failed)
+        return false;
+    float value = 55.0f;
+    DLTensor tensor = cpuFloatTensor(&value, kScalarShape, kScalarStrides, 1);
+    ovstage_write_data_t write = writeData(&tensor);
+    ovstage_enqueue_result_t enq =
+        ovstage_write_attribute(ex.stage, ex.sensorQueries[kHumiditySensor], { ex.humidity, {} },
+                                static_cast<ovstage_ordinal_t>(tick), write, OVSTAGE_PRIM_MODE_UPSERT);
+    if (!tryWaitOp(ex.stage, enq, "write_attribute"))
+        return false;
+    {
+        std::lock_guard<std::mutex> lock(co.phaseMutex);
+        co.events.push_back("humidity_written");
+        co.humidityWritten = true;
+    }
+    co.phaseCv.notify_all();
+    return true;
+}
+
+// Consumer side of the overlap phase: consumeDelta, except that the fetched
+// groups stay borrowed while the producer completes the unrelated humidity
+// write. The borrowed temperature payload must be unchanged by it; only then
+// are the groups released.
+static bool consumeDeltaHoldingRead(const Example& ex, Coordination& co, ovstage_ordinal_t startOrdinal,
+                                    ovstage_ordinal_t endOrdinal, std::vector<DeltaGroup>* outGroups)
+{
+    ovstage_ordinal_range_t delta{};
+    delta.start_ordinal = startOrdinal;
+    delta.end_ordinal = endOrdinal;
+    delta.has_start_ordinal = true;
+
+    ovstage_read_handle_t read = OVSTAGE_INVALID_READ_HANDLE;
+    ovstage_enqueue_result_t enq = ovstage_read_attributes(ex.stage, ex.allQuery, &ex.temperature, 1, delta, &read);
+    if (!tryWaitOp(ex.stage, enq, "read_attributes"))
+        return false;
+
+    std::vector<ovstage_read_group_t> held;
+    std::vector<DeltaGroup> before;
+    bool ok = true;
+    for (;;)
+    {
+        size_t fetchedBatchCount = 0;
+        ovstage_read_group_t group{};
+        const ovstage_api_status_t fetch = ovstage_fetch_read_next(ex.stage, read, OVSTAGE_TIMEOUT_INFINITE,
+            &group, 1, &fetchedBatchCount);
+        if (fetch == OVSTAGE_ERROR_END_OF_ITERATION)
+            break;
+        ok = tryCheck(ex.stage, fetch, "fetch_read_next");
+        if (!ok)
+            break;
+        held.push_back(group);
+        DeltaGroup rows;
+        ok = copyGroup(ex, group, &rows);
+        if (!ok)
+            break;
+        before.push_back(rows);
+    }
+    if (ok)
+    {
+        {
+            std::lock_guard<std::mutex> lock(co.phaseMutex);
+            co.events.push_back("read_held");
+            co.readHeld = true;
+        }
+        co.phaseCv.notify_all();
+        std::unique_lock<std::mutex> lock(co.phaseMutex);
+        if (!co.phaseCv.wait_for(lock, kWatchdog, [&] { return co.humidityWritten; }))
+        {
+            std::fprintf(stderr, "consumer: the unrelated humidity write did not complete within %lld s\n",
+                         (long long)kWatchdog.count());
+            ok = false;
+        }
+        lock.unlock();
+        if (ok && co.failed)
+            ok = false; // the producer failed during the phase (already reported)
+    }
+    for (size_t i = 0; ok && i < held.size(); ++i)
+    {
+        DeltaGroup after;
+        ok = copyGroup(ex, held[i], &after);
+        if (ok && (after.names != before[i].names || after.values != before[i].values))
+        {
+            std::fprintf(stderr, "consumer: borrowed temperature payload changed under an unrelated write\n");
+            ok = false;
+        }
+    }
+    for (ovstage_read_group_t& group : held) // release every borrowed group, success or not
+        ok = tryCheck(ex.stage, ovstage_release_groups(ex.stage, &group, 1), "release_group") && ok;
+    if (ok)
+    {
+        std::lock_guard<std::mutex> lock(co.phaseMutex);
+        co.events.push_back("read_released");
+        *outGroups = before;
+    }
+    enq = ovstage_release_read(ex.stage, read);
+    ok = tryWaitOp(ex.stage, enq, "release_read") && ok;
+    return ok;
+}
+
+// Assert what the concurrent run must have observed: the overlap phase's order
+// (read held, unrelated write completed, read released) and the final state
+// (S2 deleted; S0, S1 and S3 at their tick-4 and tick-6 values).
+static bool checkThreadedResults(Coordination& co, const std::map<std::string, float>& latest,
+                                 const std::set<std::string>& deleted)
+{
+    const std::vector<std::string> expectedEvents = { "read_held", "humidity_written", "read_released" };
+    const std::map<std::string, float> expectedLatest = { { "S0", 40.0f }, { "S1", 61.0f }, { "S3", 63.0f } };
+    const std::set<std::string> expectedDeleted = { "S2" };
+    std::vector<std::string> events;
+    {
+        std::lock_guard<std::mutex> lock(co.phaseMutex);
+        events = co.events;
+    }
+    bool ok = true;
+    if (events != expectedEvents)
+    {
+        std::fprintf(stderr, "overlap phase out of order:");
+        for (const std::string& event : events)
+            std::fprintf(stderr, " %s", event.c_str());
+        std::fprintf(stderr, "\n");
+        ok = false;
+    }
+    if (latest != expectedLatest || deleted != expectedDeleted)
+    {
+        std::fprintf(stderr, "unexpected final state:");
+        for (const auto& entry : latest)
+            std::fprintf(stderr, " %s = %.1f", entry.first.c_str(), entry.second);
+        for (const std::string& name : deleted)
+            std::fprintf(stderr, " %s deleted", name.c_str());
+        std::fprintf(stderr, "\n");
+        ok = false;
+    }
+    if (ok)
+        std::printf("overlap phase: humidity on S%zu written at ordinal %d while the temperature read of ordinal %d "
+                    "was held; final state verified\n",
+                    kHumiditySensor, kOverlapTick + 1, kOverlapTick);
+    return ok;
+}
 
 int main(int argc, char** argv)
 {
     const bool threaded = (argc > 1) && (std::strcmp(argv[1], "--threads") == 0);
 
-    // ---- 1. setup: instance, temperature token, queries ----
+    // ---- 1. setup: instance, attribute tokens, queries ----
     ovstage_instance_desc_t desc{};
     desc.name = "example.producer-consumer";
     Example ex;
@@ -434,6 +778,9 @@ int main(int argc, char** argv)
 
     ovx_string_t attrName = literal_to_ovx_string("temperature");
     ovx_api_result_t ovxResult = path_dictionary_create_tokens_from_strings(ex.dict, &attrName, 1, &ex.temperature);
+    checkOvx(ex.dict, ovxResult, "intern-token");
+    ovx_string_t humidityName = literal_to_ovx_string("humidity");
+    ovxResult = path_dictionary_create_tokens_from_strings(ex.dict, &humidityName, 1, &ex.humidity);
     checkOvx(ex.dict, ovxResult, "intern-token");
 
     ovx_string_t sensorPaths[kSensorCount];

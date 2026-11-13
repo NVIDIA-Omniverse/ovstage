@@ -49,7 +49,7 @@ def test_clone_subtree_copies_values(stage):
                 read.wait()
                 group = read.fetch_next()
                 assert group is not None
-                assert float(np.array(group.array(0))[0]) == 42.0
+                assert float(np.array(group.columns[0].array(0))[0]) == 42.0
                 stage.release_group(group)
                 read.release().wait()
                 stage.release_query(target_query).wait()

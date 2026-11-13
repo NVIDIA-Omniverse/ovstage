@@ -75,7 +75,7 @@ save("data-model", "Attribute changes along an ordinal axis", [
 save("write-read", "Advancing the watermark from 9 to 10", [
     ("1. Writes at 10 complete · watermark remains at 9", ["mass", "velocities"], [9,9],
      [[(10,"3.0")],[(10,"v₃")]],
-     "A current read (end = UINT64_MAX) fails: their changes are beyond the watermark."),
+     "A current read (end = ORDINAL_MAX) fails: their changes are beyond the watermark."),
     ("2. Watermark advances to 10 →", ["mass", "velocities"], [10,10],
      [[(10,"3.0")],[(10,"v₃")]],
      "The same changes are now red. Read these values before later updates.")])
@@ -111,7 +111,7 @@ for index, (title, watermark, changes, latest, fixed) in enumerate(steps):
                 text(x+(STEP-18)/2, y+21, "2.0", 12, RED, "middle"),
                 f'<path d="M{x+8},{y+25} L{x+STEP-26},{y+5}" stroke="{RED}" stroke-width="1.5"/>']
     y = end-30
-    for x, label, result in [(24, "Current read (end = UINT64_MAX)", latest), (410, "Range read [10, 10]", fixed)]:
+    for x, label, result in [(24, "Current read (end = ORDINAL_MAX)", latest), (410, "Range read [10, 10]", fixed)]:
         out += [rect(x,y,366,82,"#f1f4f6",5),
                 text(x+12,y+22,label,14,weight="bold"),
                 *[text(x+12,y+46+18*i,line,13) for i,line in enumerate(result.split("\n"))]]
@@ -120,7 +120,7 @@ out += [text(24,top+8,"Filled rectangle: current value. Crossed outline: earlier
         text(24,top+32,"Red: at or below watermark. Green: beyond watermark. W = watermark.",13)]
 height=top+54
 (ROOT / "read-ranges.svg").write_text(f'''<svg xmlns="http://www.w3.org/2000/svg" width="800" height="{height}" viewBox="0 0 800 {height}" role="img" aria-labelledby="title">
-<title id="title">Current (end UINT64_MAX) and fixed-range reads of mass on /World/BodyA as writes and watermarks advance</title>
+<title id="title">Current (end ORDINAL_MAX) and fixed-range reads of mass on /World/BodyA as writes and watermarks advance</title>
 <!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION &amp; AFFILIATES. All rights reserved. -->
 <!-- SPDX-License-Identifier: LicenseRef-NvidiaProprietary -->
 <rect width="800" height="{height}" fill="white"/>

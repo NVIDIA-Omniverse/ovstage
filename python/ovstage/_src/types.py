@@ -19,10 +19,12 @@ import ctypes
 import operator
 import sys
 import warnings
+import weakref
 from dataclasses import dataclass, field
 from enum import IntEnum, IntFlag
 from typing import Any, Dict, FrozenSet, List, Optional, Sequence, Tuple, Type, Union
 
+from ..handles import OpId, PrimPathList, QueryHandle, Token
 from . import bindings as _b
 from .bindings import check_timeout  # defined there to avoid an import cycle with flush_log
 from .dlpack import DLDevice, DLDeviceType, DLTensor, ManagedDLTensor, dltensor_to_numpy
@@ -37,6 +39,8 @@ __all__ = [
     "PopulationDomain",
     "PrimPredicateKind",
     "PropertyPredicateKind",
+    "ExpressionKind",
+    "DeriveWhen",
     "AttributeSemantic",
     "Placement",
     "HierarchyRelation",
@@ -48,6 +52,7 @@ __all__ = [
     "Operation",
     "CloneOperation",
     "AttributeMeta",
+    "ReadColumn",
     "ReadGroup",
     "MapGroup",
     "QueryResult",
@@ -56,10 +61,21 @@ __all__ = [
     "HierarchyResult",
     "HierarchyComputationModelDesc",
     "WriteDesc",
+    "ORDINAL_MIN",
+    "ORDINAL_MAX",
     "TIMEOUT_INFINITE",
+    "POPULATION_THREAD_LIMIT_AUTO",
 ]
 
+ORDINAL_MIN = _b.OVSTAGE_ORDINAL_MIN
+"""Initial sealed empty floor; writes must be strictly above this minimum."""
+ORDINAL_MAX = _b.OVSTAGE_ORDINAL_MAX
+"""Largest representable ordinal; also the current-value read end."""
+
 TIMEOUT_INFINITE = _b.OVSTAGE_TIMEOUT_INFINITE
+POPULATION_THREAD_LIMIT_AUTO = _b.OVSTAGE_POPULATION_THREAD_LIMIT_AUTO
+""":attr:`StageConfig.population_thread_limit` value letting the runtime choose the thread count,
+up to the concurrency the process allows."""
 
 
 _UINT32_MAX = (1 << 32) - 1
@@ -67,23 +83,9 @@ _UINT64_MAX = (1 << 64) - 1
 _SIZE_T_MAX = (1 << (8 * ctypes.sizeof(ctypes.c_size_t))) - 1
 _INT32_MIN, _INT32_MAX = -(1 << 31), (1 << 31) - 1  # the ovstage C enums are int
 
-_ORDINAL_MAX = _UINT64_MAX  # ovstage_ordinal_t is uint64_t
-
-
 def check_ordinal(ordinal: int) -> int:
-    """Validate and normalize an ordinal to a ``uint64_t``-representable int.
-
-    C++ callers pass ``ovstage_ordinal_t`` (``uint64_t``), so an out-of-range value
-    is a compile-time/type error. Python passes through ctypes as ``c_uint64`` and
-    would silently wrap (both a negative value and one ``>= 2**64``); reject both
-    here instead so the wrap can never reach the C API.
-
-    Delegates to :func:`_check_unsigned`, so a float is rejected rather than
-    truncated. This used to be ``int(ordinal)``, which turned ``5.25`` into a real
-    write at ordinal ``5``. Truncation toward zero also defeated the sign check
-    below: ``-0.5`` normalized to ``0`` and never reached the negative branch.
-    """
-    return _check_unsigned(ordinal, _ORDINAL_MAX, "ordinal", "uint64")
+    """Normalize a signed int64 ordinal before ctypes can silently wrap it."""
+    return check_int64(ordinal, "ordinal")
 
 
 def _check_unsigned(value: int, maximum: int, name: str, ctype: str) -> int:
@@ -167,28 +169,21 @@ def check_mask(mask: Sequence[int]) -> List[int]:
     return _check_unsigned_sequence(mask, _UINT64_MAX, "mask words", "uint64")
 
 
-def check_token(token: int, name: str = "attribute") -> int:
-    """Validate an attribute token (``ovx_token_t``, ``uint64_t``).
-
-    Tokens are interned ids, so a wrong one names a different live attribute
-    rather than failing. ``int()`` here accepted a float and a ``str``; the token
-    also wrapped, so ``2**64`` addressed token ``0``.
-    """
-    return _check_unsigned(token, _UINT64_MAX, name, "uint64")
+def check_token(token, name: str = "attribute"):
+    """Require a token, rejecting raw integers and other handle kinds."""
+    return _b.ovx_token_t._require(token, name)
 
 
-def check_token_sequence(tokens: Sequence[int], name: str) -> List[int]:
-    """Validate a sequence of attribute tokens and materialize it for a C array."""
-    return _check_unsigned_sequence(tokens, _UINT64_MAX, name, "uint64")
+def check_token_sequence(tokens, name: str):
+    return [check_token(token, name) for token in tokens]
 
 
-def check_handle(handle: int, name: str) -> int:
-    """Validate an opaque handle or op id (``uint64_t``).
+def check_primpath(path, name: str = "primpath"):
+    return _b.ovx_primpath_t._require(path, name)
 
-    Handle ids come from one monotonic counter, so a truncated or wrapped handle
-    lands on a live neighbour instead of failing as invalid.
-    """
-    return _check_unsigned(handle, _UINT64_MAX, name, "uint64")
+
+def check_path_list(path_list, name: str = "path_list"):
+    return _b.ovx_primpath_list_t._require(path_list, name)
 
 
 def check_uint32(value: int, name: str) -> int:
@@ -231,7 +226,7 @@ def check_int32(value: int, name: str) -> int:
 
 
 def check_element_sizes(element_sizes: Sequence[int]) -> List[int]:
-    """Validate ``map_attribute`` per-element byte sizes (``size_t*``)."""
+    """Validate ``map_attribute`` per-prim element counts (``size_t*``)."""
     return _check_unsigned_sequence(element_sizes, _SIZE_T_MAX, "element_sizes entries", "size_t")
 
 
@@ -242,7 +237,7 @@ def check_domains(domains: int) -> int:
     ``ovstage_population_domain_t`` -- and the header calls it a bitmask to OR
     together, so the extra width is the contract's headroom for future domain
     bits. The runtime bit-tests the bits it knows and ignores the rest, so
-    there is no ``& ~PopulationDomain.ALL`` mask here: masking would re-narrow
+    there is no mask to the known domains here: masking would re-narrow
     exactly what ``uint32_t`` widened, and a wheel older than the loaded
     library would reject a domain that library implements.
 
@@ -253,10 +248,8 @@ def check_domains(domains: int) -> int:
     transient, because the domain set chosen at open governs every later
     ``apply_usd_*`` on the population state.
 
-    Note for Python 3.10: ``~PopulationDomain.PHYSICS`` is ``-3`` there (3.11+
-    gives ``1``), so it is now rejected rather than wrapped. Spell an exclusion
-    as ``PopulationDomain.ALL & ~PopulationDomain.PHYSICS``, which is ``1`` on
-    every supported interpreter.
+    Note for Python 3.10: ``~PopulationDomain.RENDERING`` is ``-2`` there (3.11+
+    gives ``0``), so it is rejected rather than wrapped.
     """
     return _check_unsigned(domains, _UINT32_MAX, "domains", "uint32")
 
@@ -438,6 +431,7 @@ class FilterOp(IntEnum):
     LE = 5
     GT = 6
     GE = 7
+    NOT_HAS = 8
 
 
 class PrimMode(IntEnum):
@@ -475,10 +469,17 @@ class Scope(IntEnum):
 
 
 class PopulationDomain(IntFlag):
+    """Coarse population domains (``ovstage_population_domain_t``). A bit that names no domain is
+    ignored; other data, such as physics, is populated through a :class:`population.Desc`'s
+    selectors.
+
+    ``RENDERING`` populates scene data for rendering with its transforms and hierarchy, including
+    transformable prims that carry no rendered data, whatever API schemas they apply. A populated
+    prim carries only the properties the domain handles; properties of other APIs, such as
+    physics, are populated only by a description that selects them."""
+
     NONE = 0
     RENDERING = 1 << 0
-    PHYSICS = 1 << 1
-    ALL = (1 << 0) | (1 << 1)
 
 
 class PrimPredicateKind(IntEnum):
@@ -507,6 +508,9 @@ class PrimPredicateKind(IntEnum):
     HAS_KIND = 15
     HAS_PURPOSE = 16
     HAS_METADATA = 17
+    IS_TARGETED_BY = 18
+    HAS_DESCENDANT = 19
+    IS_INSTANCE = 20
 
 
 class PropertyPredicateKind(IntEnum):
@@ -528,6 +532,41 @@ class PropertyPredicateKind(IntEnum):
     IS_RELATIONSHIP = 10
     IS_CUSTOM = 11
     IS_AUTHORED = 12
+    TARGETS = 13
+
+
+class ExpressionKind(IntEnum):
+    """How an ``ovstage_population_expression_t`` computes the value of a derived property.
+
+    See ``ovstage_population_expression.h`` for what each kind yields.
+    """
+
+    NONE = 0
+    NUMBER = 1
+    BOOL = 2
+    STAGE_METADATA = 3
+    UP_AXIS = 4
+    ADD = 5
+    SUBTRACT = 6
+    MULTIPLY = 7
+    DIVIDE = 8
+    RESOLVED_BOUND_MATERIAL = 9
+    RESOLVED_MATERIAL_BINDING_STRENGTH = 10
+    RESOLVED_MATERIAL_BINDING_PURPOSE = 11
+    RESOLVED_COLLECTION_MEMBERS = 12
+
+
+class DeriveWhen(IntEnum):
+    """Whether a derived property publishes on a prim, depending on whether the prim already has
+    the property it derives (``ovstage_population_derive_when_t``)."""
+
+    #: Always. The derived value replaces whatever the prim has.
+    ALWAYS = 0
+    #: Only where the prim authors no value for the property: no default or time samples for an
+    #: attribute, no targets for a relationship. A value block counts as no value.
+    WHEN_UNAUTHORED = 1
+    #: Only where the prim has no such property at all.
+    WHEN_ABSENT = 2
 
 
 class AttributeSemantic(IntEnum):
@@ -877,6 +916,8 @@ class StageConfig:
     The configuration is process-scoped. Configured stages may coexist when
     their concrete settings match; creating a stage with a conflicting setting
     while another stage is live raises :class:`OvstageError`.
+    :attr:`implementation` is the exception. It selects the implementation of
+    its own stage only.
     """
 
     runtime_default_hierarchy_computation_model: Optional[HierarchyComputationModel] = None
@@ -901,6 +942,85 @@ class StageConfig:
     :attr:`~ovstage.Stage.config` returns the original process configuration entries:
     an omitted entry remains ``None`` and explicit ``DEFAULT`` remains
     ``DEFAULT``, rather than reporting the resolved policy.
+    """
+
+    population_thread_limit: Optional[int] = None
+    """Maximum number of threads one population operation may use to read what its
+    selectors select, including the thread that runs it.
+
+    ``1`` reads serially, which is the default. ``N > 1`` allows up to ``N``
+    threads, and :data:`~ovstage.POPULATION_THREAD_LIMIT_AUTO` lets the runtime choose,
+    up to the concurrency the process allows. The runtime may use fewer threads than the
+    limit. Populated data does not depend on this setting.
+
+    The limit does not cover the rest of a population operation. Opening and composing
+    the USD stage and populating the rendering domain keep their own concurrency, so a
+    limit of ``1`` does not make a whole population operation single-threaded. Which
+    population work the limit covers may grow between releases.
+
+    ``None`` and ``0`` do not override the active process limit. A conflicting limit
+    raises :class:`OvstageError` until every initialization and stage reference has
+    been released. :attr:`~ovstage.Stage.config` reports the entry as given.
+    """
+
+    population_strict_resolution: Optional[bool] = None
+    """Strict USD resolution for wholesale populations — opens and repopulates
+    (``OVSTAGE_CONFIG_POPULATION_STRICT_RESOLUTION``).
+
+    ``True`` makes :func:`ovstage.population.open_usd`,
+    :func:`ovstage.population.open_usd_from_string` and
+    :func:`ovstage.population.repopulate_usd_with_desc` raise
+    :class:`OvstageError` (``OP_FAILED``) when USD composition reports
+    unresolved sublayer, reference, or payload asset paths, listing up to
+    three of the unresolved identifiers (plus a count of the rest) in the
+    message; ``False`` keeps the default
+    behavior (an aggregated warning on the ``omni.ovstage.population`` log
+    channel and a successful open). ``None`` leaves the active process
+    default untouched. Process-scoped like the other settings: a fresh
+    process defaults to ``False``.
+    """
+
+    implementation: Optional[str] = None
+    """The implementation of the library that creates this stage, by name.
+
+    The name goes into the ``implementation`` member of the instance
+    descriptor of ``ovstage_create_instance``, not into a process
+    configuration entry. Each implementation documents its name.
+    ``history_latest`` is the default. History is off: the stage keeps the
+    latest value of every cell, and a read returns it. The history selection
+    methods raise :class:`OvstageError` (``NOT_SUPPORTED``).
+    ``history_selective`` turns history on for the pairs the application
+    selects. :meth:`~ovstage.Stage.enable_history` selects the
+    ``(prim, attribute)`` pairs that retain their earlier sealed values, up to
+    :attr:`retention_window`. Every other cell keeps the latest value.
+    ``None`` and an empty name select the default implementation,
+    ``history_latest``. A name that no implementation of the library
+    registered makes the :class:`~ovstage.Stage` constructor raise
+    :class:`OvstageError` (``INVALID_ARGUMENT``). The rejected creation
+    acquires no process reference.
+
+    **Experimental.** The history selection API and the ``history_selective``
+    implementation are experimental. Their API, ABI and semantics can change
+    between releases without a deprecation period.
+
+    The selection is per stage. Two live stages in one process can use
+    different implementations. :attr:`~ovstage.Stage.config` reports the name
+    this stage was created with, and ``None`` when no name was given.
+    """
+
+    retention_window: Optional[int] = None
+    """Number of sealed ordinals retained for history-enabled attributes
+    (``OVSTAGE_CONFIG_RETENTION_WINDOW``). Valid values are 1 to
+    ``2**64 - 2``. A fresh process defaults to 4. It is a process setting that
+    existing stages never resize. It selects no implementation by itself. A
+    stage of ``history_selective`` (``implementation="history_selective"``)
+    reads it: the setting bounds the earlier sealed values that the pairs
+    selected with :meth:`~ovstage.Stage.enable_history` retain. A stage of
+    ``history_latest``, the default, keeps history off and ignores it.
+
+    **Experimental.** This setting, the history selection API and the
+    ``history_selective`` implementation are experimental. Their API, ABI and
+    semantics can change between releases without a deprecation period.
     """
 
 
@@ -984,7 +1104,7 @@ class WriteDesc:
     :meth:`Stage.write_attribute`.
     """
 
-    attribute: Union[int, str]
+    attribute: Union[Token, str]
     tensors: Any
     is_array: bool
     index_map: Optional[Sequence[int]] = None
@@ -1006,13 +1126,14 @@ class OrdinalRange:
     - ``OrdinalRange.between(start, end)`` selects queried attribute/path pairs
       with recorded changes in [start, end], including both ends.
 
-    This build stores only the current values. For each attribute, an unsealed
-    selected change at or before the end raises ``WRITE_FLOOR_VIOLATION``.
-    Otherwise, a recorded change after the end on a selected path raises
-    ``OUT_OF_RANGE``, whether that later change is sealed or not. Reads stop at
-    the first attribute that fails either check.
+    A stage of ``history_latest``, the default, keeps history off and stores
+    only the current values. For each attribute, an unsealed selected change
+    at or before the end raises
+    ``WRITE_FLOOR_VIOLATION``. Otherwise, a recorded change after the end on a
+    selected path raises ``OUT_OF_RANGE``, whether that later change is sealed
+    or not. Reads stop at the first attribute that fails either check.
 
-    Use ``(1 << 64) - 1`` as the end to request current values. That skips the
+    Use ``ORDINAL_MAX`` as the end to request current values. That skips the
     later-change check, but a selected unsealed change still raises
     ``WRITE_FLOOR_VIOLATION``. These checks use recorded change history.
     Snapshot reads of values without such history, including derived attributes
@@ -1042,6 +1163,17 @@ class OrdinalRange:
     may have been discarded, so success does not guarantee the earlier state.
     For example, a snapshot from before an attribute deletion may return no row
     for that attribute once its deletion history has been discarded.
+
+    On a stage of ``history_selective``
+    (``StageConfig(implementation="history_selective")``), history is on for
+    the pairs selected with :meth:`Stage.enable_history`. Those pairs are the
+    exception: they answer ``latest(N)`` with the value sealed at or before
+    ``N`` and answer a fixed range from retained history. Every other pair
+    keeps the rules above.
+
+    **Experimental.** The history selection API and the ``history_selective``
+    implementation are experimental. Their API, ABI and semantics can change
+    between releases without a deprecation period.
     """
 
     end_ordinal: int
@@ -1057,15 +1189,13 @@ class OrdinalRange:
         result is what makes every entry point converge on one check.
         """
         # C read_attributes rejects reversed ranges with INVALID_ARGUMENT
-        # (ReadInterface.cpp); ordinals are uint64_t on the C side.
+        # (ReadInterface.cpp); ordinals are int64_t on the C side.
         end = check_ordinal(self.end_ordinal)
         start = None
         if self.start_ordinal is not None:
             start = check_ordinal(self.start_ordinal)
             if start > end:
-                raise ValueError(
-                    f"start_ordinal ({self.start_ordinal}) must be <= end_ordinal ({self.end_ordinal})"
-                )
+                raise ValueError(f"start_ordinal ({self.start_ordinal}) must be <= end_ordinal ({self.end_ordinal})")
         return end, start
 
     @classmethod
@@ -1073,7 +1203,7 @@ class OrdinalRange:
         """Snapshot at ``end_ordinal`` for all queried paths.
 
         Despite the name, this does not return values written after
-        ``end_ordinal``; pass ``(1 << 64) - 1`` for current values. See
+        ``end_ordinal``; pass ``ORDINAL_MAX`` for current values. See
         :class:`OrdinalRange`.
         """
         check_ordinal(end_ordinal)
@@ -1099,9 +1229,9 @@ class OrdinalRange:
 
 @dataclass
 class Predicate:
-    """A single filter predicate. ``attribute`` may be an int token or a string."""
+    """A single filter predicate. ``attribute`` may be a Token or a string."""
 
-    attribute: Union[int, str]
+    attribute: Union[Token, str]
     op: FilterOp
     values: Sequence[str] = field(default_factory=tuple)
 
@@ -1125,7 +1255,7 @@ class Filter:
         keepalive.append(pred_array)
         for i, pred in enumerate(self.predicates):
             cpred = pred_array[i]
-            sot = _b.make_string_or_token(pred.attribute)
+            sot = _b.make_token_or_string(pred.attribute)
             cpred.attribute = sot
             keepalive.append(sot)  # keeps sot._string_ref alive
             # A truncated op picks a neighbouring FilterOp, so the query resolves
@@ -1170,22 +1300,20 @@ class Operation:
     # the only window in which per-op completion state can still be fetched.
     _on_complete = None
 
-    def __init__(self, stage, status: int, op_id: int, keepalive=None):
+    def __init__(self, stage, status: int, op_id: OpId, keepalive=None):
         # Normally both come straight from an enqueue result, but Operation is
         # public and directly constructible, and a truncated op_id waits on (and
         # releases) whichever live op that integer names.
         self._stage = stage
         self.status = check_int(status, "status")
-        self.op_id = check_handle(op_id, "op_id")
+        self.op_id = _b.ovstage_op_id_t(_b.ovstage_op_id_t._require(op_id, "op_id"))
         self._keepalive = keepalive  # holds input buffers alive until waited
         self._consumed = False
         # A rejected enqueue records its detail in the thread-local last-error
         # slot, which the next enqueue on this thread clears. Reading it lazily
         # at wait() time can therefore return a later operation's message, or
         # nothing at all. The enqueue has only just returned, so capture it now.
-        self._enqueue_error = (
-            self._stage._last_op_error(self.op_id) if self.status != _b.OVSTAGE_OK else None
-        )
+        self._enqueue_error = self._stage._last_op_error(self.op_id) if self.status != _b.OVSTAGE_OK else None
 
     @property
     def ok(self) -> bool:
@@ -1265,8 +1393,12 @@ class CloneOperation(Operation):
         print(report.prims_cloned)
     """
 
-    def __init__(self, stage, status: int, op_id: int, keepalive=None):
+    def __init__(self, stage, status: int, op_id: OpId, keepalive=None):
         super().__init__(stage, status, op_id, keepalive)
+        if not self.ok:
+            # The general last-error accessor can retain an older USD accessor error.
+            clone_error = str(stage._api.ovstage_get_last_op_error(stage._inst, self.op_id))
+            self._enqueue_error = clone_error or self._enqueue_error
         self._pending_report: Optional[CloneResult] = None
         self._result: Optional[CloneResult] = None
         self._error: Optional[OvstageError] = None
@@ -1338,8 +1470,8 @@ def _warn_dropped_resource(message: str) -> None:
             pass  # stderr gone (interpreter shutdown); nothing left to report through
 
 
-class _GroupBase:
-    """Shared accessors over the ``prims`` / ``data`` sub-structs of a group."""
+class _RawBase:
+    """Base for borrowed ctypes views."""
 
     def __init__(self, raw):
         self.raw = raw
@@ -1347,21 +1479,28 @@ class _GroupBase:
     def _check_live(self) -> None:
         """Hook for subclasses whose storage can be released out from under them."""
 
+class _PrimBase(_RawBase):
+    """Accessors over a group's shared ``prims`` sub-struct."""
+
     # prims -----------------------------------------------------------------
     @property
-    def prim_list(self) -> int:
-        return int(self.raw.prims.list)
+    def prim_list(self) -> PrimPathList:
+        self._check_live()
+        return _b.ovx_primpath_list_t(self.raw.prims.list)
 
     @property
     def prim_offset(self) -> int:
+        self._check_live()
         return int(self.raw.prims.offset)
 
     @property
     def prim_count(self) -> int:
+        self._check_live()
         return int(self.raw.prims.count)
 
     @property
     def has_prim_index_map(self) -> bool:
+        self._check_live()
         return bool(self.raw.prims.index_map)
 
     def prim_index(self, local: int) -> int:
@@ -1384,24 +1523,33 @@ class _GroupBase:
             return int(p.index_map[local])
         return int(p.offset) + local
 
-    # data ------------------------------------------------------------------
+class _DataBase(_RawBase):
+    """Accessors over a column/group ``data`` and ``meta`` sub-struct."""
+
+    def _dlpack_manager_context(self):
+        return self
+
     @property
     def tensor_count(self) -> int:
+        self._check_live()
         return int(self.raw.data.tensor_count)
 
     @property
     def data_count(self) -> int:
+        self._check_live()
         return int(self.raw.data.count)
 
     @property
     def has_data_index_map(self) -> bool:
+        self._check_live()
         return bool(self.raw.data.index_map)
 
     def data_row_index(self, local: int) -> int:
         """Resolve the data-tensor row index of the ``local``-th element.
 
-        Index-guarded before the range check, for the reason in
-        :meth:`prim_index`.
+        ``local`` must be an integer index into the logical group rows. Each
+        column resolves its own mapping; the result selects a row in a fixed-size
+        tensor or a per-row tensor for array-valued attributes.
         """
         self._check_live()
         local = check_int(local, "local")
@@ -1439,7 +1587,8 @@ class _GroupBase:
 
     def dlpack(self, index: int, *, readonly: bool = True) -> ManagedDLTensor:
         """DLPack-protocol view of tensor ``index`` for zero-copy exchange with
-        numpy / warp / torch / cupy: ``np.from_dlpack(group.dlpack(i))``.
+        numpy / warp / torch / cupy: ``np.from_dlpack(column.dlpack(i))`` or
+        ``np.from_dlpack(map_group.dlpack(i))``.
 
         Unlike :meth:`array` (CPU-only numpy), this also works for CUDA-resident
         tensors. The data is borrowed from ovstage and valid only until the owning
@@ -1454,25 +1603,106 @@ class _GroupBase:
         :class:`~ovstage.ManagedDLTensor`). Read and map shapes are exported as returned
         by the native API, including ``(N, 4, 4)`` for matrix4d.
         """
-        return ManagedDLTensor(self.tensor(index), manager_ctx=self, deleter_callback=None, readonly=readonly)
+        return ManagedDLTensor(
+            self.tensor(index), manager_ctx=self._dlpack_manager_context(), deleter_callback=None, readonly=readonly
+        )
 
     @property
     def meta(self) -> AttributeMeta:
+        self._check_live()
         return AttributeMeta(self.raw.meta)
 
 
-class ReadGroup(_GroupBase):
+class _GroupBase(_PrimBase, _DataBase):
+    """Shared prim and data accessors for the writable map result model."""
+
+
+class ReadColumn(_DataBase):
+    """One attribute column aligned to the rows of a :class:`ReadGroup`.
+
+    Tensor descriptors, data, and metadata are borrowed from the containing
+    group and become invalid when that group is released. Use
+    :meth:`data_row_index` independently for each column: two columns aligned to
+    the same logical prim row may use different physical tensor rows.
+    """
+
+    def __init__(self, raw, group: "ReadGroup"):
+        super().__init__(raw)
+        # A group owns its columns, so a strong reference back to the group would
+        # form a cycle and delay ReadGroup.__del__ (and its storage release) until
+        # cyclic GC. Borrow the owner instead. dlpack() below takes a deliberate
+        # strong keepalive for the lifetime of an exported producer.
+        self._group_ref = weakref.ref(group)
+
+    def _owning_group(self) -> "ReadGroup":
+        group = self._group_ref()
+        if group is None:
+            raise OvstageError(
+                _b.OVSTAGE_ERROR_INVALID_HANDLE,
+                "ReadColumn's owning ReadGroup no longer exists; its pinned storage is no longer valid",
+            )
+        return group
+
+    def _check_live(self) -> None:
+        self._owning_group()._check_live()
+
+    def _dlpack_manager_context(self):
+        group = self._owning_group()
+        group._check_live()
+        return group
+
+    def array(self, index: int):
+        """Zero-copy shaped read-only numpy view, borrowed until group release."""
+        tensor = self.tensor(index)
+        return dltensor_to_numpy(tensor, readonly=True).reshape(tensor.shape_tuple)
+
+    @property
+    def attribute(self) -> Token:
+        self._check_live()
+        return _b.ovx_token_t(self.raw.attribute)
+
+    @property
+    def semantic(self) -> Union[AttributeSemantic, int]:
+        """Authored interpretation of this attribute column's bytes."""
+        self._check_live()
+        value = int(self.raw.semantic)
+        try:
+            return AttributeSemantic(value)
+        except ValueError:
+            return value
+
+    @property
+    def ordinal(self) -> int:
+        self._check_live()
+        return int(self.raw.ordinal)
+
+    @property
+    def is_delete(self) -> bool:
+        self._check_live()
+        return bool(self.raw.is_delete)
+
+    @property
+    def is_array(self) -> bool:
+        """Whether this column carries array-valued attribute rows."""
+        self._check_live()
+        return bool(self.raw.is_array)
+
+
+class ReadGroup(_PrimBase):
     """A read result group (``ovstage_read_group_t``).
 
-    Valid until released via :meth:`Stage.release_group`. Exposes the attribute
-    token, semantic, ordinal, delete flag, prim grouping, and tensor data.
+    Valid until released via :meth:`Stage.release_group`. ``prims`` defines the
+    shared logical rows and :attr:`columns` contains the requested attributes
+    that are present on those rows. Logical row ``i`` names the same prim in
+    every column, while each :class:`ReadColumn` resolves its own physical value
+    row through :meth:`ReadColumn.data_row_index`.
 
     A group's pinned storage is an independent resource: it is reclaimed **only**
     by ``release_group``. Releasing the owning :class:`Read` does not reclaim it,
-    so a dropped group stays pinned for the life of the :class:`Stage` — and,
-    because the pin also holds the group's outstanding-read coverage, later writes
-    to the same attribute and prims keep failing with an "overlapping outstanding
-    read" error reported at the *write* site, far from the group that caused it.
+    so a live group that is not released stays pinned — and, because the pin also
+    holds the group's outstanding-read coverage, later writes to the same attribute
+    and prims keep failing with an "overlapping outstanding read" error reported at
+    the *write* site, far from the group that caused it.
 
     Use it as a context manager so the group is released even when an error
     interrupts processing. ``fetch_next()`` returns ``None`` at end of iteration,
@@ -1481,7 +1711,7 @@ class ReadGroup(_GroupBase):
         group = read.fetch_next()
         if group is not None:
             with group:
-                values = np.array(group.array(0))  # copy out to outlive the group
+                values = np.array(group.columns[0].array(0))
 
     or iterate, which only yields real groups::
 
@@ -1489,11 +1719,11 @@ class ReadGroup(_GroupBase):
             with group:
                 ...
 
-    If a group is dropped without release, :meth:`__del__` issues a best-effort
+    If a group is dropped without release, ``__del__`` issues a best-effort
     release and emits a :class:`ResourceWarning`; rely on the context manager (or
     an explicit :meth:`Stage.release_group`) rather than the finalizer. Note the
-    zero-copy views handed out by :meth:`array` / :meth:`tensor` point into that
-    pinned storage and must not outlive the release.
+    zero-copy views handed out by a column point into that pinned storage and
+    must not outlive the release.
     """
 
     def __init__(self, raw, stage=None):
@@ -1502,6 +1732,25 @@ class ReadGroup(_GroupBase):
         # stage there is no slot to release through, so the finalizer stays off.
         self._stage = stage
         self._released = False
+        column_count = int(raw.column_count)
+        if column_count and not raw.columns:
+            raise OvstageError(
+                _b.OVSTAGE_ERROR_INTERNAL,
+                "ReadGroup has a nonzero column count but no column array",
+            )
+        self._columns = tuple(ReadColumn(raw.columns[index], self) for index in range(column_count))
+
+    @property
+    def column_count(self) -> int:
+        """Number of attribute columns in this group (always at least one)."""
+        self._check_live()
+        return len(self._columns)
+
+    @property
+    def columns(self) -> Tuple[ReadColumn, ...]:
+        """Columns in requested attribute order after exact-token deduplication."""
+        self._check_live()
+        return self._columns
 
     @property
     def released(self) -> bool:
@@ -1536,8 +1785,7 @@ class ReadGroup(_GroupBase):
         if self._stage is None:
             raise OvstageError(
                 _b.OVSTAGE_ERROR_INVALID_HANDLE,
-                "ReadGroup was constructed without an owning Stage; release it via "
-                "Stage.release_group instead",
+                "ReadGroup was constructed without an owning Stage; release it via " "Stage.release_group instead",
             )
         self._stage.release_group(self)
 
@@ -1578,56 +1826,6 @@ class ReadGroup(_GroupBase):
             "Stage.release_group() explicitly — an unreleased group keeps failing later "
             "writes to the same prims with an 'overlapping outstanding read' error."
         )
-
-    def array(self, index: int):
-        """Zero-copy shaped, read-only numpy view of tensor ``index`` (CPU only).
-
-        The view **borrows** this group's storage and does not keep the group
-        alive: it is valid only while the group is, and the group is released by
-        :meth:`Stage.release_group`, by ``with`` exit, or by the finalizer once
-        the group becomes unreachable. Keep the group bound for as long as you
-        read through the view, and copy out (``np.array(...)``) anything that must
-        outlive it.
-        """
-        tensor = self.tensor(index)
-        return dltensor_to_numpy(tensor, readonly=True).reshape(tensor.shape_tuple)
-
-    @property
-    def attribute(self) -> int:
-        return int(self.raw.attribute)
-
-    @property
-    def semantic(self) -> Union[AttributeSemantic, int]:
-        """Authored interpretation of this attribute column's bytes.
-
-        Known values are returned as :class:`AttributeSemantic`. A value added
-        by a newer native library is returned as its raw integer so callers can
-        preserve it even when the installed Python enum does not yet name it.
-        """
-        value = int(self.raw.semantic)
-        try:
-            return AttributeSemantic(value)
-        except ValueError:
-            return value
-
-    @property
-    def ordinal(self) -> int:
-        """Informational ordinal of this group.
-
-        It may be above or below the requested end and does not, by itself,
-        prove which state the payload represents. See :class:`OrdinalRange`.
-        """
-        return int(self.raw.ordinal)
-
-    @property
-    def is_delete(self) -> bool:
-        return bool(self.raw.is_delete)
-
-    @property
-    def is_array(self) -> bool:
-        """Whether this result group carries array-valued attribute rows."""
-        return bool(self.raw.is_array)
-
 
 class MapGroup(_GroupBase):
     """A writable map group (``ovstage_map_group_t``).
@@ -1688,9 +1886,9 @@ class QueryResult:
     returning. Nothing here needs to be freed.
     """
 
-    attributes: List[int]
+    attributes: List[Token]
     total_prim_count: int
-    all_handle: int
+    all_handle: QueryHandle
     """The query's own handle, echoed back for convenience — *not* a second resource.
 
     It is the same value as :attr:`Query.handle`, included so a consumer handed only

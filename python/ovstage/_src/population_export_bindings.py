@@ -6,12 +6,15 @@
 # distribution of this software and related documentation without an express
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
-"""Raw ctypes layer for ovpopulation runtime -> USD export.
+"""Constants and type aliases of the export functions of the population family.
 
-This module is intentionally separate from ``bindings.py`` so the broad ovstage
-ctypes layout stays focused on the core data plane and USD population ingest.
-The export API is descriptor-heavy and changes on its own cadence, so its C
-struct mirrors and flat-symbol prototypes live here.
+The export functions that take a stage are the export members of the
+population family vtable, ``ovstage_population_vtable_t`` in ``bindings.py``.
+That module mirrors the export types of ``ovstage_population_types.h``: the
+destination handle, the rules, the descriptor and the report. This module
+holds the export constants, re-exports the export types under their C names,
+and binds the prototypes of the descriptor initializers, the flat exports of
+the export functions.
 """
 
 import ctypes
@@ -21,11 +24,8 @@ from . import bindings as _core
 
 ovstage_api_status_t = _core.ovstage_api_status_t
 ovstage_ordinal_t = _core.ovstage_ordinal_t
-ovstage_instance_p = _core.ovstage_instance_p
-ovx_string_t = _core.ovx_string_t
 ovstage_population_op_id_t = _core.ovstage_population_op_id_t
-ovstage_timeout_ns_t = _core.ovstage_timeout_ns_t
-ovstage_population_enqueue_result_t = _core.ovstage_population_enqueue_result_t
+ovx_string_t = _core.ovx_string_t
 
 OVSTAGE_OK = _core.OVSTAGE_OK
 OVSTAGE_ERROR_NOT_SUPPORTED = _core.OVSTAGE_ERROR_NOT_SUPPORTED
@@ -76,133 +76,37 @@ OVSTAGE_POPULATION_EXPORT_METADATA_LAYER_STANDARD = 3
 
 OVSTAGE_POPULATION_EXPORT_DESTINATION_EMPTY = 0
 OVSTAGE_POPULATION_EXPORT_DESTINATION_OPEN_EXISTING = 1
-OVSTAGE_POPULATION_EXPORT_INVALID_DESTINATION_HANDLE = 0
+OVSTAGE_POPULATION_EXPORT_INVALID_DESTINATION_HANDLE = _core.OVSTAGE_POPULATION_EXPORT_INVALID_DESTINATION_HANDLE
 
 
+# The export types of ovstage_population_types.h. ``bindings.py`` defines the
+# mirrors, because the export members of ``ovstage_population_vtable_t`` name
+# them. The names below are the C names.
 ovstage_population_prim_predicate_t = _core.ovstage_population_prim_predicate_t
 ovstage_population_property_predicate_t = _core.ovstage_population_property_predicate_t
-ovstage_population_export_destination_handle_t = ctypes.c_uint64
-
-
-class ovstage_population_export_attribute_rule_t(ctypes.Structure):
-    _fields_ = [
-        ("path", ovx_string_t),
-        ("path_match", ctypes.c_int),
-        ("source_attribute_name", ovx_string_t),
-        ("source_attribute_name_match", ctypes.c_int),
-        ("destination_attribute_name", ovx_string_t),
-        ("usd_type_name", ovx_string_t),
-        ("required_schema_name", ovx_string_t),
-        ("flags", ctypes.c_uint32),
-    ]
-
-
-class ovstage_population_export_prim_rule_t(ctypes.Structure):
-    _fields_ = [
-        ("path", ovx_string_t),
-        ("path_match", ctypes.c_int),
-        ("usd_type_name", ovx_string_t),
-        ("unknown_type_metadata_key", ovx_string_t),
-    ]
-
-
-class ovstage_population_export_api_schema_rule_t(ctypes.Structure):
-    _fields_ = [
-        ("path", ovx_string_t),
-        ("path_match", ctypes.c_int),
-        ("schema_name", ovx_string_t),
-        ("instance_name", ovx_string_t),
-        ("flags", ctypes.c_uint32),
-    ]
-
-
-class ovstage_population_export_property_edge_rule_t(ctypes.Structure):
-    _fields_ = [
-        ("path", ovx_string_t),
-        ("path_match", ctypes.c_int),
-        ("source_property_name", ovx_string_t),
-        ("destination_property_name", ovx_string_t),
-        ("usd_type_name", ovx_string_t),
-        ("property_kind", ctypes.c_int),
-        ("flags", ctypes.c_uint32),
-    ]
-
-
-class ovstage_population_export_metadata_rule_t(ctypes.Structure):
-    _fields_ = [
-        ("path", ovx_string_t),
-        ("path_match", ctypes.c_int),
-        ("source_metadata_name", ovx_string_t),
-        ("destination_metadata_name", ovx_string_t),
-        ("metadata_kind", ctypes.c_int),
-        ("flags", ctypes.c_uint32),
-    ]
-
-
-class ovstage_population_export_desc_t(ctypes.Structure):
-    _fields_ = [
-        ("struct_size", ctypes.c_uint32),
-        ("source_api_schema_policy", ctypes.c_int),
-        ("projection", ctypes.c_int),
-        ("ordinal", ovstage_ordinal_t),
-        ("since_ordinal", ovstage_ordinal_t),
-        ("selection", ctypes.c_int),
-        ("layer_mode", ctypes.c_int),
-        ("transform_policy", ctypes.c_int),
-        ("unknown_metadata_policy", ctypes.c_int),
-        ("prim_predicate", ovstage_population_prim_predicate_t),
-        ("property_predicate", ovstage_population_property_predicate_t),
-        ("prim_rules", ctypes.POINTER(ovstage_population_export_prim_rule_t)),
-        ("prim_rule_count", ctypes.c_size_t),
-        ("api_schema_rules", ctypes.POINTER(ovstage_population_export_api_schema_rule_t)),
-        ("api_schema_rule_count", ctypes.c_size_t),
-        ("attribute_rules", ctypes.POINTER(ovstage_population_export_attribute_rule_t)),
-        ("attribute_rule_count", ctypes.c_size_t),
-        ("property_rules", ctypes.POINTER(ovstage_population_export_property_edge_rule_t)),
-        ("property_rule_count", ctypes.c_size_t),
-        ("metadata_rules", ctypes.POINTER(ovstage_population_export_metadata_rule_t)),
-        ("metadata_rule_count", ctypes.c_size_t),
-    ]
-
-
-class ovstage_population_export_report_t(ctypes.Structure):
-    _fields_ = [
-        ("prims_examined", ctypes.c_size_t),
-        ("prims_exported", ctypes.c_size_t),
-        ("prims_skipped", ctypes.c_size_t),
-        ("attributes_examined", ctypes.c_size_t),
-        ("attributes_exported", ctypes.c_size_t),
-        ("attributes_skipped", ctypes.c_size_t),
-        ("attributes_unsupported", ctypes.c_size_t),
-        ("api_schemas_examined", ctypes.c_size_t),
-        ("api_schemas_applied", ctypes.c_size_t),
-        ("api_schemas_skipped", ctypes.c_size_t),
-        ("custom_attributes_inferred", ctypes.c_size_t),
-        ("unknown_metadata_preserved", ctypes.c_size_t),
-        ("transforms_examined", ctypes.c_size_t),
-        ("transforms_exported", ctypes.c_size_t),
-        ("property_edges_examined", ctypes.c_size_t),
-        ("property_edges_exported", ctypes.c_size_t),
-        ("property_edges_skipped", ctypes.c_size_t),
-        ("property_edges_unsupported", ctypes.c_size_t),
-        ("metadata_examined", ctypes.c_size_t),
-        ("metadata_exported", ctypes.c_size_t),
-        ("metadata_skipped", ctypes.c_size_t),
-        ("metadata_unsupported", ctypes.c_size_t),
-        ("source_states_unavailable", ctypes.c_size_t),
-    ]
+ovstage_population_export_destination_handle_t = _core.ovstage_population_export_destination_handle_t
+ovstage_population_export_attribute_rule_t = _core.ovstage_population_export_attribute_rule_t
+ovstage_population_export_prim_rule_t = _core.ovstage_population_export_prim_rule_t
+ovstage_population_export_api_schema_rule_t = _core.ovstage_population_export_api_schema_rule_t
+ovstage_population_export_property_edge_rule_t = _core.ovstage_population_export_property_edge_rule_t
+ovstage_population_export_metadata_rule_t = _core.ovstage_population_export_metadata_rule_t
+ovstage_population_export_desc_t = _core.ovstage_population_export_desc_t
+ovstage_population_export_report_t = _core.ovstage_population_export_report_t
 
 
 _configured_lib: Optional[ctypes.CDLL] = None
 
 
 def configure_prototypes(lib: ctypes.CDLL) -> None:
-    """Set argtypes/restype for ovstage population export flat symbols."""
+    """Set argtypes/restype for the export descriptor initializers.
+
+    These are the flat exports of the export functions. The export functions
+    that take a stage are the export members of the population family vtable.
+    """
     global _configured_lib
     if _configured_lib is lib:
         return
 
-    inst = ovstage_instance_p
     err = ovstage_api_status_t
     if hasattr(lib, "ovstage_population_export_desc_init"):
         lib.ovstage_population_export_desc_init.argtypes = [ctypes.POINTER(ovstage_population_export_desc_t)]
@@ -213,116 +117,6 @@ def configure_prototypes(lib: ctypes.CDLL) -> None:
                 ovstage_ordinal_t,
             ]
             lib.ovstage_population_export_desc_init_snapshot.restype = err
-        if hasattr(lib, "ovstage_population_export_to_usd_layer_identifier"):
-            lib.ovstage_population_export_to_usd_layer_identifier.argtypes = [
-                inst,
-                ovx_string_t,
-                ctypes.POINTER(ovstage_population_export_desc_t),
-                ctypes.POINTER(ovstage_population_export_report_t),
-            ]
-            lib.ovstage_population_export_to_usd_layer_identifier.restype = err
-        if hasattr(lib, "ovstage_population_export_to_usd_stage_identifier"):
-            lib.ovstage_population_export_to_usd_stage_identifier.argtypes = [
-                inst,
-                ovx_string_t,
-                ctypes.POINTER(ovstage_population_export_desc_t),
-                ctypes.POINTER(ovstage_population_export_report_t),
-            ]
-            lib.ovstage_population_export_to_usd_stage_identifier.restype = err
-        if hasattr(lib, "ovstage_population_export_destination_create"):
-            lib.ovstage_population_export_destination_create.argtypes = [
-                inst,
-                ovx_string_t,
-                ctypes.c_int,
-                ctypes.POINTER(ovstage_population_export_destination_handle_t),
-            ]
-            lib.ovstage_population_export_destination_create.restype = err
-        if hasattr(lib, "ovstage_population_export_to_destination"):
-            lib.ovstage_population_export_to_destination.argtypes = [
-                inst,
-                ovstage_population_export_destination_handle_t,
-                ctypes.POINTER(ovstage_population_export_desc_t),
-                ctypes.POINTER(ovstage_population_export_report_t),
-            ]
-            lib.ovstage_population_export_to_destination.restype = err
-        if hasattr(lib, "ovstage_population_export_destination_save"):
-            lib.ovstage_population_export_destination_save.argtypes = [
-                inst,
-                ovstage_population_export_destination_handle_t,
-            ]
-            lib.ovstage_population_export_destination_save.restype = err
-        if hasattr(lib, "ovstage_population_export_destination_destroy"):
-            lib.ovstage_population_export_destination_destroy.argtypes = [
-                inst,
-                ovstage_population_export_destination_handle_t,
-            ]
-            lib.ovstage_population_export_destination_destroy.restype = err
-        if hasattr(lib, "ovstage_population_export_to_usd_file"):
-            lib.ovstage_population_export_to_usd_file.argtypes = [
-                inst,
-                ovx_string_t,
-                ctypes.POINTER(ovstage_population_export_desc_t),
-                ctypes.POINTER(ovstage_population_export_report_t),
-            ]
-            lib.ovstage_population_export_to_usd_file.restype = err
-
-    if hasattr(lib, "ovstage_population_export_enqueue_to_usd_layer_identifier"):
-        enqueue_layer = lib.ovstage_population_export_enqueue_to_usd_layer_identifier
-        enqueue_layer.argtypes = [
-            inst,
-            ovx_string_t,
-            ctypes.POINTER(ovstage_population_export_desc_t),
-        ]
-        enqueue_layer.restype = ovstage_population_enqueue_result_t
-    if hasattr(lib, "ovstage_population_export_enqueue_to_usd_stage_identifier"):
-        enqueue_stage_identifier = lib.ovstage_population_export_enqueue_to_usd_stage_identifier
-        enqueue_stage_identifier.argtypes = [
-            inst,
-            ovx_string_t,
-            ctypes.POINTER(ovstage_population_export_desc_t),
-        ]
-        enqueue_stage_identifier.restype = ovstage_population_enqueue_result_t
-    if hasattr(lib, "ovstage_population_export_destination_enqueue_create"):
-        enqueue_create = lib.ovstage_population_export_destination_enqueue_create
-        enqueue_create.argtypes = [
-            inst,
-            ovx_string_t,
-            ctypes.c_int,
-            ctypes.POINTER(ovstage_population_export_destination_handle_t),
-        ]
-        enqueue_create.restype = ovstage_population_enqueue_result_t
-    if hasattr(lib, "ovstage_population_export_enqueue_to_destination"):
-        enqueue_destination = lib.ovstage_population_export_enqueue_to_destination
-        enqueue_destination.argtypes = [
-            inst,
-            ovstage_population_export_destination_handle_t,
-            ctypes.POINTER(ovstage_population_export_desc_t),
-        ]
-        enqueue_destination.restype = ovstage_population_enqueue_result_t
-    if hasattr(lib, "ovstage_population_export_destination_enqueue_save"):
-        enqueue_save = lib.ovstage_population_export_destination_enqueue_save
-        enqueue_save.argtypes = [inst, ovstage_population_export_destination_handle_t]
-        enqueue_save.restype = ovstage_population_enqueue_result_t
-    if hasattr(lib, "ovstage_population_export_destination_enqueue_destroy"):
-        enqueue_destroy = lib.ovstage_population_export_destination_enqueue_destroy
-        enqueue_destroy.argtypes = [inst, ovstage_population_export_destination_handle_t]
-        enqueue_destroy.restype = ovstage_population_enqueue_result_t
-    if hasattr(lib, "ovstage_population_export_enqueue_to_usd_file"):
-        enqueue_file = lib.ovstage_population_export_enqueue_to_usd_file
-        enqueue_file.argtypes = [
-            inst,
-            ovx_string_t,
-            ctypes.POINTER(ovstage_population_export_desc_t),
-        ]
-        enqueue_file.restype = ovstage_population_enqueue_result_t
-    if hasattr(lib, "ovstage_population_export_wait_op"):
-        lib.ovstage_population_export_wait_op.argtypes = [
-            inst,
-            ovstage_population_op_id_t,
-            ovstage_timeout_ns_t,
-            ctypes.POINTER(ovstage_population_export_report_t),
-        ]
-        lib.ovstage_population_export_wait_op.restype = err
 
     _configured_lib = lib
 
@@ -334,7 +128,8 @@ def load() -> ctypes.CDLL:
 
 
 def available() -> bool:
+    """True when the loaded libovstage exports the export descriptor initializers."""
     try:
-        return hasattr(load(), "ovstage_population_export_to_usd_layer_identifier")
+        return hasattr(load(), "ovstage_population_export_desc_init")
     except Exception:  # noqa: BLE001 - library not loadable in this environment
         return False

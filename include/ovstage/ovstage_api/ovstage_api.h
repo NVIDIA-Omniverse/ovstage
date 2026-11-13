@@ -97,7 +97,7 @@
  *   flight.
  *
  * - **Result vs. handle lifetime.** Result payloads returned by `fetch_*`
- *   slots are released synchronously (`release_group`,
+ *   slots are released synchronously (`release_groups`,
  *   `release_query_result`) once the caller is done reading them.
  *   Persistent handles are released through per-handle-ordered `release_*`
  *   slots (those returning `ovstage_enqueue_result_t`): the release
@@ -111,8 +111,11 @@
  *
  * ## Thread Safety
  *
- * All slots are thread-safe when called on the same instance from multiple
- * threads. GPU synchronization between producer and consumer is the caller's
+ * All slots are thread-safe when called from multiple threads on the same live
+ * instance or on different live instances in the same process, including GPU
+ * hierarchy computation. Coordinate object lifetimes and sequence dependent
+ * operations explicitly; thread safety does not imply parallel execution.
+ * GPU synchronization between producer and consumer is the caller's
  * responsibility (cuda_sync-based coordination).
  *
  * ## Built-in Attributes (Metadata)
@@ -132,13 +135,12 @@
  * | `usd-children`      | path-id array  | Child prim paths               |
  *
  * `usd-prim-type`, `usd-schemas`, and `usd-ancestor-types` are recorded columns
- * and writable through the ordinary write contract (they read, filter with
+ * and writable through the ordinary write and map contracts (they read, filter with
  * `HAS`/`CONTAINS`, and support ordinal-range change reads like any recorded
- * column). Each lowers its assigned token(s) to Fabric prim-type / applied-schema
- * / ancestor-prim-type tags; a `usd-ancestor-types` (or `usd-schemas`) write
- * replaces the whole tag set for that role (adds the newly listed tags, drops the
- * rest). `usd-ancestor-types` and `usd-prim-type` are **independent** channels:
- * neither write touches the other's tags. The ancestor set is conceptually derived
+ * column). A `usd-ancestor-types` (or `usd-schemas`) write replaces the complete
+ * set of tokens for that column (adds the newly listed tokens, drops the rest).
+ * `usd-ancestor-types` and `usd-prim-type` are **independent** columns:
+ * neither write changes the other's values. The ancestor set is conceptually derived
  * from the prim type, so a caller that changes `usd-prim-type` is responsible for
  * writing the matching `usd-ancestor-types` (a stale ancestor set is not corrected
  * automatically). A typical replication writes both together. `usd-path`, `usd-parent`, and `usd-children`
@@ -151,10 +153,21 @@
  * requested end, and like query membership itself, the synthesized values
  * reflect the latest committed
  * structural state — they carry no ordinal-keyed payload history and are not
- * bounded by the write floor the way recorded-column reads are. They also
- * keep no per-write change stream, so a range ("since"/"between") read
- * reports them as never changed (zero groups) — poll current values with
- * snapshot reads instead. Prims without a value (a root prim's `usd-parent`,
+ * bounded by the write floor the way recorded-column reads are. `usd-parent`
+ * and `usd-children` also keep no per-write change stream, so a range
+ * ("since"/"between") read reports them as never changed (zero groups) — poll
+ * current values with snapshot reads instead. A range read of `usd-path` returns
+ * one tombstone group (`is_delete`) for the query prims whose latest creation
+ * or whole-prim delete in the range is a delete. A prim that is deleted and
+ * then created again in the range gives no tombstone. Exception: this range
+ * read is bounded by the write floor. It fails with
+ * OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION if the effective write floor of
+ * `usd-path` is less than `end_ordinal`, also when no prim changed above the
+ * floor. Reason: the read cannot see an outstanding prim creation or delete,
+ * so only the floor makes its result final. SCOPE_ALL, or SCOPE_INCLUDE that
+ * lists `usd-path`, advances this floor. A
+ * range read of `usd-path` does not return value groups for prims created in
+ * the range. Prims without a value (a root prim's `usd-parent`,
  * a leaf prim's `usd-children`) contribute no row to the read group. Path-id
  * and token-id payloads cross as `uint64` handles resolvable through the
  * shared path dictionary. Reading an attribute that no queried prim carries
@@ -166,7 +179,21 @@
  * table above for contract stability only and is subject to removal in a
  * future release.
  *
- * @version 0.3.0
+ * ## Attribute Selector Patterns and Reserved Names
+ *
+ * `read_attributes` accepts the selector patterns `*` and `prefix*` next to
+ * attribute names (refer to `read_attributes`). An attribute name that
+ * contains `*` is therefore reserved for read selection. Writes, maps,
+ * deletes, query filter predicates, query attribute lists,
+ * `advance_write_floor` (SCOPE_INCLUDE and SCOPE_EXCLUDE lists), and
+ * `get_attribute_write_floor` reject such a name with
+ * OVSTAGE_ERROR_INVALID_ARGUMENT. A rejected call does not change the stage.
+ * The rejection does not change the ownership rules of write tensors (refer
+ * to ovstage_write_data_t): write_attributes still takes the supplied
+ * managed tensors and releases each one exactly once.
+ * SCOPE_ALL does not use its attribute list, so it does not check the list.
+ *
+ * @version 0.4.0
  * @date 2026-05-27
  */
 
@@ -182,8 +209,8 @@ extern "C" {
 /* ═══════════════════════════════════════════════════════════════════════════════
  * Vtable
  *
- * Single combined vtable for the ovstage_api contract. Every slot
- * takes `ovstage_context_t* instance` as the first argument. Return type
+ * Single combined vtable for the ovstage_api contract. Every slot takes
+ * `ovstage_data_plane_context_t* context` as the first argument. Return type
  * is `ovstage_enqueue_result_t` for asynchronous enqueues, or
  * `ovstage_api_status_t` for synchronous calls. Diagnostics slots return
  * `void`, `const char*`, or `ovx_string_t` as noted on each slot.
@@ -199,7 +226,7 @@ extern "C" {
  *                                fetch_query_result, release_query_result,
  *                                release_query
  * - Read                   (4) : read_attributes, fetch_read_next,
- *                                release_group, release_read
+ *                                release_groups, release_read
  * - Write copy-in          (2) : write_attribute, write_attributes
  * - Mapped writes         (4) : map_attribute, fetch_map_next, unmap_group,
  *                                unmap_attribute
@@ -208,13 +235,16 @@ extern "C" {
  *                                get_last_op_error
  * - Resources              (1) : get_path_dictionary
  * - Extensions             (1) : query_extension
+ * - Subtree clone          (2) : clone, fetch_clone_result
  *
  * Device placement is not a vtable slot: it is the experimental
  * "ovstage.placement" extension, declared in
- * experimental/ovstage_placement_extension.h.
+ * experimental/ovstage_placement_extension.h. The subtree clone slots are
+ * appended after the released layout of 0.3: a clone is an ordinal-keyed
+ * write of the data plane, awaited through wait_op like every operation.
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
-struct ovstage_vtable_t
+struct ovstage_data_plane_vtable_t
 {
     /* ───────────────────────────────────────────────────────────────────────
      * Op tracking
@@ -245,10 +275,10 @@ struct ovstage_vtable_t
      * wait_op call on the same thread.
      */
     ovstage_api_status_t (*wait_op)(
-        ovstage_context_t*         instance,
-        ovstage_op_id_t            op_id,
-        ovstage_timeout_ns_t       timeout,
-        ovstage_op_wait_result_t*  out_wait_result);
+        ovstage_data_plane_context_t* context,
+        ovstage_op_id_t               op_id,
+        ovstage_timeout_ns_t          timeout,
+        ovstage_op_wait_result_t*     out_wait_result);
 
     /**
      * @brief Release tracking state associated with an op id (synchronous).
@@ -257,8 +287,8 @@ struct ovstage_vtable_t
      * the op id may not be used again with wait_op or get_last_op_error.
      */
     ovstage_api_status_t (*release_op)(
-        ovstage_context_t* instance,
-        ovstage_op_id_t    op_id);
+        ovstage_data_plane_context_t* context,
+        ovstage_op_id_t               op_id);
 
     /* ───────────────────────────────────────────────────────────────────────
      * Write-floor advance
@@ -281,12 +311,15 @@ struct ovstage_vtable_t
      * Advances clamp to the current value (max), so they never regress and a
      * non-monotonic ordinal is a no-op rather than an error.
      *
-     * @param instance Implementation context.
+     * With SCOPE_INCLUDE or SCOPE_EXCLUDE, a listed name that contains `*`
+     * fails with OVSTAGE_ERROR_INVALID_ARGUMENT (reserved for read selection).
+     *
+     * @param context The context of the data plane.
      * @param desc Write-floor advance descriptor.
      * @return Enqueue result with status + op_index.
      */
     ovstage_enqueue_result_t (*advance_write_floor)(
-        ovstage_context_t*                 instance,
+        ovstage_data_plane_context_t*      context,
         const ovstage_write_floor_desc_t*  desc);
 
     /* ───────────────────────────────────────────────────────────────────────
@@ -308,21 +341,25 @@ struct ovstage_vtable_t
      * change-membership frontier. Payload reads store only current values:
      * they return the current payload or tombstone, or
      * OVSTAGE_ERROR_OUT_OF_RANGE when a selected path changed after a
-     * requested end below UINT64_MAX.
+     * requested end below OVSTAGE_ORDINAL_MAX. The frontier also covers the retained
+     * history of prim creations and whole-prim deletes that `usd-path` range
+     * reads use, so these prim changes can raise it.
      */
     ovstage_enqueue_result_t (*get_oldest_preserved_ordinal)(
-        ovstage_context_t*              instance,
+        ovstage_data_plane_context_t*   context,
         ovstage_ordinal_query_handle_t* out_handle);
 
     /**
      * @brief Enqueue a query for the write floor of a specific attribute.
      *
      * Pass an empty attribute (`{.token = 0, .string = {NULL, 0}}`) to query
-     * the global write floor (minimum across all known attributes).
+     * the global write floor (minimum across all known attributes). A name
+     * that contains `*` fails with OVSTAGE_ERROR_INVALID_ARGUMENT (reserved
+     * for read selection).
      */
     ovstage_enqueue_result_t (*get_attribute_write_floor)(
-        ovstage_context_t*              instance,
-        ovx_string_or_token_t           attribute,
+        ovstage_data_plane_context_t*   context,
+        ovx_token_or_string_t           attribute,
         ovstage_ordinal_query_handle_t* out_handle);
 
     /**
@@ -333,7 +370,7 @@ struct ovstage_vtable_t
      *         OVSTAGE_ERROR_OP_FAILED if the underlying enqueue failed.
      */
     ovstage_api_status_t (*fetch_ordinal)(
-        ovstage_context_t*             instance,
+        ovstage_data_plane_context_t*  context,
         ovstage_ordinal_query_handle_t handle,
         ovstage_timeout_ns_t           timeout,
         ovstage_ordinal_t*             out_ordinal);
@@ -345,7 +382,7 @@ struct ovstage_vtable_t
      * same handle to complete before reclaiming resources.
      */
     ovstage_enqueue_result_t (*release_ordinal_query)(
-        ovstage_context_t*             instance,
+        ovstage_data_plane_context_t*  context,
         ovstage_ordinal_query_handle_t handle);
 
     /* ───────────────────────────────────────────────────────────────────────
@@ -366,14 +403,16 @@ struct ovstage_vtable_t
      *
      * The returned query handle is reserved synchronously. Reading the
      * discovered attribute list and total prim count requires a subsequent
-     * fetch_query_result call.
+     * fetch_query_result call. A filter predicate or an `attrs` entry with a
+     * name that contains `*` fails with OVSTAGE_ERROR_INVALID_ARGUMENT
+     * (reserved for read selection).
      */
     ovstage_enqueue_result_t (*query)(
-        ovstage_context_t*       instance,
-        const ovstage_filter_t*  filter,
-        const ovx_token_t*           attrs,
-        size_t                       attr_count,
-        ovstage_query_handle_t*  out_query_handle);
+        ovstage_data_plane_context_t* context,
+        const ovstage_filter_t*       filter,
+        const ovx_token_t*            attrs,
+        size_t                        attr_count,
+        ovstage_query_handle_t*       out_query_handle);
 
     /**
      * @brief Create a query handle from an explicit prim path list. Synchronous.
@@ -383,9 +422,9 @@ struct ovstage_vtable_t
      * immediately as input to any enqueue.
      */
     ovstage_api_status_t (*query_from_path_list)(
-        ovstage_context_t*       instance,
-        ovx_primpath_list_t          path_list,
-        ovstage_query_handle_t*  out_handle);
+        ovstage_data_plane_context_t* context,
+        ovx_primpath_list_t           path_list,
+        ovstage_query_handle_t*       out_handle);
 
     /**
      * @brief Fetch the result (discovered attributes + summary) of a prior
@@ -397,10 +436,10 @@ struct ovstage_vtable_t
      *         OVSTAGE_ERROR_OP_FAILED if the underlying enqueue failed.
      */
     ovstage_api_status_t (*fetch_query_result)(
-        ovstage_context_t*       instance,
-        ovstage_query_handle_t   query_handle,
-        ovstage_timeout_ns_t     timeout,
-        ovstage_query_result_t*  out_result);
+        ovstage_data_plane_context_t* context,
+        ovstage_query_handle_t        query_handle,
+        ovstage_timeout_ns_t          timeout,
+        ovstage_query_result_t*       out_result);
 
     /**
      * @brief Release a query result payload (synchronous).
@@ -410,7 +449,7 @@ struct ovstage_vtable_t
      * release_query.
      */
     ovstage_api_status_t (*release_query_result)(
-        ovstage_context_t*            instance,
+        ovstage_data_plane_context_t* context,
         const ovstage_query_result_t* result);
 
     /**
@@ -421,8 +460,8 @@ struct ovstage_vtable_t
      * reclaiming resources.
      */
     ovstage_enqueue_result_t (*release_query)(
-        ovstage_context_t*       instance,
-        ovstage_query_handle_t   handle);
+        ovstage_data_plane_context_t* context,
+        ovstage_query_handle_t        handle);
 
     /* ───────────────────────────────────────────────────────────────────────
      * Read
@@ -436,55 +475,183 @@ struct ovstage_vtable_t
      * OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION. A read whose requested values are no
      * longer available fails with OVSTAGE_ERROR_OUT_OF_RANGE. A range that
      * selects nothing succeeds with no groups. See ovstage_ordinal_range_t.
+     * A range read with a selector pattern (`*` or `prefix*`) has two more
+     * checks that are not scoped to the selected keys: the global write floor
+     * and the retention frontier (refer to read_attributes).
      * ─────────────────────────────────────────────────────────────────────── */
 
     /**
      * @brief Enqueue a multi-attribute read.
      *
+     * Each entry of `attrs` is an attribute selector:
+     *  - an attribute name, for example `points`, selects that attribute;
+     *  - `*` selects every attribute that the read can return, except the
+     *    hidden attributes (see below);
+     *  - a prefix followed by `*`, for example `primvars:*`, selects every
+     *    attribute whose name starts with the prefix, with the same exception.
+     *
+     * A pattern has exactly one `*`, as its last character. The match is case
+     * sensitive and uses the full attribute name. The `*` also matches an
+     * empty suffix. A selector with a `*` in a different position, or with
+     * more than one `*`, makes read_attributes return
+     * OVSTAGE_ERROR_INVALID_ARGUMENT.
+     *
+     * Each read finds the matching names again. Thus a read includes names
+     * that were written after the query was made, and the caller does not
+     * need a new query. A snapshot read matches the names that the query
+     * prims have now, and the names that have an unsealed change on the query
+     * prims. Thus an unsealed delete of a name fails the read with
+     * OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION until the floor of that name
+     * reaches the delete. With an end below OVSTAGE_ORDINAL_MAX, a snapshot read also
+     * matches the names that have a retained change or delete on the query
+     * prims after the end. Thus a name that a later delete removed fails the
+     * read with OVSTAGE_ERROR_OUT_OF_RANGE, as for an attribute name. The read
+     * does not leave out a name that the prims had at the end.
+     * A range read matches the names that have a retained change or delete
+     * on the query prims in the range.
+     *
+     * Order and duplicates:
+     *  - Explicit attribute names enter the selection first, in the order of
+     *    `attrs` after exact-token deduplication. Repeated names add no columns.
+     *  - Then come the names that the patterns add, sorted by name. The
+     *    position of a pattern in `attrs` has no effect on this order.
+     *  - A pattern does not add a name that the selection already has. Thus
+     *    overlapping patterns, and a pattern that matches an attribute name in
+     *    `attrs`, give each name one time.
+     *
+     * Hidden attributes: a name that starts with `_` or `usd-` is hidden,
+     * except `usd-path`. A pattern selects a hidden name only when the prefix
+     * of the pattern starts with the same namespace. Thus `*`, `u*`, and
+     * `usd*` do not select `usd-schemas`, but `usd-*` and `usd-s*` do. `*`
+     * does not select `_name`, but `_*` does. The rule applies to the
+     * start of the name only: `*` selects `points:usd-metadata:interpolation`.
+     * A read that gives a hidden name as an attribute name is not affected.
+     *
+     * Built-in attributes: patterns select them by name, with the rule above.
+     *  - A pattern that matches `usd-path` selects it. A snapshot read gives
+     *    the query prims. A range read gives the tombstones of the query prims
+     *    deleted whole in the range.
+     *  - A snapshot read with `usd-*` also selects `usd-parent`,
+     *    `usd-children`, `usd-prim-type`, `usd-schemas`, and
+     *    `usd-ancestor-types`. Each gives groups only for the query prims that
+     *    have a value. `usd-children` groups are ragged arrays.
+     *  - A range read with `usd-*` selects `usd-prim-type`, `usd-schemas`, and
+     *    `usd-ancestor-types` when they changed in the range, as any recorded
+     *    attribute. It never selects `usd-parent` or `usd-children`.
+     *  - A longer prefix, such as `usd-p*`, selects the built-ins that it
+     *    matches, with the same rules.
+     *  - Patterns never select `usd-active`.
+     *
+     * A pattern that matches no name gives zero groups. An empty `attrs`, or
+     * a query with no prims, also gives zero groups.
+     *
+     * A read with a pattern applies the checks of an attribute name to each
+     * matched name. It also has these checks:
+     *  - An outstanding write or delete on the query prims to a name that a
+     *    pattern matches fails the read with OVSTAGE_ERROR_OP_FAILED. This
+     *    includes a write that adds a new name.
+     *  - A range read fails with OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION while the
+     *    stage-wide floor is less than `end_ordinal`. This is true also when
+     *    every matched name has a higher floor. The reason: a pattern can
+     *    match a name that no prim has yet. That name has no floor of its
+     *    own, so only the stage-wide floor seals it. Advance the floor with
+     *    SCOPE_ALL before the read. SCOPE_INCLUDE, and SCOPE_EXCLUDE with a
+     *    non-empty list, do not advance the stage-wide floor. Do not use
+     *    get_attribute_write_floor with an empty attribute to check it: that
+     *    call can report a higher value.
+     *  - A range read fails with OVSTAGE_ERROR_OUT_OF_RANGE when
+     *    `start_ordinal` is less than ovstage_get_oldest_preserved_ordinal.
+     *    Records of deleted attributes below that value can be gone, so the
+     *    pattern could miss a name.
+     * The two range checks also apply when the query has no prims. When the
+     * selection has patterns and attribute names, the checks apply to the
+     * whole read.
+     *
      * @remark This implementation stores only current values. Later recorded
      * changes can make a requested snapshot or change range unavailable;
      * see ovstage_ordinal_range_t for the checks and limitations.
+     *
+     * @remark Current limits of selector patterns:
+     *  - A snapshot read with a pattern matches the names that the query prims
+     *    have now. `end_ordinal` does not limit these names. A matched name
+     *    with a recorded change or delete after an end below OVSTAGE_ORDINAL_MAX fails
+     *    the read with OVSTAGE_ERROR_OUT_OF_RANGE, as for an attribute name.
+     *  - `*` can return internal columns. It skips hidden names, but returns
+     *    all other names that a query result reports in `attributes`. A later
+     *    release can hide more names.
+     *  - A range read with a pattern does not find attributes of the RENDERING
+     *    population domain. The read finds names from change history, and
+     *    these attributes have none. A range read of the attribute name also
+     *    gives no groups for them.
+     *  - A range read gives no `usd-path` tombstone for a prim that the
+     *    RENDERING population domain removes.
+     *  - A pattern sees the two alias names of one stored column as different
+     *    names. After a write through one alias, a pattern that matches only
+     *    the other alias does not find the change. A read of either alias name
+     *    finds it. If both aliases changed in the range, a range read with a
+     *    pattern that matches both gives the same rows under each name.
      */
     ovstage_enqueue_result_t (*read_attributes)(
-        ovstage_context_t*       instance,
-        ovstage_query_handle_t   handle,
-        const ovx_token_t*           attrs,
-        size_t                       attr_count,
-        ovstage_ordinal_range_t  range,
-        ovstage_read_handle_t*   out_read_handle);
+        ovstage_data_plane_context_t* context,
+        ovstage_query_handle_t        handle,
+        const ovx_token_t*            attrs,
+        size_t                        attr_count,
+        ovstage_ordinal_range_t       range,
+        ovstage_read_handle_t*        out_read_handle);
 
     /**
-     * @brief Fetch the next read result group, with timeout.
+     * @brief Fetch up to capacity complete read groups.
      *
-     * @return OVSTAGE_OK on success,
-     *         OVSTAGE_ERROR_END_OF_ITERATION when no more groups,
-     *         OVSTAGE_ERROR_TIMEOUT if the next group is not ready
-     *         within timeout,
-     *         OVSTAGE_ERROR_OP_FAILED if the underlying enqueue failed. When a
-     *         deferred read is rejected, the producer's own status (for example
-     *         OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION or
-     *         OVSTAGE_ERROR_OUT_OF_RANGE) is reported once that producer has
-     *         completed; a fetch that is itself waiting on the producer reports
-     *         OVSTAGE_ERROR_OP_FAILED instead. Ready queries are validated at
-     *         enqueue and report the typed status from read_attributes.
+     * capacity must be positive; out_groups and out_count are required.
+     * A valid call sets *out_count to zero before waiting. Timeout applies only
+     * to the first group: return available groups without waiting to fill the
+     * array. OVSTAGE_OK delivers 1..capacity groups; only those slots are valid.
+     * A short batch does not imply completion. With no groups delivered, return
+     * OVSTAGE_ERROR_END_OF_ITERATION, OVSTAGE_ERROR_TIMEOUT, or the read's error.
+     * If group delivery fails after some groups have been delivered, return
+     * OVSTAGE_OK; the next fetch reports that error. A group-delivery failure
+     * is terminal for the read, including OUT_OF_MEMORY before any delivery:
+     * every later fetch returns the same error, never END_OF_ITERATION.
+     * release_read reclaims the undelivered groups. Timeouts and argument
+     * validation errors do not latch a group-delivery failure.
      *
-     * @post On OVSTAGE_OK, the group is independently valid until
-     *       release_group.
+     * Deferred producer failures retain the single-group contract: an already
+     * failed producer reports its own status; waiting on a producer that fails
+     * reports OVSTAGE_ERROR_OP_FAILED.
+     *
+     * Concurrent fetches on one read handle are safe and return disjoint
+     * groups. A short batch or deferred error may be observed on another
+     * thread; serialize fetches when one consumer must observe every group
+     * and the error. Each delivered group remains valid until release_groups,
+     * independently of later fetches or release_read. Copying a descriptor
+     * does not acquire another reference.
      */
     ovstage_api_status_t (*fetch_read_next)(
-        ovstage_context_t*       instance,
+        ovstage_data_plane_context_t*       instance,
         ovstage_read_handle_t    read_handle,
         ovstage_timeout_ns_t     timeout,
-        ovstage_read_group_t*    out_group);
+        ovstage_read_group_t*    out_groups,
+        size_t                   capacity,
+        size_t*                  out_count);
 
     /**
-     * @brief Release a read group's pinned storage (synchronous).
+     * @brief Release a batch of read groups' pinned storage (synchronous).
      *
-     * Thread-safe; groups can be released in any order from any thread.
+     * Groups must be distinct live acquisitions from this instance, and may
+     * come from different reads or fetches. Validate every ID before releasing
+     * any: invalid, duplicate, or already released IDs release nothing.
+     * A zero count succeeds and permits groups == NULL. A nonzero count
+     * requires an array. Release each acquisition exactly once.
+     *
+     * Thread-safe; independent groups may be released in any order from any
+     * thread. Do not concurrently release the same acquisition. The instance
+     * must outlive its groups. Release does not wait for consumer GPU work;
+     * callers must finish using all borrowed views before releasing them.
      */
-    ovstage_api_status_t (*release_group)(
-        ovstage_context_t*           instance,
-        const ovstage_read_group_t*  group);
+    ovstage_api_status_t (*release_groups)(
+        ovstage_data_plane_context_t*           instance,
+        const ovstage_read_group_t*  groups,
+        size_t                       group_count);
 
     /**
      * @brief Enqueue release of a read handle.
@@ -493,8 +660,8 @@ struct ovstage_vtable_t
      * call on the same handle to complete before reclaiming resources.
      */
     ovstage_enqueue_result_t (*release_read)(
-        ovstage_context_t*       instance,
-        ovstage_read_handle_t    read_handle);
+        ovstage_data_plane_context_t* context,
+        ovstage_read_handle_t         read_handle);
 
     /* ───────────────────────────────────────────────────────────────────────
      * Write (Copy-In)
@@ -530,6 +697,15 @@ struct ovstage_vtable_t
      * Other prims keep the schema they carry.
      * Reserved metadata attributes accept only OVSTAGE_ATTRIBUTE_MODE_REJECT.
      *
+     * A write that would give `omni:fabric:worldMatrix` to a hierarchy parent or
+     * ancestor of the written prims, or to a prim with a transform input between
+     * a written prim and a descendant that carries it (see the transforms
+     * documentation), is rejected while an outstanding read covers that prim,
+     * like any structural write; the rejected write creates nothing (a write
+     * with several entries keeps the partial-failure behavior documented for
+     * write_attributes: entries applied before the rejected one remain
+     * committed).
+     *
      * Reads observe a replacement as the end of the previous schema and the
      * written value at the same ordinal. A change-range read that includes that
      * ordinal returns, for each replaced prim, a tombstone group
@@ -554,11 +730,14 @@ struct ovstage_vtable_t
      *
      * Reserved metadata follows the same attribute-write and row-coverage contract
      * as every other attribute. `usd-prim-type` requires `is_array == false`;
-     * `usd-schemas` requires `is_array == true`. A mismatch is rejected, and
-     * neither name enables implicit broadcasting. Use an explicit index_map
-     * when multiple target rows intentionally share source data. Metadata rows
-     * are assignments: later values replace earlier values, and an empty
-     * `usd-schemas` row clears the applied-schema set.
+     * `usd-schemas` and `usd-ancestor-types` require `is_array == true`. A
+     * mismatch is rejected, and none of them enables implicit broadcasting. Use
+     * an explicit index_map when multiple target rows intentionally share
+     * source data. Metadata rows are assignments: later values replace earlier
+     * values, and an empty `usd-schemas` row clears the applied-schema set. A
+     * write of any of the three is refused while any attribute of a target prim
+     * has an outstanding read, because the change restructures the prim's
+     * storage.
      *
      * To fill ovstage-owned writable buffers, use Map/Unmap.
      * ─────────────────────────────────────────────────────────────────────── */
@@ -592,9 +771,10 @@ struct ovstage_vtable_t
      * error precedence; common preflight currently validates prim_mode before
      * query-handle readiness and enqueue-time ordinal checks.
      *
-     * @param instance Implementation context.
+     * @param context The context of the data plane.
      * @param handle Query handle identifying target prims.
-     * @param attribute Attribute to write.
+     * @param attribute Attribute to write. A name that contains `*` fails with
+     *        OVSTAGE_ERROR_INVALID_ARGUMENT (reserved for read selection).
      * @param ordinal Must exceed applicable floors and satisfy the configured
      *        ordinal admission policy for affected cells and prim lifecycles at
      *        execution. The STRICTLY_INCREASING policy rejects equality
@@ -609,12 +789,12 @@ struct ovstage_vtable_t
      *         through wait_op + get_last_op_error.
      */
     ovstage_enqueue_result_t (*write_attribute)(
-        ovstage_context_t*           instance,
-        ovstage_query_handle_t       handle,
-        ovx_string_or_token_t            attribute,
-        ovstage_ordinal_t            ordinal,
-        ovstage_write_data_t         data,
-        ovstage_prim_mode_t          prim_mode);
+        ovstage_data_plane_context_t* context,
+        ovstage_query_handle_t        handle,
+        ovx_token_or_string_t         attribute,
+        ovstage_ordinal_t             ordinal,
+        ovstage_write_data_t          data,
+        ovstage_prim_mode_t           prim_mode);
 
     /* ───────────────────────────────────────────────────────────────────────
      * Map / Unmap (Mapped Writes)
@@ -636,8 +816,9 @@ struct ovstage_vtable_t
      * writable storage before any tensor is produced, new attributes require a
      * descriptor dtype. If `desc.dtype` is zero-initialized, map_attribute uses
      * the existing attribute schema only when it is unambiguous for the target
-     * prims. If the requested dtype conflicts with existing storage or the
-     * semantic conflicts with an authored role on a target prim/name,
+     * prims. If the requested dtype conflicts with existing storage or
+     * an explicit semantic differs from the existing semantic on a target
+     * prim/name, including adding a role to a roleless attribute,
      * map_attribute fails; delete that attribute first, then map it
      * again with the new schema at a later ordinal. With `desc.attribute_mode`
      * OVSTAGE_ATTRIBUTE_MODE_FORCE and an explicit `desc.dtype`, setup accepts
@@ -650,6 +831,20 @@ struct ovstage_vtable_t
      * An omitted semantic adopts an unambiguous compatible existing identity;
      * specify dtype and semantic when the target prims have multiple same-name
      * identities.
+     *
+     * The recorded reserved metadata (`usd-prim-type`, `usd-schemas`,
+     * `usd-ancestor-types`) maps like any recorded column: the staging buffer
+     * carries interned uint64 token ids, and each successful unmap applies them
+     * to the prim's recorded metadata exactly as a copy-in write does (an empty
+     * list row clears the set). Such a session is host-resident and canonical:
+     * `desc.dtype` is zero or `{kDLUInt, 64, 1}`, `desc.semantic` is NONE,
+     * `element_sizes` is required for the list forms and must be omitted for
+     * `usd-prim-type`, a CUDA placement returns `OVSTAGE_ERROR_NOT_SUPPORTED`,
+     * and a query that names a prim twice is rejected. Like a copy-in write of
+     * these names, the commit is refused while any attribute of a mapped prim
+     * has an outstanding read. A staged row whose ids do not name anything
+     * fails the commit before any metadata changes; like every failed accepted
+     * commit, that is terminal for the session.
      *
      * For array attributes (variable-size per prim), the caller additionally
      * provides element_sizes at map-enqueue time so the implementation can
@@ -673,6 +868,11 @@ struct ovstage_vtable_t
      * Successful setup does not guarantee a later commit: unmap rechecks the
      * current layout, type/semantic compatibility, prim creation policy,
      * ordinal admission and read overlap before committing remaining data.
+     * A commit that would give `omni:fabric:worldMatrix` to a hierarchy parent or
+     * ancestor of the mapped prims, or to a prim with a transform input between
+     * a mapped prim and a descendant that carries it (see the transforms
+     * documentation), is rejected while an outstanding read covers that prim,
+     * like any structural write; nothing is created.
      *
      * @remark Mapped buffers need not alias final backing storage; the current
      * implementation may copy or scatter them during unmap.
@@ -692,10 +892,11 @@ struct ovstage_vtable_t
      * group already committed by unmap_group -- has no payload and never
      * inspects the sync, so this is not a general argument check.
      *
-     * @param instance Implementation context.
+     * @param context The context of the data plane.
      * @param handle Query handle identifying target prims.
      * @param desc Map descriptor (attribute, dtype, semantic, prim_mode). See
-     *        ovstage_map_desc_t.
+     *        ovstage_map_desc_t. An attribute name that contains `*` fails with
+     *        OVSTAGE_ERROR_INVALID_ARGUMENT (reserved for read selection).
      * @param ordinal Ordinal for this map session. Setup and publication must
      *        exceed applicable floors and satisfy the configured ordinal
      *        admission policy for affected cells and prim lifecycles. Disjoint
@@ -716,13 +917,13 @@ struct ovstage_vtable_t
      * @return Enqueue result with status + op_index.
      */
     ovstage_enqueue_result_t (*map_attribute)(
-        ovstage_context_t*           instance,
-        ovstage_query_handle_t       handle,
-        const ovstage_map_desc_t*    desc,
-        ovstage_ordinal_t            ordinal,
-        const size_t*                    element_sizes,
-        size_t                           element_count,
-        ovstage_map_handle_t*        out_map_handle);
+        ovstage_data_plane_context_t* context,
+        ovstage_query_handle_t        handle,
+        const ovstage_map_desc_t*     desc,
+        ovstage_ordinal_t             ordinal,
+        const size_t*                 element_sizes,
+        size_t                        element_count,
+        ovstage_map_handle_t*         out_map_handle);
 
     /**
      * @brief Fetch the next writable map group, with timeout.
@@ -731,10 +932,10 @@ struct ovstage_vtable_t
      * finalizing the session.
      */
     ovstage_api_status_t (*fetch_map_next)(
-        ovstage_context_t*       instance,
-        ovstage_map_handle_t     map_handle,
-        ovstage_timeout_ns_t     timeout,
-        ovstage_map_group_t*     out_group);
+        ovstage_data_plane_context_t* context,
+        ovstage_map_handle_t          map_handle,
+        ovstage_timeout_ns_t          timeout,
+        ovstage_map_group_t*          out_group);
 
     /**
      * @brief Enqueue commit of a single map group (streaming commit).
@@ -762,10 +963,10 @@ struct ovstage_vtable_t
      * experimental/ovstage_placement_extension.h).
      */
     ovstage_enqueue_result_t (*unmap_group)(
-        ovstage_context_t*           instance,
-        ovstage_map_handle_t         map_handle,
-        const ovstage_map_group_t*   group,
-        ovstage_cuda_sync_t          write_done_sync);
+        ovstage_data_plane_context_t* context,
+        ovstage_map_handle_t          map_handle,
+        const ovstage_map_group_t*    group,
+        ovstage_cuda_sync_t           write_done_sync);
 
     /**
      * @brief Enqueue commit of all remaining groups and release of the
@@ -784,9 +985,9 @@ struct ovstage_vtable_t
      * apply to remaining groups committed here.
      */
     ovstage_enqueue_result_t (*unmap_attribute)(
-        ovstage_context_t*       instance,
-        ovstage_map_handle_t     map_handle,
-        ovstage_cuda_sync_t      write_done_sync);
+        ovstage_data_plane_context_t* context,
+        ovstage_map_handle_t          map_handle,
+        ovstage_cuda_sync_t           write_done_sync);
 
     /* ───────────────────────────────────────────────────────────────────────
      * Delete
@@ -816,10 +1017,11 @@ struct ovstage_vtable_t
      * @brief Enqueue a delete (tombstone) of attributes on prims at a given
      *        ordinal.
      *
-     * @param instance Implementation context.
+     * @param context The context of the data plane.
      * @param handle Query handle identifying target prims.
      * @param attributes List of attributes to delete. Empty list = delete
-     *        entire prims (all attributes).
+     *        entire prims (all attributes). A name that contains `*` fails
+     *        with OVSTAGE_ERROR_INVALID_ARGUMENT (reserved for read selection).
      * @param attribute_count Number of attributes. 0 = delete entire prims.
      * @param ordinal Ordinal of the deletion. Must exceed applicable floors and
      *        satisfy the configured ordinal admission policy for deleted cells
@@ -827,11 +1029,11 @@ struct ovstage_vtable_t
      * @return Enqueue result with status + op_index.
      */
     ovstage_enqueue_result_t (*delete_attributes)(
-        ovstage_context_t*           instance,
-        ovstage_query_handle_t       handle,
-        const ovx_string_or_token_t*     attributes,
-        size_t                           attribute_count,
-        ovstage_ordinal_t            ordinal);
+        ovstage_data_plane_context_t* context,
+        ovstage_query_handle_t        handle,
+        const ovx_token_or_string_t*  attributes,
+        size_t                        attribute_count,
+        ovstage_ordinal_t             ordinal);
 
     /* ───────────────────────────────────────────────────────────────────────
      * Diagnostics
@@ -847,29 +1049,32 @@ struct ovstage_vtable_t
      * `OVSTAGE_VERSION_MINOR` / `OVSTAGE_VERSION_PATCH` macros, so a runtime
      * query and a compile-time `#if` check always agree. */
     void (*get_version)(
-        ovstage_context_t* instance,
-        uint32_t*              out_major,
-        uint32_t*              out_minor,
-        uint32_t*              out_patch);
+        ovstage_data_plane_context_t* context,
+        uint32_t*                     out_major,
+        uint32_t*                     out_minor,
+        uint32_t*                     out_patch);
 
     /**
      * @brief Get a human-readable string for an error code.
      * @return Static string. Never NULL.
      */
     const char* (*get_error_string)(
-        ovstage_context_t* instance,
-        ovstage_api_status_t    error);
+        ovstage_data_plane_context_t* context,
+        ovstage_api_status_t          error);
 
     /**
      * @brief Get the human-readable error string for a failed op id reported
-     *        by the last wait_op call on this thread.
+     *        by the last wait_op call on this thread. Pass
+     *        `OVSTAGE_INVALID_OP_ID` for the current thread-local diagnostic,
+     *        which may be from another data-plane API call.
      *
      * The returned string is valid until the next wait_op call on the same
-     * thread. Returns `{NULL, 0}` if the op id is not known or did not fail.
+     * thread; the thread-local diagnostic is valid until another API call
+     * replaces or clears it. Returns `{NULL, 0}` if the requested error is unavailable.
      */
     ovx_string_t (*get_last_op_error)(
-        ovstage_context_t* instance,
-        ovstage_op_id_t    op_id);
+        ovstage_data_plane_context_t* context,
+        ovstage_op_id_t               op_id);
 
     /* ───────────────────────────────────────────────────────────────────────
      * Resources
@@ -906,9 +1111,9 @@ struct ovstage_vtable_t
      * (`ovstage_read_group_t::prims.list`, `ovstage_map_group_t::prims.list`,
      * `ovstage_query_result_t::prims.list`) is a BORROW: the producing op
      * holds a reference and will release it on teardown of the producing
-     * handle (`release_group` / `release_read` / `release_query` etc.). To
+     * handle (`release_groups` / `release_read` / `release_query` etc.). To
      * keep such a list usable beyond the producing handle, call
-     * `path_dictionary_add_path_list_reference(get_path_dictionary(instance), list)`
+     * `path_dictionary_add_path_list_reference(ovstage_get_path_dictionary(instance), list)`
      * BEFORE releasing the producer, and pair that add with a matching
      * `path_dictionary_release_path_list_reference` when finished. Tokens
      * and prim paths in result structs need no per-handle pinning — they
@@ -919,16 +1124,15 @@ struct ovstage_vtable_t
      *     was constructed and the caller MUST NOT invoke this slot. Treat
      *     the dictionary as unavailable in that path; there is nothing to
      *     query.
-     *   - When called on a live instance, the slot returns a non-NULL
-     *     pointer for the current implementation. A NULL return is reserved
-     *     for future implementations that may not provide a dictionary;
-     *     check for NULL before dereferencing the result.
+     *   - When called on a live instance, the slot returns the dictionary of
+     *     the instance, or NULL when the implementation has no dictionary.
+     *     Check for NULL before dereferencing the result.
      *
      * @return The instance's path dictionary, or NULL if no dictionary is
      *         available for this instance.
      */
     path_dictionary_instance_t* (*get_path_dictionary)(
-        ovstage_context_t* instance);
+        ovstage_data_plane_context_t* context);
 
     /* -----------------------------------------------------------------------
      * Batched write
@@ -1014,16 +1218,18 @@ struct ovstage_vtable_t
      *         the process rather than return an inconsistent instance.
      *         This condition is not surfaced through wait_op.
      *
-     * @param instance Implementation context.
+     * @param context The context of the data plane.
      * @param handle Query handle identifying target prims.
-     * @param writes Array of named attribute writes.
+     * @param writes Array of named attribute writes. An entry with a name that
+     *        contains `*` fails the whole operation with
+     *        OVSTAGE_ERROR_INVALID_ARGUMENT (reserved for read selection).
      * @param write_count Number of entries in writes.
      * @param ordinal Ordinal shared by the operation.
      * @param prim_mode UPSERT (default) or INSERT.
      * @return Enqueue result with status and one op_index for the complete group.
      */
     ovstage_enqueue_result_t (*write_attributes)(
-        ovstage_context_t*                 instance,
+        ovstage_data_plane_context_t*      context,
         ovstage_query_handle_t             handle,
         const ovstage_attribute_write_t*   writes,
         size_t                             write_count,
@@ -1047,9 +1253,41 @@ struct ovstage_vtable_t
      * OVSTAGE_ERROR_INVALID_ARGUMENT for NULL arguments.
      */
     ovstage_api_status_t (*query_extension)(
-        ovstage_context_t* instance,
-        const char*        name,
-        const void**       out_extension);
+        ovstage_data_plane_context_t* context,
+        const char*                   name,
+        const void**                  out_extension);
+
+    /* -----------------------------------------------------------------------
+     * Subtree clone
+     * ----------------------------------------------------------------------- */
+
+    /**
+     * @brief Enqueue a clone of the subtree under `source_path` to every path
+     *        in `target_paths`, as an ordinal-keyed write at `ordinal`.
+     *
+     * The wrapper ovstage_clone in ovstage.h documents the contract of a
+     * clone. The operation is awaited through wait_op and released through
+     * release_op like every other operation of the data plane.
+     */
+    ovstage_enqueue_result_t (*clone)(
+        ovstage_data_plane_context_t* context,
+        ovx_string_t                  source_path,
+        const ovx_string_t*           target_paths,
+        size_t                        num_target_paths,
+        ovstage_ordinal_t             ordinal);
+
+    /**
+     * @brief Fetch the completion report of a clone operation.
+     *
+     * The wrapper ovstage_fetch_clone_result in ovstage.h documents the
+     * contract. The report is per-op completion state, available from the
+     * completion of the clone until release_op.
+     */
+    ovstage_api_status_t (*fetch_clone_result)(
+        ovstage_data_plane_context_t* context,
+        ovstage_op_id_t               op_id,
+        ovstage_timeout_ns_t          timeout,
+        ovstage_clone_result_t*       out_result);
 };
 
 /* ═══════════════════════════════════════════════════════════════════════════════

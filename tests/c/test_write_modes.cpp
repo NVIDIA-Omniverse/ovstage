@@ -97,13 +97,19 @@ protected:
         range.end_ordinal = endOrdinal;
         ovstage_read_handle_t read = OVSTAGE_INVALID_READ_HANDLE;
         ASSERT_TRUE(waitOp(stage_, ovstage_read_attributes(stage_, query_, &score_, 1, range, &read), "read"));
+        size_t fetchedGroupCount = 0;
         ovstage_read_group_t group{};
-        const ovstage_api_status_t fetched = ovstage_fetch_read_next(stage_, read, OVSTAGE_TIMEOUT_INFINITE, &group);
+        const ovstage_api_status_t fetched =
+            ovstage_fetch_read_next(stage_, read, OVSTAGE_TIMEOUT_INFINITE, &group, 1, &fetchedGroupCount);
         if (fetched == OVSTAGE_OK)
         {
-            if (group.data.tensor_count == 1u)
+            if (group.column_count != 1u)
             {
-                const DLTensor& tensor = group.data.tensors[0];
+                ADD_FAILURE() << "single-attribute read returned " << group.column_count << " columns";
+            }
+            else if (group.columns[0].data.tensor_count == 1u)
+            {
+                const DLTensor& tensor = group.columns[0].data.tensors[0];
                 if (tensor.data && tensor.ndim == 1 && tensor.shape && tensor.shape[0] >= 2 &&
                     tensor.dtype.code == kDLFloat && tensor.dtype.bits == 32 && tensor.dtype.lanes == 1)
                 {
@@ -116,9 +122,9 @@ protected:
             }
             else
             {
-                ADD_FAILURE() << "read expected one tensor, got " << group.data.tensor_count;
+                ADD_FAILURE() << "read expected one tensor, got " << group.columns[0].data.tensor_count;
             }
-            ovstage_release_group(stage_, &group);
+            ovstage_release_groups(stage_, &group, 1);
         }
         else
         {

@@ -96,9 +96,16 @@ These rules are mandatory.
 - **Async, ordinal-keyed model.** State-mutating/data-producing calls enqueue and
   return an `op_index`; drive them to completion (`wait_op` in C, `Operation.wait()`
   in Python) and check per-op errors — enqueue success ≠ op success.
-- **Latest-snapshot payloads.** This build does not retain historical payloads.
-  Bounded dirty metadata may test older change membership at or above
-  `ovstage_get_oldest_preserved_ordinal`.
+- **Latest-snapshot payloads by default.** An instance of `history_latest` (the
+  default) keeps history off and keeps the latest value of every cell. Bounded
+  dirty metadata may test older change membership at or above
+  `ovstage_get_oldest_preserved_ordinal`. Historical payloads need an instance of
+  `history_selective` (`ovstage_instance_desc_t.implementation` with the name
+  `history_selective`), which turns history on for the exact pairs that
+  `ovstage_enable_history()` selects. History support (the `history_selective`
+  implementation and `ovstage_enable_history()`) is experimental and can change
+  between releases without a deprecation period. See `test_history.cpp` /
+  `test_history.py`.
 - **Reads target sealed data** at/below the write floor; advance the write floor
   before reading a just-written column.
 
@@ -110,7 +117,6 @@ consumed by an ovstage skill and/or public documentation.
 
 | Snippet | Source file | Used in |
 |---------|-------------|---------|
-| `initialize-static-loader-c` | `tests/c/test_static_config.cpp` | `skills/project-setup-c`, `skills/application-flow` |
 | `dlpack-three-prim-query` | `tests/python/test_minimal.py` | `docs/concepts/dlpack_tensors.rst` |
 | `dlpack-three-prim-query-c` | `tests/c/test_minimal.cpp` | `docs/concepts/dlpack_tensors.rst` |
 | `dlpack-pass-values` | `tests/python/test_minimal.py` | `docs/concepts/dlpack_tensors.rst` |
@@ -119,6 +125,8 @@ consumed by an ovstage skill and/or public documentation.
 | `dlpack-copy-result-c` | `tests/c/test_minimal.cpp` | `docs/concepts/dlpack_tensors.rst` |
 | `dlpack-map-existing` | `tests/python/test_map_attribute.py` | `docs/concepts/dlpack_tensors.rst` |
 | `dlpack-map-existing-c` | `tests/c/test_map_attribute.cpp` | `docs/concepts/dlpack_tensors.rst` |
+| `typed-write-adapter-outer-stride` | `tests/python/test_map_attribute.py` | `skills/dlpack-tensor-exchange` |
+| `initialize-static-loader-c` | `tests/c/test_static_config.cpp` | `skills/project-setup-c`, `skills/application-flow` |
 | `write-read-roundtrip-c` | `tests/c/test_minimal.cpp` | `skills/application-flow`, `skills/dlpack-tensor-exchange` |
 | `write-read-roundtrip` | `tests/python/test_minimal.py` | `skills/application-flow` |
 | `nonblocking-poll-c` | `tests/c/test_minimal.cpp` | `skills/cpu-ahead-gpu-async` |
@@ -137,6 +145,24 @@ consumed by an ovstage skill and/or public documentation.
 | `populate-stage-metadata` | `tests/python/test_population.py` | `skills/loading-usd` |
 | `populate-several-descs` | `tests/python/test_population.py` | `skills/loading-usd` |
 | `register-usd-schemas-c` | `tests/c/test_population.cpp` | `skills/loading-usd` |
+| `select-by-relationship-target` | `tests/python/test_population_descriptions.py` | `docs/scene/population.rst` |
+| `select-by-relationship-target-c` | `tests/c/test_population_descriptions.cpp` | `docs/scene/population.rst` |
+| `select-by-descendant` | `tests/python/test_population_descriptions.py` | `docs/scene/population.rst` |
+| `select-by-descendant-c` | `tests/c/test_population_descriptions.cpp` | `docs/scene/population.rst` |
+| `select-instances` | `tests/python/test_population_descriptions.py` | `docs/scene/population.rst` |
+| `select-instances-c` | `tests/c/test_population_descriptions.cpp` | `docs/scene/population.rst` |
+| `select-targeted-prims` | `tests/python/test_population_descriptions.py` | `docs/scene/population.rst` |
+| `select-targeted-prims-c` | `tests/c/test_population_descriptions.cpp` | `docs/scene/population.rst` |
+| `derive-default-in-stage-units` | `tests/python/test_population_descriptions.py` | `docs/scene/population.rst` |
+| `derive-default-in-stage-units-c` | `tests/c/test_population_descriptions.cpp` | `docs/scene/population.rst` |
+| `derive-bound-material` | `tests/python/test_population_descriptions.py` | `docs/scene/population.rst` |
+| `derive-bound-material-c` | `tests/c/test_population_descriptions.cpp` | `docs/scene/population.rst` |
+| `derive-collection-members` | `tests/python/test_population_descriptions.py` | `docs/scene/population.rst` |
+| `derive-collection-members-c` | `tests/c/test_population_descriptions.cpp` | `docs/scene/population.rst` |
+| `derive-binding-strength` | `tests/python/test_population_descriptions.py` | `docs/scene/population.rst` |
+| `derive-binding-strength-c` | `tests/c/test_population_descriptions.cpp` | `docs/scene/population.rst` |
+| `derive-for-one-instance` | `tests/python/test_population_descriptions.py` | `docs/scene/population.rst` |
+| `derive-for-one-instance-c` | `tests/c/test_population_descriptions.cpp` | `docs/scene/population.rst` |
 | `export-typed-hierarchy-to-usd-c` | `tests/c/test_population_export.cpp` | `skills/exporting-to-usd`, `docs/scene/exporting_to_usd.rst` |
 | `export-typed-hierarchy-to-usd-file` | `tests/python/test_population_export.py` | `skills/exporting-to-usd`, `docs/scene/exporting_to_usd.rst` |
 | `export-runtime-to-usd` | `tests/python/test_population_export.py` | `skills/exporting-to-usd`, `docs/scene/exporting_to_usd.rst` |
@@ -155,6 +181,7 @@ consumed by an ovstage skill and/or public documentation.
 | `clone-target-exists-error` | `tests/python/test_error_handling.py` | `skills/error-handling` |
 | `query-by-usd-path-c` | `tests/c/test_queries.cpp` | `skills/stage-queries` |
 | `query-by-usd-path` | `tests/python/test_queries.py` | `skills/stage-queries` |
+| `instancing-resolve-paths` | `tests/python/test_instancing.py` | `docs/scene/instancing.rst` |
 | `query-has-attribute-c` | `tests/c/test_queries.cpp` | `skills/stage-queries` |
 | `query-has-attribute` | `tests/python/test_queries.py` | `skills/stage-queries` |
 | `query-predicate-matrix-c` | `tests/c/test_queries.cpp` | `skills/stage-queries` |
@@ -173,6 +200,7 @@ consumed by an ovstage skill and/or public documentation.
 | `attribute-shapes-fixed` | `tests/python/test_attribute_shapes.py` | `skills/dlpack-tensor-exchange`, `docs/concepts/dlpack_tensors.rst` |
 | `attribute-shapes-ragged-c` | `tests/c/test_attribute_shapes.cpp` | `skills/dlpack-tensor-exchange` |
 | `attribute-shapes-ragged` | `tests/python/test_attribute_shapes.py` | `skills/dlpack-tensor-exchange` |
+| `batched-read-groups-c` | `tests/c/test_attributes.cpp` | `docs/scene/reading_attributes.rst` |
 | `semantic-roles-c` | `tests/c/test_attributes.cpp` | `skills/dlpack-tensor-exchange` |
 | `semantic-roles` | `tests/python/test_attributes.py` | `skills/dlpack-tensor-exchange` |
 | `path-list-context-manager` | `tests/python/test_path_lists.py` | `skills/path-dictionary` |
@@ -181,12 +209,16 @@ consumed by an ovstage skill and/or public documentation.
 | `map-unmap-cpu-c` | `tests/c/test_map_attribute.cpp` | `skills/dlpack-tensor-exchange` |
 | `map-unmap-cpu` | `tests/python/test_map_attribute.py` | `skills/dlpack-tensor-exchange` |
 | `map-dlpack-readonly` | `tests/python/test_map_attribute.py` | `skills/dlpack-tensor-exchange` |
+| `map-reserved-metadata` | `tests/python/test_map_attribute.py` | `docs/concepts/dlpack_tensors.rst` |
+| `map-reserved-metadata-c` | `tests/c/test_map_attribute.cpp` | `docs/concepts/dlpack_tensors.rst` |
 | `upsert-vs-insert-c` | `tests/c/test_write_modes.cpp` | `skills/error-handling` |
 | `upsert-vs-insert` | `tests/python/test_write_modes.py` | `skills/error-handling` |
 | `sparse-index-map-and-mask-c` | `tests/c/test_sparse_writes.cpp` | `docs/concepts/dlpack_tensors.rst` |
 | `sparse-index-map-and-mask` | `tests/python/test_sparse_writes.py` | `docs/concepts/dlpack_tensors.rst` |
 | `delete-attribute-then-prim-c` | `tests/c/test_delete.cpp` | _(test only)_ |
 | `delete-attribute-then-prim` | `tests/python/test_delete.py` | _(test only)_ |
+| `read-attribute-patterns-c` | `tests/c/test_read_patterns.cpp` | `skills/stage-queries`, `docs/scene/reading_attributes.rst` |
+| `read-attribute-patterns` | `tests/python/test_read_patterns.py` | `skills/stage-queries`, `docs/scene/reading_attributes.rst` |
 | `log-callback-filter-c` | `tests/c/test_logging.cpp` | `skills/logging` |
 | `log-callback-filter` | `tests/python/test_logging.py` | `skills/logging` |
 | `version-and-error-c` | `tests/c/test_support_api.cpp` | `skills/error-handling` |
@@ -194,6 +226,10 @@ consumed by an ovstage skill and/or public documentation.
 | `configure-transform-updates` | `tests/python/test_config.py` | `docs/guides/project_setup_python.rst` |
 | `configure-ordinal-admission-c` | `tests/c/test_support_api.cpp` | `docs/guides/project_setup_c.rst` |
 | `configure-ordinal-admission` | `tests/python/test_config.py` | `docs/guides/project_setup_python.rst` |
+| `configure-population-threads-c` | `tests/c/test_support_api.cpp` | `docs/guides/project_setup_c.rst` |
+| `configure-population-threads` | `tests/python/test_config.py` | `docs/guides/project_setup_python.rst` |
+| `history-enable-read-c` | `tests/c/test_history.cpp` | `skills/application-flow`, `docs/scene/reading_attributes.rst` |
+| `history-enable-read` | `tests/python/test_history.py` | `skills/application-flow`, `docs/scene/reading_attributes.rst` |
 | `wait-chaining` | `tests/python/test_minimal.py` | `skills/error-handling`, `skills/cpu-ahead-gpu-async` |
 | `write-with-placement` | `tests/python/test_placement.py` | _(test only)_ |
 
@@ -209,6 +245,10 @@ consumes a produced package the way a consumer would: the C tests
 (one aggregate configure+build, each run and asserted exit 0) and, with
 `--wheel`, the Python tests (pytest in a venv, the wheel force-reinstalled so
 reruns always test the given artifact) plus **every** shipped Python example.
+The producer-consumer example additionally runs its concurrent `--threads`
+mode in both languages, asserted exit 0 like any other run (the mode
+coordinates the accesses that conflict and asserts that an unrelated write
+completes while a read group is held, so a rejection or a hang is a defect).
 GPU-requiring examples run only when a CUDA device is detected
 (`OVSTAGE_PUBLIC_TESTS_REQUIRE_GPU=1` turns that skip into a failure so GPU
 runners cannot silently lose the coverage); on a GPU box the runner also
@@ -238,7 +278,7 @@ cd ../python && python -m pytest -v      # ovstage on PYTHONPATH + libovstage on
 
 These runnable example snippets supplement the asserted `query-by-usd-path`
 and `query-has-attribute` tests above. Both examples are included in
-`docs/scene/queries.rst` and their adjacent READMEs.
+`docs/scene/queries.rst`; their adjacent READMEs point to the source markers.
 
 | Snippet | Example source |
 |---------|----------------|
@@ -249,7 +289,8 @@ and `query-has-attribute` tests above. Both examples are included in
 
 These runnable snippets supplement the existing `query-predicate-matrix` and
 query introspection tests. Each has Python/C tabs in `docs/scene/queries.rst`
-and an identical excerpt in its example README.
+except the shared Python imports. The example READMEs retain only the
+`query-type-subtree` and `query-type-subtree-c` excerpts from this group.
 
 | Snippet | Example source |
 |---------|----------------|
@@ -260,6 +301,8 @@ and an identical excerpt in its example README.
 | `query-direct-children-c` | `examples/c/queries/main.cpp` |
 | `query-required-attributes` | `examples/python/queries/main.py` |
 | `query-required-attributes-c` | `examples/c/queries/main.cpp` |
+| `query-excluded-attribute` | `examples/python/queries/main.py` |
+| `query-excluded-attribute-c` | `examples/c/queries/main.cpp` |
 | `query-matched-paths` | `examples/python/queries/main.py` |
 | `query-matched-paths-c` | `examples/c/queries/main.cpp` |
 
@@ -276,7 +319,9 @@ Applied-schema query examples (Python/C tabs in `docs/scene/queries.rst`):
 
 Runnable examples in `examples/python/write-flavors/main.py` and
 `examples/c/write-flavors/main.cpp` supply the Writing Attributes snippets.
-Each C marker has a `-c` suffix; README excerpts match the source.
+Each C marker has a `-c` suffix. The example READMEs retain only the
+`write-fixed-shape` and `write-array-width` excerpts and their C equivalents;
+the other snippets are listed in the source-marker guides.
 
 | Snippet | Demonstrates |
 |---------|--------------|
@@ -295,27 +340,33 @@ Each C marker has a `-c` suffix; README excerpts match the source.
 provide `transform-layout`, `transform-write`, `transform-compute`,
 `transform-override`, and `transform-read` (C markers append `-c`).
 Python's `transform-imports` supplies the shared imports. These snippets
-appear in `docs/scene/transforms.rst` and the example READMEs. The examples
-populate matching `car.usda` fixtures and run with CPU hierarchy computation.
+appear in `docs/scene/transforms.rst`; the example READMEs point to the source
+markers. The examples populate matching `car.usda` fixtures and run with CPU
+hierarchy computation.
 
 The CUDA-buffer helper snippets `gpu-transform-write` and
 `gpu-transform-write-c` live in `examples/{python,c}/transforms/gpu_write.*`.
-They accept caller-owned GPU buffers and a recorded completion event; running
-them requires a working CUDA device and a producer supplying those inputs.
+They accept caller-owned GPU buffers and a readiness event recorded after producing
+both buffers. They require a working CUDA device and a populated hierarchy with
+existing derived-output rows. Keep the buffers and event valid and unchanged until
+the helper returns.
 
 ### Attribute read examples
 
 The write-flavors examples provide `read-copy-groups`, `read-fixed-vectors`,
 `read-change-range`, and `read-retained-records` (C markers append `-c`).
-They read back the write-options data and appear in Reading Attributes and
-the example READMEs. The metadata section reuses `query-matched-paths`.
+They read back the write-options data and appear in Reading Attributes; the example
+READMEs point to the source markers. `read-copy-groups` / `read-copy-groups-c` also
+supplement the migration details in `docs/scene/reading_attributes.rst`. The metadata
+section reuses `query-matched-paths`.
 
 ### Clone operation examples
 
 The write-flavors examples provide `clone-duplicate-targets`,
 `clone-async-report`, and `clone-specific-failure` (C markers append `-c`).
-They appear in Cloning Subtrees and the example READMEs, demonstrating
-submission rejection, asynchronous completion, and fetching a failure before release.
+They appear in Cloning Subtrees, demonstrating submission rejection, asynchronous
+completion, and fetching a failure before release. The example READMEs point to the
+source markers.
 
 ### Population walkthrough examples
 

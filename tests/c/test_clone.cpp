@@ -86,14 +86,15 @@ float readScalarAtPath(ovstage_instance_t* stage, path_dictionary_instance_t* di
         return 0.0f;
     }
 
+    size_t fetchedGroupCount = 0;
     ovstage_read_group_t group{};
     float value = 0.0f;
-    const ovstage_api_status_t fetched = ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group);
-    if (fetched == OVSTAGE_OK && group.data.tensor_count == 1u && group.data.tensors[0].data)
-        std::memcpy(&value, group.data.tensors[0].data, sizeof(value));
+    const ovstage_api_status_t fetched = ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group, 1, &fetchedGroupCount);
+    if (fetched == OVSTAGE_OK && group.column_count == 1u && group.columns[0].data.tensor_count == 1u && group.columns[0].data.tensors[0].data)
+        std::memcpy(&value, group.columns[0].data.tensors[0].data, sizeof(value));
 
     if (fetched == OVSTAGE_OK)
-        ovstage_release_group(stage, &group);
+        ovstage_release_groups(stage, &group, 1);
     waitOp(stage, ovstage_release_read(stage, read), "release_read");
     waitOp(stage, ovstage_release_query(stage, query), "release_query");
     path_dictionary_release_path_list_reference(dict, list);

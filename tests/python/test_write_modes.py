@@ -17,10 +17,11 @@ def _scalar_values(stage, query, attr, end_ordinal, order):
     read.wait()
     rows = {}
     for group in read.groups():
-        if not group.is_delete:
-            values = group.array(0)
+        column = group.columns[0]
+        if not column.is_delete:
+            values = column.array(0)
             for local in range(group.prim_count):
-                row = group.data_row_index(local) if group.has_data_index_map else local
+                row = column.data_row_index(local) if column.has_data_index_map else local
                 rows[group.prim_index(local)] = float(values[row])
         stage.release_group(group)
     read.release().wait()
@@ -199,7 +200,7 @@ def test_write_rejects_fractional_ordinal_and_token(stage):
                 stage.read_attributes(query, [score + 0.75], OrdinalRange.latest(5))
             seen = []
             for group in read.groups():
-                seen.extend(float(v) for v in group.array(0))
+                seen.extend(float(v) for v in group.columns[0].array(0))
                 stage.release_group(group)
             read.release().wait()
             assert seen == [12.5]

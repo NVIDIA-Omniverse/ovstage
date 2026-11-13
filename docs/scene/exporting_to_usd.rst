@@ -135,12 +135,8 @@ only the subtree:
 The helper selects the root and descendants, creates ``DEF`` prims using
 ``usd-prim-type``, applies recognized ``usd-schemas``, and exports supported
 schema-declared attributes under their existing names. It also handles
-``omni:xform``. For an instance root with synthetic ``XformInstance`` or
-``ScopeInstance`` type, it recovers the authored USD type and schema-declared
-attributes from ``usd-metadata:typeName`` when present (``PHYSICS`` or selector
-population). A root populated only by ``RENDERING`` lacks that metadata and
-exports as a typeless prim when its runtime type is synthetic.
-The synthetic ``GeomInstanceAPI``
+``omni:xform``. An instance root exports with its authored type and
+schema-declared attributes, as any other prim. The synthetic ``GeomInstanceAPI``
 and ``GeomInstanceRootAPI`` tags are not applied as USD schemas. This exports
 the root's selected values without recreating its instance reference.
 
@@ -568,8 +564,8 @@ Limitations
   rules. Use ``SourceApiSchemaPolicy.APPLY_RECORDED`` or the typed helper to keep
   recognized recorded schemas.
 * **Property kinds are explicit.** Relationship and material-binding rules require
-  the relationship-path semantic. A single-path column (``is_array=False``)
-  exports as a relationship with that one target. Connection rules require a single target and
+  the relationship-path semantic; a single-path column (``is_array = false``) exports
+  as a relationship with that one target. Connection rules require a single target and
   the connection semantic. A zero-initialized property rule is invalid. Optional
   unsupported rules are counted; required ones fail.
 * **Connections have limits.** A direct-write single-target connection can be

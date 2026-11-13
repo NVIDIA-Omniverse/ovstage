@@ -63,6 +63,10 @@ the minimal example's lifecycle: create → get path dictionary → intern / bui
 path list → query → write → advance write floor → read → release. Refer to
 :doc:`/concepts/application_flow`.
 
+Keep the complete package ``bin/`` tree, including its ``plugins/``
+subdirectories, together when deploying or relocating an application.
+Both public loaders use this same layout.
+
 Linux Toolchain Requirements
 ----------------------------
 
@@ -122,6 +126,10 @@ example, when the package lives at ``<exe_dir>/ovstage/bin``:
    };
    ovstage_config_t config = { entries, 2 };
    ovstage_initialize(&config);
+   /* ... create instances, use ovstage ... */
+   ovstage_shutdown();
+
+Balance every successful :c:func:`ovstage_initialize() <ovstage_initialize>` with exactly one :c:func:`ovstage_shutdown() <ovstage_shutdown>`. Destroying a stage does not replace its matching shutdown, and shutdown does not destroy the application's stages.
 
 The runtime-default model is process-scoped. It drives automatic transform
 updates for newly created instances and can be selected explicitly:
@@ -134,14 +142,9 @@ updates for newly created instances and can be selected explicitly:
        input_ordinal,
        output_ordinal);
 
-Configure a concrete CPU or GPU model on the first process reference. Passing
-``RUNTIME_DEFAULT`` as the configured value leaves the runtime default
-unmodified; that config entry is ignored.
+Choose the concrete CPU or GPU model before the first successful :c:func:`ovstage_initialize` call or any stage creation, and pass it in that initialization call's configuration. A later initialization call must match the active model. Passing ``RUNTIME_DEFAULT`` as the configured value leaves the runtime default unmodified; that config entry is ignored.
 
-After creating an instance, :c:func:`ovstage_get_config` returns a borrowed view
-of the explicit entries that established the active process state. The view does
-not materialize omitted defaults and remains valid until the instance is
-destroyed.
+After creating an instance, :c:func:`ovstage_get_config` returns a read-only view of the configured entries. It does not fill in omitted defaults. Use the view only while the instance remains valid.
 
 .. _configuring-ordinal-admission-c:
 
@@ -170,6 +173,109 @@ or acquiring a reference. Balance every successful initialization with
 ``ovstage_shutdown()`` and release all instances, including retained handles and
 attachments, before choosing a different policy. The original explicit entries
 remain available through ``ovstage_get_config()``; omitted defaults are not added.
+
+.. _configuring-population-threads-c:
+
+Configuring Population Threads
+------------------------------
+
+Population reads what its selectors select serially by default. Pass an entry
+from :c:func:`ovstage_config_entry_population_thread_limit` to
+``ovstage_initialize()`` before creating the first instance to let a population
+operation use more threads for those reads:
+
+.. filtered-literalinclude:: ../../tests/c/test_support_api.cpp
+   :language: cpp
+   :start-after: // [snippet:configure-population-threads-c]
+   :end-before: // [/snippet:configure-population-threads-c]
+   :exclude-pattern: ^\s*//\s*\[/?snippet:
+   :dedent:
+
+The limit counts the thread that runs the operation: ``1`` is serial, ``N``
+allows up to ``N`` threads, and ``OVSTAGE_POPULATION_THREAD_LIMIT_AUTO`` lets the
+runtime choose, up to the concurrency the process allows. The runtime may use
+fewer threads. Populated data is the same for every limit.
+
+The limit does not cover the rest of a population operation. Opening and
+composing the USD stage and populating ``OVSTAGE_POPULATION_DOMAIN_RENDERING``
+keep their own concurrency, so a limit of ``1`` does not make a whole
+population operation single-threaded. Which population work the limit covers
+may grow between releases.
+
+The limit is process-scoped and follows the same lifetime rules as the settings
+above. ``OVSTAGE_POPULATION_THREAD_LIMIT_DEFAULT`` (``0``) does not
+override the active limit; a different limit is rejected until all
+initialization and instance references are released.
+
+.. _selecting-the-implementation-c:
+
+Selecting the Implementation
+----------------------------
+
+.. warning::
+
+   History support is **experimental**. The ``history_selective``
+   implementation, the ``ovstage.history.v1`` selection extension of
+   ``ovstage_history.h`` and the ``OVSTAGE_CONFIG_RETENTION_WINDOW`` setting
+   can change between releases without a deprecation period. The library does
+   not guarantee source compatibility, ABI or semantics. Isolate their use
+   behind an application adapter. Check availability at run time.
+
+``ovstage_create_instance()`` creates an instance of the implementation that
+the ``implementation`` member of :c:type:`ovstage_instance_desc_t` selects.
+Each implementation of the library has a name and documents it. ``NULL`` or
+an empty string selects the default implementation, ``history_latest``.
+
+``history_latest`` is the default. History is off: the instance keeps the
+latest value of every cell, and a read returns it. The history selection calls
+of ``ovstage_history.h`` report ``OVSTAGE_ERROR_NOT_SUPPORTED`` on such an
+instance. Set the member to select it by name:
+
+.. code-block:: c
+
+   ovstage_instance_desc_t desc = { .name = "simulation",
+                                    .implementation = "history_latest" };
+   ovstage_instance_t* instance = NULL;
+   ovstage_create_instance(&desc, &instance);
+   /* ... history is off: every read returns the latest value ... */
+   ovstage_destroy_instance(instance);
+
+``history_selective`` turns history on for the pairs the application selects.
+``ovstage_enable_history()`` (``ovstage_history.h``) selects the
+``(prim, attribute)`` pairs that retain their earlier sealed values. The
+process key ``OVSTAGE_CONFIG_RETENTION_WINDOW``
+(:c:func:`ovstage_config_entry_retention_window`, default 4) bounds the number
+of sealed ordinals each selected pair retains. Every other cell keeps the
+latest value. The instance serves the history extension
+``ovstage.history.v1``. It does not serve the experimental device placement
+extension: ``ovstage_query_placement_extension()`` reports
+``OVSTAGE_ERROR_NOT_FOUND`` on it. Every other operation runs as on an
+instance of ``history_latest``. See :ref:`ovstage-selective-history` for the
+complete sequence and for the recovery after a failed selection:
+
+.. code-block:: c
+
+   ovstage_config_entry_t entry = ovstage_config_entry_retention_window(8);
+   ovstage_config_t config = { &entry, 1 };
+   ovstage_initialize(&config);
+
+   ovstage_instance_desc_t desc = { .name = "simulation",
+                                    .implementation = "history_selective" };
+   ovstage_instance_t* instance = NULL;
+   ovstage_create_instance(&desc, &instance);
+   /* ... select pairs with ovstage_enable_history, then destroy the instance ... */
+   ovstage_shutdown();
+
+The selection is per instance. Instances of different implementations share
+one process, so an instance of ``history_selective`` and an instance of
+``history_latest`` can be live together. A name that no implementation of the
+library has is rejected with ``OVSTAGE_ERROR_INVALID_ARGUMENT``, and the call
+creates no instance. ``ovstage_get_last_error()`` then reports the rejected
+name. The process config that ``ovstage_get_config()`` returns holds no entry
+for the implementation. The retention window is a process setting and follows
+the lifetime rules of the settings above. The implementation name is an
+instance setting: each ``ovstage_create_instance()`` call selects the
+implementation of its own instance.
 
 Minimal Program
 ---------------

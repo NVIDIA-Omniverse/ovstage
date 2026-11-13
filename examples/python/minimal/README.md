@@ -32,8 +32,7 @@ dlpack read back ordinal 4 [7. 8. 9.]
   version number the application picks for each write, and advancing the
   **write floor** to 1 seals everything up to that ordinal so readers can
   trust it.
-- The last two lines come from the later sections: the multi-environment
-  clone and the DLPack round trip.
+- `cloned /World/A` and `dlpack read back ordinal 4` show the multi-environment clone and the DLPack round trip.
 
 ## Build and run
 
@@ -68,18 +67,17 @@ python main.py
 
 ## Snippets
 
-The `[snippet:name]` markers in `main.py` fence regions referenced by the
-ovstage skills under `../../../skills/`; keep them intact when editing.
+The `[snippet:name]` markers in [main.py](main.py) identify the source regions described below and referenced by the [ovstage skills](../../../skills/). Keep the markers intact when editing.
 
-- `setup` — imports (`numpy`, `ovstage`)
-- `intern-and-resolve` — path-dictionary intern + resolve
-- `path-list-query` — build a prim-path list and open a query
-- `minimal-write-read` — write → advance write floor → read back
-- `string-or-token-arg` — pass an attribute as an interned token or a plain `str`
-- `clone-subtree-multienv` — clone one prim's subtree to several targets in one call
-- `dlpack-interchange` — zero-copy tensor exchange with numpy via DLPack
-- `error-handling` — `OvstageError` / `OvxError` exception handling
-- `nonblocking-poll` — `wait_op(timeout=0)` poll loop (CPU running ahead)
+- `setup` — Imports NumPy, ovstage, and the tensor, ordinal-range, and error types used throughout the example. `main()` creates the stage and path dictionary before running the snippets.
+- `intern-and-resolve` — Calls `intern_token("temperature")` to obtain an attribute identifier, then `token_to_string()` to recover its name. The printed identifier is assigned at runtime; the resolved name is `temperature`.
+- `path-list-query` — Uses `create_path_list_from_strings()` and `query_from_path_list()` to select `/World/A`, `/World/B`, and `/World/C`. Close the query before destroying its path list; the surrounding context manager and cleanup handle this in `main()`.
+- `minimal-write-read` — Writes temperatures `[1, 2, 3]` at ordinal 1, waits for completion, and advances the write floor. `read_attributes()` then reads the column, and `column.array(0)` exposes its values while the group is valid; the example releases the group after printing.
+- `string-or-token-arg` — Passes `"temperature"` directly to `write_attribute()` instead of its interned token. It updates the same column to `[4, 5, 6]` at ordinal 2, demonstrating that either argument form identifies the attribute.
+- `clone-subtree-multienv` — Calls `clone()` to copy `/World/A` and its subtree to `/World/A_env0` and `/World/A_env1` at ordinal 3. The snippet advances the write floor before later reads of the copied data.
+- `dlpack-interchange` — Wraps NumPy values `[7, 8, 9]` with `DLTensor.from_dlpack()` for a write, then reads them with `np.from_dlpack(read_column.dlpack(0))`. It accounts for a data-row index map when present and finishes using the returned array before releasing the group.
+- `error-handling` — The reference helper `write_checked()` waits for a write and returns `True` on success. If an `OvstageError` occurs, it prints the code and message and returns `False`; this helper is provided for reuse and is not called by `main()`.
+- `nonblocking-poll` — The reference helper `poll_until_done()` repeatedly calls `wait_op(timeout=0)`, continuing on `TIMEOUT` and reporting failures. It releases the operation record after completion; this helper is also separate from the main demonstration.
 
 ## Notes
 

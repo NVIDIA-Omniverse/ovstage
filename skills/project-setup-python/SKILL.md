@@ -47,8 +47,8 @@ Resolve inputs in this order: existing repository files and referenced snippets,
 
 ## Prerequisites
 
-- Python **3.10–3.13** (`requires-python = ">=3.10,<3.14"`).
-- A built ovstage shared library reachable by the loader (see Library Path below).
+- Python **3.10–3.14** (`python/pyproject.toml`: `requires-python = ">=3.10,<3.15"`). Individual example projects may require a narrower range; follow their own `pyproject.toml`.
+- For native API calls, an ovstage shared library reachable by the loader (see Library Path below).
 - `numpy` for tensor attribute I/O.
 
 ## Instructions
@@ -83,9 +83,11 @@ This skill has no scripts.
 ## Overview
 
 ovstage ships a Python package, **`ovstage`**, built with hatchling
-(`pyproject.toml`, `requires-python = ">=3.10,<3.14"`). It binds the ovstage C
-data-plane via ctypes, so the **ovstage shared loader must be loadable** at
-import time. The released wheel bundles that library at `<package>/bin`, which
+(`python/pyproject.toml`, `requires-python = ">=3.10,<3.15"`). It binds the ovstage C
+data-plane via ctypes. Plain `import ovstage` and inspection of `ovstage.__version__`
+do not load native libraries. Native API calls open the shared loader on demand;
+creating a `Stage` initializes the runtime.
+The released wheel bundles that library at `<package>/bin`, which
 the bindings find automatically — a wheel consumer needs no loader-path setup.
 
 ## Installing
@@ -129,7 +131,7 @@ export LD_LIBRARY_PATH=/path/to/ovstage/build/output:$LD_LIBRARY_PATH
 | Package | Purpose |
 |---------|---------|
 | `ovstage` | the bindings (Stage, PathDictionary, OrdinalRange, …) |
-| `numpy` | tensor attribute I/O (`write_attribute(tensors=...)`, `group.array(...)`) |
+| `numpy` | tensor attribute I/O (`write_attribute(tensors=...)`, `column.array(...)`) |
 
 ## Minimal Program
 
@@ -158,11 +160,11 @@ for `PathDictionary`, and `string-handling` (Python) for `str` vs. interned-toke
 
 ## Troubleshooting
 
-- **Import fails / shared loader not found:** make the build output dir (holding
+- **Native API call fails / shared loader not found:** make the build output dir (holding
   `ovstage-dynamic.dll` / `libovstage-dynamic.so`) reachable — set `OVSTAGE_LIBRARY_PATH_HINT` to it, or add
   it to `PATH` (Windows) / `LD_LIBRARY_PATH` (Linux). See Library Path.
-- **Unsupported Python version:** the package supports 3.10–3.13 only; recreate the env
-  with a supported interpreter rather than editing the constraint.
+- **Unsupported Python version:** use Python 3.10–3.14 for the package, within the
+  project's own constraint, and follow the README's platform runtime prerequisites.
 - **`OvstageError` / `OvxError` on calls:** these are `RuntimeError` subclasses carrying a
   numeric `code`; see the `error-handling` skill.
 - **Forgot to `.wait()`:** async ops (`write_attribute`, `advance_write_floor`,

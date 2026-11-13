@@ -11,8 +11,11 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from ovstage import PrimPath, Token
 from ovstage import (AttributeSemantic, DLDataType, DLDataTypeCode, OrdinalRange, PathDictionary,
-                     ReadGroup, make_dltensor)
+    ReadColumn,
+    make_dltensor,
+)
 
 FLOAT3 = DLDataType(code=DLDataTypeCode.kDLFloat, bits=32, lanes=3)
 MAT4 = DLDataType(code=DLDataTypeCode.kDLFloat, bits=64, lanes=16)
@@ -24,15 +27,19 @@ def _semantic_payload(paths, semantic):
     if semantic == AttributeSemantic.STRING:
         return [np.frombuffer(b"text", dtype=np.uint8)], True
     if semantic == AttributeSemantic.ASSET_PATH_ID:
-        values = np.array([paths.intern_token("authored.png"), paths.intern_token("resolved.png")], np.uint64)
+        values = np.array(
+            [paths.intern_token("authored.png").raw_id, paths.intern_token("resolved.png").raw_id], np.uint64,
+        )
         return make_dltensor(values, dtype=UINT64X2, shape=[1]), False
     if semantic == AttributeSemantic.CONNECTION_PATH_ID:
-        values = np.array([paths.intern_path("/World/Source"), paths.intern_token("outputs:value")], np.uint64)
+        values = np.array(
+            [paths.intern_path("/World/Source").raw_id, paths.intern_token("outputs:value").raw_id], np.uint64,
+        )
         return make_dltensor(values, dtype=UINT64X2, shape=[1]), False
     if semantic == AttributeSemantic.RELATIONSHIP_PATH_ID:
-        return [np.array([paths.intern_path("/World/Target")], np.uint64)], True
+        return [np.array([paths.intern_path("/World/Target").raw_id], np.uint64)], True
     if semantic in (AttributeSemantic.TOKEN_ID, AttributeSemantic.PATH_EXPRESSION_STRING):
-        return np.array([paths.intern_token("value")], np.uint64), False
+        return np.array([paths.intern_token("value").raw_id], np.uint64), False
 
     lanes = {
         AttributeSemantic.POINT: 3,
@@ -44,11 +51,13 @@ def _semantic_payload(paths, semantic):
         AttributeSemantic.TEXTURE_COORDINATE: 2,
         AttributeSemantic.FRAME: 16,
     }.get(semantic, 1)
-    numpy_dtype = np.float64 if semantic in (
-        AttributeSemantic.MATRIX,
-        AttributeSemantic.TIME_CODE,
-        AttributeSemantic.FRAME,
-    ) else np.float32
+    numpy_dtype = (
+        np.float64 if semantic in (
+            AttributeSemantic.MATRIX,
+            AttributeSemantic.TIME_CODE,
+            AttributeSemantic.FRAME,
+        ) else np.float32
+    )
     dtype = DLDataType(code=DLDataTypeCode.kDLFloat, bits=np.dtype(numpy_dtype).itemsize * 8, lanes=lanes)
     return make_dltensor(np.zeros(lanes, dtype=numpy_dtype), dtype=dtype, shape=[1]), False
 
@@ -67,7 +76,7 @@ def test_semantic_roles_round_trip(stage):
             # [snippet:semantic-roles]
             # A semantic is the authored USD interpretation of a column's bytes,
             # orthogonal to the storage dtype: the write stamps it at creation and
-            # reads recover it (group.semantic). The same 3-lane float32 storage
+            # reads recover it (column.semantic). The same 3-lane float32 storage
             # is POINT on one column and COLOR on another; a 16-lane float64 is
             # MATRIX. TOKEN_ID differs: it pins uint64 storage and the payload must
             # be pre-interned path-dictionary token ids — ovstage never stringifies.
@@ -75,15 +84,18 @@ def test_semantic_roles_round_trip(stage):
             rubber = paths.intern_token("rubber")
             stage.write_attribute(query, "points", ordinal=1, is_array=False,
                                   tensors=make_dltensor(np.array([0, 0, 1, 0, 1, 0], np.float32), dtype=FLOAT3,
-                                                        shape=[2]), semantic=AttributeSemantic.POINT).wait()
+                                                        shape=[2]), semantic=AttributeSemantic.POINT,
+            ).wait()
             stage.write_attribute(query, "display-color", ordinal=1, is_array=False,
                                   tensors=make_dltensor(np.array([1, 0, 0, 0, 0.5, 0], np.float32), dtype=FLOAT3,
-                                                        shape=[2]), semantic=AttributeSemantic.COLOR).wait()
+                                                        shape=[2]), semantic=AttributeSemantic.COLOR,
+            ).wait()
             stage.write_attribute(query, "local-matrix", ordinal=1, is_array=False,
                                   tensors=make_dltensor(np.tile(np.eye(4, dtype=np.float64).ravel(), 2), dtype=MAT4,
-                                                        shape=[2]), semantic=AttributeSemantic.MATRIX).wait()
+                                                        shape=[2]), semantic=AttributeSemantic.MATRIX,
+            ).wait()
             stage.write_attribute(query, "material", ordinal=1, is_array=False,
-                                  tensors=np.array([steel, rubber], np.uint64),
+                                  tensors=np.array([steel.raw_id, rubber.raw_id], np.uint64),
                                   semantic=AttributeSemantic.TOKEN_ID).wait()
             stage.advance_write_floor(ordinal=1).wait()
             # [/snippet:semantic-roles]
@@ -91,16 +103,18 @@ def test_semantic_roles_round_trip(stage):
             for name, expected in (("points", AttributeSemantic.POINT),
                                    ("display-color", AttributeSemantic.COLOR),
                                    ("local-matrix", AttributeSemantic.MATRIX),
-                                   ("material", AttributeSemantic.TOKEN_ID)):
+                                   ("material", AttributeSemantic.TOKEN_ID),
+            ):
                 attr = paths.intern_token(name)
                 read, group = _read_one_group(stage, query, attr, 1)
                 assert group is not None, name
-                assert group.semantic == expected, name
+                column = group.columns[0]
+                assert column.semantic == expected, name
                 if name == "local-matrix":
-                    assert group.tensor(0).dtype.lanes == 1
-                    assert group.tensor(0).shape_tuple == (2, 4, 4)
+                    assert column.tensor(0).dtype.lanes == 1
+                    assert column.tensor(0).shape_tuple == (2, 4, 4)
                 if name == "material":
-                    resolved = [paths.token_to_string(int(t)) for t in np.asarray(group.array(0))]
+                    resolved = [paths.token_to_string(Token(t)) for t in np.asarray(column.array(0))]
                     assert set(resolved) == {"steel", "rubber"}  # order-independent
                 stage.release_group(group)
                 read.release().wait()
@@ -126,11 +140,12 @@ def test_connection_path_ids_round_trip_for_single_and_multi_prim_reads(stage):
         multi_query = stage.query_from_path_list(multi_plist)
         single_query = stage.query_from_path_list(single_plist)
         try:
-            payload = np.array([expected[path] for path in target_names], dtype=np.uint64)
+            payload = np.array([[handle.raw_id for handle in expected[path]] for path in target_names], dtype=np.uint64)
             tensor = make_dltensor(payload.reshape(-1), dtype=UINT64X2, shape=[len(target_names)])
             stage.write_attribute(multi_query, connection_attr, ordinal=1, is_array=False,
                                   tensors=tensor,
-                                  semantic=AttributeSemantic.CONNECTION_PATH_ID).wait()
+                                  semantic=AttributeSemantic.CONNECTION_PATH_ID,
+            ).wait()
             stage.advance_write_floor(ordinal=1).wait()
 
             for query, expected_rows in (
@@ -139,18 +154,19 @@ def test_connection_path_ids_round_trip_for_single_and_multi_prim_reads(stage):
             ):
                 read, group = _read_one_group(stage, query, connection_attr, 1)
                 assert group is not None
-                assert not group.is_array
-                assert group.semantic == AttributeSemantic.CONNECTION_PATH_ID
-                dtype = group.tensor(0).dtype
+                column = group.columns[0]
+                assert not column.is_array
+                assert column.semantic == AttributeSemantic.CONNECTION_PATH_ID
+                dtype = column.tensor(0).dtype
                 assert (dtype.code, dtype.bits, dtype.lanes) == (DLDataTypeCode.kDLUInt, 64, 1)
-                assert group.tensor(0).shape_tuple[-1] == 2
+                assert column.tensor(0).shape_tuple[-1] == 2
 
                 list_paths = paths.get_path_strings(group.prim_list)
-                values = np.asarray(group.array(0)).reshape(-1, 2)
+                values = np.asarray(column.array(0)).reshape(-1, 2)
                 actual = {}
                 for local in range(group.prim_count):
-                    pair = values[group.data_row_index(local)]
-                    actual[list_paths[group.prim_index(local)]] = (int(pair[0]), int(pair[1]))
+                    pair = values[column.data_row_index(local)]
+                    actual[list_paths[group.prim_index(local)]] = (PrimPath(pair[0]), Token(pair[1]))
                 assert actual == expected_rows
 
                 stage.release_group(group)
@@ -174,17 +190,18 @@ def test_single_path_relationship_round_trips(stage):
         query = stage.query_from_path_list(plist)
         try:
             stage.write_attribute(query, link, ordinal=1, is_array=False,
-                                  tensors=np.array([expected[name] for name in names], np.uint64),
+                                  tensors=np.array([expected[name].raw_id for name in names], np.uint64),
                                   semantic=AttributeSemantic.RELATIONSHIP_PATH_ID).wait()
             stage.advance_write_floor(ordinal=1).wait()
 
             read, group = _read_one_group(stage, query, link, 1)
             assert group is not None
-            assert not group.is_array
-            assert group.semantic == AttributeSemantic.RELATIONSHIP_PATH_ID
+            column = group.columns[0]
+            assert not column.is_array
+            assert column.semantic == AttributeSemantic.RELATIONSHIP_PATH_ID
             list_paths = paths.get_path_strings(group.prim_list)
-            values = np.asarray(group.array(0)).reshape(-1)
-            actual = {list_paths[group.prim_index(local)]: int(values[group.data_row_index(local)])
+            values = np.asarray(column.array(0)).reshape(-1)
+            actual = {list_paths[group.prim_index(local)]: PrimPath(values[column.data_row_index(local)])
                       for local in range(group.prim_count)}
             assert actual == expected
             stage.release_group(group)
@@ -218,13 +235,19 @@ def test_read_group_semantic_round_trips_every_public_value(stage, semantic):
                     group = read.wait().fetch_next()
                     assert group is not None
                     with group:
-                        assert group.semantic == semantic
+                        assert group.columns[0].semantic == semantic
             finally:
                 stage.release_query(query).wait()
 
 
 def test_read_group_semantic_preserves_unknown_native_value():
     unknown = max(semantic.value for semantic in AttributeSemantic) + 1
-    group = ReadGroup(SimpleNamespace(semantic=unknown))
-    assert group.semantic == unknown
-    assert type(group.semantic) is int
+
+    class LiveGroup:
+        def _check_live(self):
+            pass
+
+    group = LiveGroup()
+    column = ReadColumn(SimpleNamespace(semantic=unknown), group)
+    assert column.semantic == unknown
+    assert type(column.semantic) is int

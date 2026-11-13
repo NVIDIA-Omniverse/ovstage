@@ -379,8 +379,8 @@ not text. Supply the dtype and element count listed below; mismatches fail with
      - One token id per value.
    * - ``RELATIONSHIP_PATH_ID``
      - ``uint64``, 1 lane
-     - Path ids: ``is_array=True`` for a target list, or ``False`` for
-       exactly one path per prim.
+     - Path ids. ``is_array=True`` is a relationship's target list, one id per
+       target; ``False`` holds exactly one path per prim.
    * - ``CONNECTION_PATH_ID``
      - ``uint64``, 2 lanes
      - One ``(path id, token id)`` pair per target prim/property. Scalar and

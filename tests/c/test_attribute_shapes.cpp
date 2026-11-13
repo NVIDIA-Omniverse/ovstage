@@ -149,16 +149,19 @@ TEST_F(ShapesTest, ScalarAndFixedLane)
         ovstage_read_handle_t read = OVSTAGE_INVALID_READ_HANDLE;
         ASSERT_TRUE(waitOp(stage_, ovstage_read_attributes(stage_, query_, &temperature, 1, range, &read),
             "read scalar"));
+        size_t fetchedGroupCount = 0;
         ovstage_read_group_t group{};
-        ASSERT_EQ(ovstage_fetch_read_next(stage_, read, OVSTAGE_TIMEOUT_INFINITE, &group), OVSTAGE_OK);
-        ASSERT_EQ(group.data.tensor_count, 1u);
-        EXPECT_EQ(group.data.tensors[0].dtype.lanes, 1u);
+        ASSERT_EQ(ovstage_fetch_read_next(stage_, read, OVSTAGE_TIMEOUT_INFINITE, &group, 1, &fetchedGroupCount), OVSTAGE_OK);
+        ASSERT_EQ(group.column_count, 1u);
+        const ovstage_read_column_t& column = group.columns[0];
+        ASSERT_EQ(column.data.tensor_count, 1u);
+        EXPECT_EQ(column.data.tensors[0].dtype.lanes, 1u);
         float out[3] = {};
-        std::memcpy(out, group.data.tensors[0].data, sizeof(out));
+        std::memcpy(out, column.data.tensors[0].data, sizeof(out));
         EXPECT_FLOAT_EQ(out[0], 18.5f);
         EXPECT_FLOAT_EQ(out[1], 19.5f);
         EXPECT_FLOAT_EQ(out[2], 20.5f);
-        ovstage_release_group(stage_, &group);
+        ovstage_release_groups(stage_, &group, 1);
         waitOp(stage_, ovstage_release_read(stage_, read), "release_read");
     }
 
@@ -169,19 +172,22 @@ TEST_F(ShapesTest, ScalarAndFixedLane)
         ovstage_read_handle_t read = OVSTAGE_INVALID_READ_HANDLE;
         ASSERT_TRUE(waitOp(stage_, ovstage_read_attributes(stage_, query_, &velocity, 1, range, &read),
             "read vec3"));
+        size_t fetchedGroupCount = 0;
         ovstage_read_group_t group{};
-        ASSERT_EQ(ovstage_fetch_read_next(stage_, read, OVSTAGE_TIMEOUT_INFINITE, &group), OVSTAGE_OK);
-        ASSERT_EQ(group.data.tensor_count, 1u);
-        EXPECT_EQ(group.data.tensors[0].dtype.lanes, 1u);
-        EXPECT_EQ(group.data.tensors[0].ndim, 2);
-        EXPECT_EQ(group.data.tensors[0].shape[0], 3);
-        EXPECT_EQ(group.data.tensors[0].shape[1], 3);
+        ASSERT_EQ(ovstage_fetch_read_next(stage_, read, OVSTAGE_TIMEOUT_INFINITE, &group, 1, &fetchedGroupCount), OVSTAGE_OK);
+        ASSERT_EQ(group.column_count, 1u);
+        const ovstage_read_column_t& column = group.columns[0];
+        ASSERT_EQ(column.data.tensor_count, 1u);
+        EXPECT_EQ(column.data.tensors[0].dtype.lanes, 1u);
+        EXPECT_EQ(column.data.tensors[0].ndim, 2);
+        EXPECT_EQ(column.data.tensors[0].shape[0], 3);
+        EXPECT_EQ(column.data.tensors[0].shape[1], 3);
         float out[9] = {};
-        std::memcpy(out, group.data.tensors[0].data, sizeof(out));
+        std::memcpy(out, column.data.tensors[0].data, sizeof(out));
         const float expected[9] = { 1, 0, 0, 0, 1, 0, 0, 0, 1 };
         for (int i = 0; i < 9; ++i)
             EXPECT_FLOAT_EQ(out[i], expected[i]);
-        ovstage_release_group(stage_, &group);
+        ovstage_release_groups(stage_, &group, 1);
         waitOp(stage_, ovstage_release_read(stage_, read), "release_read");
     }
 }
@@ -234,19 +240,23 @@ TEST_F(ShapesTest, RaggedArray)
     std::map<int64_t, std::vector<float>> byLength;
     for (;;)
     {
+        size_t fetchedGroupCount = 0;
         ovstage_read_group_t group{};
-        const ovstage_api_status_t fetched = ovstage_fetch_read_next(stage_, read, OVSTAGE_TIMEOUT_INFINITE, &group);
+        const ovstage_api_status_t fetched =
+            ovstage_fetch_read_next(stage_, read, OVSTAGE_TIMEOUT_INFINITE, &group, 1, &fetchedGroupCount);
         if (fetched == OVSTAGE_ERROR_END_OF_ITERATION)
             break;
         ASSERT_EQ(fetched, OVSTAGE_OK);
+        ASSERT_EQ(group.column_count, 1u);
+        const ovstage_read_column_t& column = group.columns[0];
         for (uint32_t local = 0; local < group.prims.count; ++local)
         {
-            const uint32_t rowIdx = group.data.index_map ? group.data.index_map[local] : local;
-            const DLTensor& t = group.data.tensors[rowIdx];
+            const uint32_t rowIdx = column.data.index_map ? column.data.index_map[local] : local;
+            const DLTensor& t = column.data.tensors[rowIdx];
             byLength[t.shape[0]] = std::vector<float>(static_cast<const float*>(t.data),
                                                       static_cast<const float*>(t.data) + t.shape[0]);
         }
-        ovstage_release_group(stage_, &group);
+        ovstage_release_groups(stage_, &group, 1);
     }
     waitOp(stage_, ovstage_release_read(stage_, read), "release_read");
 

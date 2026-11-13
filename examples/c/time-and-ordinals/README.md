@@ -4,7 +4,7 @@ A standalone C++ program that shows **how to place time-indexed data on the
 ordinal axis**: one timeline, two data sources. A saxpy simulator steps three
 sphere prims with **non-uniform dt** (`position += velocity * dt`), and a
 time-sampled USD clip animates a conveyor. ovstage stores no time — it orders
-writes by opaque `uint64` ordinals — so the application owns an explicit
+writes by opaque `int64` ordinals — so the application owns an explicit
 ordinal ↔ time table and uses it to land **both** sources in the same ordinal
 slot per tick. Because the slots are shared, anything a consumer reads at a
 sealed ordinal is **time-coherent** — every value describes the same instant.
@@ -94,11 +94,10 @@ directory (`../CMakeLists.txt` aggregates them).
 
 ## Snippets
 
-The `[snippet:name]` markers in `main.cpp` fence regions referenced by the
-ovstage skills under `../../../skills/`; keep them intact when editing.
+The `[snippet:name]` markers in [main.cpp](main.cpp) identify the source regions described below and referenced by the [ovstage skills](../../../skills/). Keep the markers intact when editing.
 
-- `time-to-ordinal-table` — the app-owned ordinal ↔ time table (a table, not a formula)
-- `float3-attribute-write` — float3-per-prim column write (`lanes=3`, POINT/VECTOR semantic)
+- `time-to-ordinal-table` — Builds `timeOfOrdinal` by accumulating the step durations in `kDtOfTick`. Ordinal 1 represents time zero; later entries record simulation time in seconds after each step, keeping the time mapping explicit when step durations vary.
+- `float3-attribute-write` — Uses `cpuFloatTensor()` and `writeData()` to describe one three-component float32 position and velocity per sphere. `ovstage_write_attribute()` writes both at ordinal 1 with `POINT` and `VECTOR` semantics; the program waits before advancing the write floor.
 
 ## Notes
 

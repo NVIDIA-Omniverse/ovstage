@@ -12,6 +12,7 @@ import ctypes
 from enum import IntEnum
 from typing import Callable, Optional
 
+from ..handles import PopulationExportDestinationHandle, PopulationOpId
 from . import bindings as _core
 from . import population_export_bindings as _b
 from .selectors import (
@@ -28,7 +29,6 @@ from .types import (
     check_ordinal,
     check_timeout,
     check_uint32,
-    check_uint64,
 )
 
 OVSTAGE_POPULATION_EXPORT_SELECTION_EXPLICIT_PREDICATE = _b.OVSTAGE_POPULATION_EXPORT_SELECTION_EXPLICIT_PREDICATE
@@ -55,9 +55,7 @@ OVSTAGE_POPULATION_EXPORT_SOURCE_API_SCHEMAS_APPLY_RECORDED = (
 )
 OVSTAGE_POPULATION_EXPORT_PROJECTION_EXPLICIT_RULES = _b.OVSTAGE_POPULATION_EXPORT_PROJECTION_EXPLICIT_RULES
 OVSTAGE_POPULATION_EXPORT_PROJECTION_SCHEMA_DECLARED = _b.OVSTAGE_POPULATION_EXPORT_PROJECTION_SCHEMA_DECLARED
-OVSTAGE_POPULATION_EXPORT_UNKNOWN_APPLIED_API_SCHEMAS_CUSTOM_DATA_KEY = (
-    "ovpopulation:unknownAppliedAPISchemas"
-)
+OVSTAGE_POPULATION_EXPORT_UNKNOWN_APPLIED_API_SCHEMAS_CUSTOM_DATA_KEY = "ovpopulation:unknownAppliedAPISchemas"
 OVSTAGE_POPULATION_EXPORT_RULE_NONE = _b.OVSTAGE_POPULATION_EXPORT_RULE_NONE
 OVSTAGE_POPULATION_EXPORT_RULE_EXPORT_DEFAULT_VALUE = _b.OVSTAGE_POPULATION_EXPORT_RULE_EXPORT_DEFAULT_VALUE
 OVSTAGE_POPULATION_EXPORT_RULE_DERIVED_ALLOWED = _b.OVSTAGE_POPULATION_EXPORT_RULE_DERIVED_ALLOWED
@@ -75,7 +73,12 @@ OVSTAGE_POPULATION_EXPORT_DESTINATION_OPEN_EXISTING = _b.OVSTAGE_POPULATION_EXPO
 
 
 def export_available() -> bool:
-    """True when libovstage exports the ovstage population USD export bridge."""
+    """True when libovstage exports the export descriptor initializers.
+
+    The export functions that take a stage are members of the population
+    family vtable of every instance. An implementation that does not serve them
+    answers ``OVSTAGE_ERROR_NOT_SUPPORTED`` at the call.
+    """
     return _b.available()
 
 
@@ -87,33 +90,21 @@ def _last_error() -> str:
 
 
 def _require_export(stage):
+    """Return the facade and the instance pointer of ``stage`` for an export call.
+
+    ``_b.load()`` binds the prototypes of the export descriptor initializers.
+    The facade (:class:`bindings._InstanceApi`) serves each export function by
+    its historical name through the population family vtable of the
+    instance, and delegates the descriptor initializers and the error accessors
+    to the library.
+    """
     lib = _b.load()
-    if not hasattr(lib, "ovstage_population_export_to_usd_layer_identifier"):
+    if not hasattr(lib, "ovstage_population_export_desc_init"):
         raise OvstageError(
             _b.OVSTAGE_ERROR_NOT_SUPPORTED,
             "libovstage was built without the ovstage population export-to-USD bridge",
         )
-    return lib, stage._inst
-
-
-def _require_destination_symbols(stage):
-    lib, inst = _require_export(stage)
-    required = (
-        "ovstage_population_export_destination_create",
-        "ovstage_population_export_destination_enqueue_create",
-        "ovstage_population_export_to_destination",
-        "ovstage_population_export_enqueue_to_destination",
-        "ovstage_population_export_destination_save",
-        "ovstage_population_export_destination_enqueue_save",
-        "ovstage_population_export_destination_destroy",
-        "ovstage_population_export_destination_enqueue_destroy",
-    )
-    if not all(hasattr(lib, name) for name in required):
-        raise OvstageError(
-            _b.OVSTAGE_ERROR_NOT_SUPPORTED,
-            "libovstage was built without reusable USD export destinations",
-        )
-    return lib, inst
+    return stage._api, stage._inst
 
 
 class ExportOperation:
@@ -123,11 +114,11 @@ class ExportOperation:
     Timeout polling does not consume the native report or destination keepalive.
     """
 
-    def __init__(self, stage, lib, status: int, op_id: int, *, name: str):
+    def __init__(self, stage, api, status: int, op_id: PopulationOpId, *, name: str):
         self._stage = stage
-        self._lib = lib
+        self._api = api
         self.status = int(status)
-        self.op_id = int(op_id)
+        self.op_id = _b.ovstage_population_op_id_t(_b.ovstage_population_op_id_t._require(op_id, "op_id"))
         self._name = name
         self._terminal = False
 
@@ -137,7 +128,7 @@ class ExportOperation:
 
     def error_message(self) -> str:
         try:
-            return str(self._lib.ovstage_population_get_last_op_error(self.op_id))
+            return str(self._api.ovstage_population_get_last_op_error(self.op_id))
         except Exception:  # noqa: BLE001 - fall back to the shared last-error channel
             return ""
 
@@ -150,7 +141,7 @@ class ExportOperation:
             raise OvstageError(self.status, _last_error())
 
         report = _b.ovstage_population_export_report_t()
-        code = self._lib.ovstage_population_export_wait_op(
+        code = self._api.ovstage_population_export_wait_op(
             self._stage._inst,
             self.op_id,
             check_timeout(timeout),
@@ -187,9 +178,7 @@ class ExportProjection(IntEnum):
 
 class _ExportSelection(IntEnum):
     EXPLICIT_PREDICATE = OVSTAGE_POPULATION_EXPORT_SELECTION_EXPLICIT_PREDICATE
-    CHANGED_PROPERTIES_SINCE_ORDINAL = (
-        OVSTAGE_POPULATION_EXPORT_SELECTION_CHANGED_PROPERTIES_SINCE_ORDINAL
-    )
+    CHANGED_PROPERTIES_SINCE_ORDINAL = OVSTAGE_POPULATION_EXPORT_SELECTION_CHANGED_PROPERTIES_SINCE_ORDINAL
 
 
 class _ExportLayerMode(IntEnum):
@@ -238,18 +227,18 @@ class DestinationOperation:
     def __init__(
         self,
         stage,
-        lib,
+        api,
         status: int,
-        op_id: int,
+        op_id: PopulationOpId,
         *,
         value=True,
         keepalive=None,
         on_terminal: Optional[Callable[[bool], None]] = None,
     ):
         self._stage = stage
-        self._lib = lib
+        self._api = api
         self.status = int(status)
-        self.op_id = int(op_id)
+        self.op_id = _b.ovstage_population_op_id_t(_b.ovstage_population_op_id_t._require(op_id, "op_id"))
         self._value = value
         self._keepalive = keepalive
         self._on_terminal = on_terminal
@@ -275,7 +264,7 @@ class DestinationOperation:
             self._finish(False)
             raise OvstageError(self.status, _last_error())
 
-        code = self._lib.ovstage_population_export_wait_op(
+        code = self._api.ovstage_population_export_wait_op(
             self._stage._inst,
             self.op_id,
             check_timeout(timeout),
@@ -288,7 +277,7 @@ class DestinationOperation:
             return self._value
 
         self._finish(False)
-        raise OvstageError(code, str(self._lib.ovstage_population_get_last_op_error(self.op_id)) or _last_error())
+        raise OvstageError(code, str(self._api.ovstage_population_get_last_op_error(self.op_id)) or _last_error())
 
 
 class DestinationCreateOperation(DestinationOperation):
@@ -308,10 +297,12 @@ class ExportDestination:
     finalizer best-effort queues release without saving and emits ``ResourceWarning``.
     """
 
-    def __init__(self, stage, lib, handle: int, identifier: str):
+    def __init__(self, stage, api, handle: PopulationExportDestinationHandle, identifier: str):
         self._stage = stage
-        self._lib = lib
-        self._handle = check_uint64(handle, "destination handle")
+        self._api = api
+        self._handle = _b.ovstage_population_export_destination_handle_t(
+            _b.ovstage_population_export_destination_handle_t._require(handle, "destination handle")
+        )
         self.identifier = str(identifier)
         self._closing = False
         self._closed = False
@@ -324,7 +315,7 @@ class ExportDestination:
         mode: int = ExportDestinationMode.EMPTY,
     ):
         """Create a destination and wait until it is ready."""
-        lib, inst = _require_destination_symbols(stage)
+        lib, inst = _require_export(stage)
         identifier_s = _b.ovx_string_t(identifier)
         handle = _b.ovstage_population_export_destination_handle_t()
         code = lib.ovstage_population_export_destination_create(
@@ -335,7 +326,7 @@ class ExportDestination:
         )
         if code != _b.OVSTAGE_OK:
             raise OvstageError(code, _last_error())
-        return cls(stage, lib, handle.value, identifier)
+        return cls(stage, lib, handle, identifier)
 
     @classmethod
     def create_async(
@@ -345,7 +336,7 @@ class ExportDestination:
         mode: int = ExportDestinationMode.EMPTY,
     ) -> DestinationCreateOperation:
         """Enqueue creation and expose the reserved destination immediately."""
-        lib, inst = _require_destination_symbols(stage)
+        lib, inst = _require_export(stage)
         identifier_s = _b.ovx_string_t(identifier)
         handle = _b.ovstage_population_export_destination_handle_t()
         result = lib.ovstage_population_export_destination_enqueue_create(
@@ -356,7 +347,7 @@ class ExportDestination:
         )
         if result.status != _b.OVSTAGE_OK:
             raise OvstageError(result.status, _last_error())
-        destination = cls(stage, lib, handle.value, identifier)
+        destination = cls(stage, lib, handle, identifier)
 
         def creation_finished(success: bool) -> None:
             if not success:
@@ -373,7 +364,7 @@ class ExportDestination:
         )
 
     @property
-    def handle(self) -> int:
+    def handle(self) -> PopulationExportDestinationHandle:
         return self._handle
 
     @property
@@ -387,7 +378,7 @@ class ExportDestination:
     def save(self) -> None:
         """Persist all currently accumulated opinions."""
         self._require_open()
-        code = self._lib.ovstage_population_export_destination_save(self._stage._inst, self._handle)
+        code = self._api.ovstage_population_export_destination_save(self._stage._inst, self._handle)
         if code != _b.OVSTAGE_OK:
             raise OvstageError(code, _last_error())
 
@@ -402,10 +393,10 @@ class ExportDestination:
     def save_async(self) -> DestinationOperation:
         """Enqueue persistence after previously submitted destination work."""
         self._require_open()
-        result = self._lib.ovstage_population_export_destination_enqueue_save(self._stage._inst, self._handle)
+        result = self._api.ovstage_population_export_destination_enqueue_save(self._stage._inst, self._handle)
         if result.status != _b.OVSTAGE_OK:
             raise OvstageError(result.status, _last_error())
-        return DestinationOperation(self._stage, self._lib, result.status, result.op_index)
+        return DestinationOperation(self._stage, self._api, result.status, result.op_index)
 
     def close(self) -> None:
         """Release the destination without implicitly saving."""
@@ -413,7 +404,7 @@ class ExportDestination:
             return
         self._require_open()
         self._closing = True
-        code = self._lib.ovstage_population_export_destination_destroy(self._stage._inst, self._handle)
+        code = self._api.ovstage_population_export_destination_destroy(self._stage._inst, self._handle)
         if code != _b.OVSTAGE_OK:
             self._closing = False
             raise OvstageError(code, _last_error())
@@ -422,7 +413,7 @@ class ExportDestination:
     def close_async(self) -> DestinationOperation:
         """Enqueue ordered release without implicitly saving."""
         self._require_open()
-        result = self._lib.ovstage_population_export_destination_enqueue_destroy(self._stage._inst, self._handle)
+        result = self._api.ovstage_population_export_destination_enqueue_destroy(self._stage._inst, self._handle)
         if result.status != _b.OVSTAGE_OK:
             raise OvstageError(result.status, _last_error())
         self._closing = True
@@ -435,7 +426,7 @@ class ExportDestination:
 
         return DestinationOperation(
             self._stage,
-            self._lib,
+            self._api,
             result.status,
             result.op_index,
             on_terminal=close_finished,
@@ -457,14 +448,14 @@ class ExportDestination:
         if getattr(self, "_closed", True) or getattr(self, "_closing", False):
             return
         stage = getattr(self, "_stage", None)
-        lib = getattr(self, "_lib", None)
+        api = getattr(self, "_api", None)
         handle = getattr(self, "_handle", None)
-        if stage is None or lib is None or handle is None or not getattr(stage, "_inst", None):
+        if stage is None or api is None or handle is None or not getattr(stage, "_inst", None):
             return
         try:
             # Do not synchronously wait during GC.  The native FIFO owns the
             # queued release and never persists the destination.
-            result = lib.ovstage_population_export_destination_enqueue_destroy(stage._inst, handle)
+            result = api.ovstage_population_export_destination_enqueue_destroy(stage._inst, handle)
             if result.status == _b.OVSTAGE_OK:
                 self._closing = True
         except Exception:
@@ -665,7 +656,7 @@ def _build_export_desc(
     )
     if code != _b.OVSTAGE_OK:
         raise OvstageError(code, _last_error())
-    desc.since_ordinal = check_uint64(since_ordinal, "since_ordinal")
+    desc.since_ordinal = check_ordinal(since_ordinal)
     desc.selection = check_enum_member(selection, _ExportSelection, "selection")
     desc.layer_mode = check_enum_member(layer_mode, _ExportLayerMode, "layer_mode")
     desc.transform_policy = check_enum_member(transform_policy, _TransformPolicy, "transform_policy")
@@ -743,11 +734,6 @@ def _export_to_usd_identifier(
     metadata_rules,
 ) -> dict:
     lib, inst = _require_export(stage)
-    if not hasattr(lib, c_function_name):
-        raise OvstageError(
-            _b.OVSTAGE_ERROR_NOT_SUPPORTED,
-            f"libovstage was built without {public_function_name}",
-        )
     desc, refs = _build_export_desc(
         lib,
         ordinal,
@@ -784,12 +770,6 @@ def _enqueue_to_usd_identifier(
     **options,
 ) -> ExportOperation:
     lib, inst = _require_export(stage)
-    if not hasattr(lib, c_function_name):
-        raise OvstageError(
-            _b.OVSTAGE_ERROR_NOT_SUPPORTED,
-            f"libovstage was built without {public_function_name}",
-        )
-
     desc, refs = _build_export_desc(lib, ordinal, **options)
     identifier_s = _b.ovx_string_t(identifier)
     refs.append(identifier_s)
@@ -1036,14 +1016,11 @@ def _typed_hierarchy_options(
             if not isinstance(namespace, str):
                 raise TypeError("include_custom_namespaces entries must be str")
             segments = namespace.split(":")
-            if (
-                not namespace
-                or any(
-                    not segment
-                    or not (segment[0].isalpha() or segment[0] == "_")
-                    or not all(character.isalnum() or character == "_" for character in segment[1:])
-                    for segment in segments
-                )
+            if not namespace or any(
+                not segment
+                or not (segment[0].isalpha() or segment[0] == "_")
+                or not all(character.isalnum() or character == "_" for character in segment[1:])
+                for segment in segments
             ):
                 raise ValueError("custom namespaces must contain valid USD identifier segments")
             if segments[0] in reserved_namespace_roots:
@@ -1251,7 +1228,7 @@ def export_to_destination(
     if destination._stage is not stage:
         raise ValueError("export destination belongs to a different source stage")
     destination._require_open()
-    lib, inst = _require_destination_symbols(stage)
+    lib, inst = _require_export(stage)
     desc, _refs = _build_export_desc(
         lib,
         ordinal,
@@ -1305,7 +1282,7 @@ def export_to_destination_async(
     if destination._stage is not stage:
         raise ValueError("export destination belongs to a different source stage")
     destination._require_open()
-    lib, inst = _require_destination_symbols(stage)
+    lib, inst = _require_export(stage)
     desc, _refs = _build_export_desc(
         lib,
         ordinal,

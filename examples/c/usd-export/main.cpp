@@ -11,6 +11,7 @@
 #include <ovstage/ovstage.h>
 #include <ovstage/ovstage_population.h>
 #include <ovstage/ovstage_population_export.h>
+#include <ovstage/ovstage_population_predicate.h>
 #include <ovx/types.h>
 #include <ovx/path_dictionary/path_dictionary_utils.h>
 
@@ -56,9 +57,8 @@ static void exportRuntimeData(const std::string& prefix)
     double matrix[] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 1, 2, 3, 1};
     float temperature = 20;
     double radius = 2.5;
-    uint64_t sphereType = tokens[4];
     DLTensor tensors[4]{};
-    void* values[] = {matrix, &temperature, &radius, &sphereType};
+    void* values[] = {matrix, &temperature, &radius, &tokens[4]};
     const DLDataType types[] = {{kDLFloat, 64, 16}, {kDLFloat, 32, 1},
                                 {kDLFloat, 64, 1}, {kDLUInt, 64, 1}};
     // Four fixed-size attributes on one prim. Record the type for later DEF exports.
@@ -282,10 +282,21 @@ def Xform "World"
     }
 }
 )usd";
+    // RENDERING, and the physics properties of the prims that apply a physics API.
+    const ovx_string_t physicsApis[] = { literal_to_ovx_string("PhysicsCollisionAPI"),
+                                         literal_to_ovx_string("PhysicsRigidBodyAPI") };
+    const ovx_string_t physicsNamespace[] = { literal_to_ovx_string("physics") };
+    ovstage_population_selector_t physics{};
+    physics.prim_predicate = ovstage_population_prim_predicate_has_applied_schema(physicsApis, 2);
+    physics.property_predicate = ovstage_population_property_predicate_in_namespace(physicsNamespace, 1);
+    ovstage_population_desc_t population{};
+    population.domains = OVSTAGE_POPULATION_DOMAIN_RENDERING;
+    population.selectors = &physics;
+    population.selector_count = 1;
     waitPop(runtime,
-            ovstage_population_open_usd_from_string(
-                runtime, { source, std::strlen(source) }, 1, NAN, OVSTAGE_POPULATION_DOMAIN_ALL),
-            "open_usd_from_string");
+            ovstage_population_open_usd_from_string_with_desc(
+                runtime, { source, std::strlen(source) }, 1, NAN, &population, 1),
+            "open_usd_from_string_with_desc");
 
     ovstage_write_floor_desc_t floor{};
     floor.ordinal = 1;
@@ -311,8 +322,7 @@ def Xform "World"
         text.find("def Cube \"Crate\"") == std::string::npos ||
         text.find("OutsideSelection") != std::string::npos)
     {
-        std::fprintf(stderr, "the exported USD file does not contain the selected typed hierarchy\n");
-        std::exit(EXIT_FAILURE);
+        fail("the exported USD file does not contain the selected typed hierarchy");
     }
     // [/snippet:typed-hierarchy-c-example]
 

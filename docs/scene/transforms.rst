@@ -260,33 +260,98 @@ prim, and the population path must create this output:
 
    * - How the prim enters the runtime stage
      - World-matrix output
-   * - Population without ``RENDERING``, including ``PHYSICS`` or explicit selectors
+   * - Population without ``RENDERING``, through explicit selectors
      - Population creates the attribute for each in-scope USD-transformable
        prim. Its initial value is the **local** matrix; compute the hierarchy
        before using it as a world matrix.
-   * - Population with ``RENDERING``, including ``ALL``
+   * - Population with ``RENDERING``
      - The rendering domain owns ``omni:fabric:worldMatrix`` on ordinary ``Xform``
-       and geometry prims. :ref:`Generated instance prims <population-instance-types>`,
-       such as ``XformInstance`` and ``MeshInstance``, can store a compact world
-       transform instead. Check for ``omni:fabric:worldMatrix`` on these instance
-       prims before reading it.
+       and geometry prims. Instance roots and
+       :ref:`generated instance prims <population-instance-types>`, such as
+       ``MeshInstance``, can store a compact world transform instead. Check for
+       ``omni:fabric:worldMatrix`` on these instance prims before reading it.
    * - Prims created entirely through runtime writes
      - Writing ``omni:xform`` does not automatically create the world-matrix
        attribute. Initialize placeholder output rows once during hierarchy
        setup, then let computation fill them. See the ``authoring-hierarchy``
-       example in :doc:`/examples/index`.
+       example in :doc:`/examples/index`. Runtime parents of prims with derived
+       outputs can receive the attribute automatically; see
+       :ref:`ovstage-runtime-parent-outputs` for the conditions and read-group
+       constraints.
 
-:meth:`compute_hierarchy() <ovstage.Stage.compute_hierarchy>` updates existing output rows; it does not create
-missing ones. Repeating the computation will not fix a missing attribute.
-Check the population selection and hierarchy setup instead. See
+Apart from the :ref:`deferred connections <ovstage-runtime-parent-outputs>`, whose parent receives
+the attribute at the first :meth:`compute_hierarchy() <ovstage.Stage.compute_hierarchy>`
+call after the read group is released,
+:meth:`compute_hierarchy() <ovstage.Stage.compute_hierarchy>` updates existing
+output rows; it does not create missing ones. Repeating the computation will
+not fix a missing attribute. Check the population selection and hierarchy
+setup instead. See
 :ref:`population-ancestors-transforms` for selection rules and
 :doc:`queries` for checking whether an attribute exists on a prim.
+
+.. _ovstage-runtime-parent-outputs:
+
+Runtime Parents and Deferred Connections
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A runtime parent can receive the output attribute automatically: a written or mapped prim whose hierarchy
+children carry ``omni:fabric:worldMatrix`` (for example clones of
+populated prims placed under it, populated prims that were created
+before it and are reconnected under it, or prims that USD population
+creates under it) receives the attribute itself as soon
+as it has both such children and a local transform, in whichever order
+they arrive, initialized to identity until the next computation; so do
+its written ancestors up to the first prim that already has it.
+
+A clone whose destination parent was absent is evaluated against the
+ancestor it attached to when it is published; if that ancestor receives
+a local transform only later, the clone is not revisited, because it
+is recorded under its destination parent rather than under that
+ancestor (``get_hierarchy()`` reports no parent for it until then).
+Creating the destination parent reconnects the clone and applies the
+rule.
+
+The rule looks through prims without a transform input in both directions,
+such as a token-created prim between the parent and the clones, and also
+gives the attribute to any prim with a transform input that lies
+between the parent and a descendant that has it.
+
+**Held read groups.** Because receiving the
+attribute changes the prim's storage layout, the write, map, or clone
+that would trigger it fails with ``ErrorCode.OP_FAILED`` while a fetched
+read group covers that prim or ancestor, even though the operation does
+not target it; release the group and repeat the operation. Deleting a
+prim moves the children connected under it to the nearest remaining
+ancestor, and a delete that would thereby give that ancestor the
+attribute fails the same way.
+
+**Deferred population connections.** A population step (an open, repopulate,
+``apply_usd_changes`` or ``apply_usd_time``) never fails for this
+reason: while a fetched read group covers the prim or ancestor that
+would receive the attribute, the step leaves those children where they
+are and connects them, giving the attribute, at the next population
+step or :meth:`compute_hierarchy() <ovstage.Stage.compute_hierarchy>`
+call after the group is released, or at the next write, map or clone
+that targets that prim and adds attributes (to it or to another of its
+targets) or maps its transform input; a write or map that only changes
+values the prim already stores does neither, and releasing the group by
+itself connects nothing.
+
+A :meth:`compute_hierarchy()
+<ovstage.Stage.compute_hierarchy>` call made while the group is still
+held succeeds and composes those children where they hang; the first
+one after the release connects them before it computes, so its output
+rows already compose through the parent.
+
+The attribute stays if the
+local transform is deleted later. A hierarchy whose prims all come from
+writes gets no derived rows this way.
 
 When Is the Value Ready to Read?
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 **USD changes applied through rendering population:** when ``RENDERING`` is
-enabled (including ``ALL``), population updates world transforms as it processes
+enabled, population updates world transforms as it processes
 USD changes. After editing USD, call :func:`population.apply_usd_changes() <ovstage.population.apply_usd_changes>` and
 wait for completion if using its asynchronous form. Then advance the
 :term:`watermark` to the update's :term:`ordinal` and wait before reading.
@@ -382,9 +447,12 @@ Keep the buffers and event alive, and do not overwrite the buffers until the
 writes complete. Waiting on an operation synchronizes completion; it does not
 copy the transform values to the CPU.
 
-To keep the write payloads on the GPU, use dense inputs in query order, without
-``index_map`` or ``mask``. The current sparse fixed-size write path can copy
-inputs through CPU memory. Do not call :meth:`read_attributes() <ovstage.Stage.read_attributes>` or map the values
+Contiguous numeric payloads, such as the ``float64`` matrices, stay on the GPU
+both as dense inputs in query order and with ``index_map`` or ``mask``. A write
+with ``index_map`` or ``mask`` first waits on the CPU for unfinished earlier
+writes to the same attribute. With ``index_map`` or ``mask``, the boolean
+``omni:resetXformStack`` flags and other payloads that are not plain numeric
+values can still be copied through CPU memory. Do not call :meth:`read_attributes() <ovstage.Stage.read_attributes>` or map the values
 without placement in this workflow: unplaced reads and maps return CPU buffers.
 The experimental :ref:`ovstage-device-placement` can instead select CUDA buffers.
 If world transforms must also be computed on the GPU, select a supported GPU

@@ -114,8 +114,9 @@ This skill has no scripts.
 - **`apply_usd_time` / structural edits.** For the RENDERING domain, `apply_usd_changes` /
   `apply_usd_time` also reflect structural USD edits; other domains apply structural edits only via
   `apply_usd_changes`.
-- **Latest-snapshot build** — data becomes visible at/below the write floor once you advance it;
-  don't design around reading historical ordinals.
+- **Latest values by default** — data becomes visible at/below the write floor once you advance it.
+  Retaining earlier values requires opting into experimental
+  [selective history](../../docs/scene/reading_attributes.rst#earlier-values-of-selected-pairs).
 
 ## Overview
 

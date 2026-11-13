@@ -18,6 +18,9 @@
 // CPU-only — no GPU required.
 
 #include <ovstage/ovstage.h>
+
+static_assert(OVSTAGE_ORDINAL_MIN == INT64_MIN, "ordinal minimum");
+static_assert(OVSTAGE_ORDINAL_MAX == INT64_MAX, "ordinal maximum");
 #include <ovx/path_dictionary/path_dictionary.h>
 #include <ovx/path_dictionary/path_dictionary_utils.h>
 #include <dlpack/dlpack.h>
@@ -172,7 +175,7 @@ TEST_F(MinimalTest, WriteAdvanceRead)
     write.tensor_count = 1;
     write.is_array = false;
 
-    ovx_string_or_token_t attrArg{ attr_, {} };
+    ovx_token_or_string_t attrArg{ attr_, {} };
     ASSERT_TRUE(waitOp(stage_,
         ovstage_write_attribute(stage_, query_, attrArg, /*ordinal*/ 1, write, OVSTAGE_PRIM_MODE_UPSERT),
         "write_attribute"));
@@ -190,14 +193,17 @@ TEST_F(MinimalTest, WriteAdvanceRead)
     ASSERT_TRUE(waitOp(stage_, ovstage_read_attributes(stage_, query_, &attr_, 1, range, &read),
         "read_attributes"));
 
+    size_t fetchedGroupCount = 0;
     ovstage_read_group_t group{};
-    ASSERT_EQ(ovstage_fetch_read_next(stage_, read, OVSTAGE_TIMEOUT_INFINITE, &group), OVSTAGE_OK);
-    ASSERT_EQ(group.data.tensor_count, 1u);
-    ASSERT_NE(group.data.tensors[0].data, nullptr);
+    ASSERT_EQ(ovstage_fetch_read_next(stage_, read, OVSTAGE_TIMEOUT_INFINITE, &group, 1, &fetchedGroupCount), OVSTAGE_OK);
+    ASSERT_EQ(group.column_count, 1u);
+    const ovstage_read_column_t& column = group.columns[0];
+    ASSERT_EQ(column.data.tensor_count, 1u);
+    ASSERT_NE(column.data.tensors[0].data, nullptr);
     // [snippet:dlpack-copy-result-c]
-    std::memcpy(out, group.data.tensors[0].data, sizeof(out));
+    std::memcpy(out, column.data.tensors[0].data, sizeof(out));
 
-    ovstage_release_group(stage_, &group);
+    ovstage_release_groups(stage_, &group, 1);
     // [/snippet:dlpack-copy-result-c]
     waitOp(stage_, ovstage_release_read(stage_, read), "release_read");
     // [/snippet:write-read-roundtrip-c]
@@ -227,7 +233,7 @@ TEST_F(MinimalTest, NonblockingPollWaitRelease)
     write.tensors = &tensor;
     write.tensor_count = 1;
     write.is_array = false;
-    ovx_string_or_token_t attrArg{ attr_, {} };
+    ovx_token_or_string_t attrArg{ attr_, {} };
 
     // [snippet:nonblocking-poll-c]
     // Enqueue without waiting: the call returns an op id immediately. Poll it with
@@ -268,13 +274,16 @@ TEST_F(MinimalTest, NonblockingPollWaitRelease)
     ASSERT_TRUE(waitOp(stage_, ovstage_read_attributes(stage_, query_, &attr_, 1, range, &read),
         "read_attributes"));
 
+    size_t fetchedGroupCount = 0;
     ovstage_read_group_t group{};
-    ASSERT_EQ(ovstage_fetch_read_next(stage_, read, OVSTAGE_TIMEOUT_INFINITE, &group), OVSTAGE_OK);
-    ASSERT_EQ(group.data.tensor_count, 1u);
-    ASSERT_NE(group.data.tensors[0].data, nullptr);
+    ASSERT_EQ(ovstage_fetch_read_next(stage_, read, OVSTAGE_TIMEOUT_INFINITE, &group, 1, &fetchedGroupCount), OVSTAGE_OK);
+    ASSERT_EQ(group.column_count, 1u);
+    const ovstage_read_column_t& column = group.columns[0];
+    ASSERT_EQ(column.data.tensor_count, 1u);
+    ASSERT_NE(column.data.tensors[0].data, nullptr);
     float out[3] = { 0.0f, 0.0f, 0.0f };
-    std::memcpy(out, group.data.tensors[0].data, sizeof(out));
-    ovstage_release_group(stage_, &group);
+    std::memcpy(out, column.data.tensors[0].data, sizeof(out));
+    ovstage_release_groups(stage_, &group, 1);
     waitOp(stage_, ovstage_release_read(stage_, read), "release_read");
 
     EXPECT_FLOAT_EQ(out[0], 4.0f);
@@ -367,11 +376,14 @@ TEST_F(MinimalTest, ConvenienceFixedShapesReadBackInCanonicalLaneForm)
         ASSERT_TRUE(waitOp(
             stage_, ovstage_read_attributes(stage_, query_, &attrs[i], 1, range, &read), "read attribute"));
 
+        size_t fetchedGroupCount = 0;
         ovstage_read_group_t group{};
-        ASSERT_EQ(ovstage_fetch_read_next(stage_, read, OVSTAGE_TIMEOUT_INFINITE, &group), OVSTAGE_OK);
-        ASSERT_EQ(group.data.tensor_count, 1u);
-        ASSERT_NE(group.data.tensors, nullptr);
-        const DLTensor& result = group.data.tensors[0];
+        ASSERT_EQ(ovstage_fetch_read_next(stage_, read, OVSTAGE_TIMEOUT_INFINITE, &group, 1, &fetchedGroupCount), OVSTAGE_OK);
+        ASSERT_EQ(group.column_count, 1u);
+        const ovstage_read_column_t& column = group.columns[0];
+        ASSERT_EQ(column.data.tensor_count, 1u);
+        ASSERT_NE(column.data.tensors, nullptr);
+        const DLTensor& result = column.data.tensors[0];
         EXPECT_EQ(result.ndim, expectedDimensions[i]);
         ASSERT_NE(result.shape, nullptr);
         ASSERT_NE(result.strides, nullptr);
@@ -380,9 +392,9 @@ TEST_F(MinimalTest, ConvenienceFixedShapesReadBackInCanonicalLaneForm)
         for (int axis = 1; axis < result.ndim; ++axis)
             EXPECT_EQ(result.shape[axis], expectedTrailing[i][axis - 1]);
         EXPECT_EQ(result.strides[result.ndim - 1], 1);
-        EXPECT_EQ(group.semantic, semantics[i]);
-        ASSERT_EQ(ovstage_release_group(stage_, &group), OVSTAGE_OK);
-        EXPECT_EQ(ovstage_fetch_read_next(stage_, read, OVSTAGE_TIMEOUT_INFINITE, &group),
+        EXPECT_EQ(column.semantic, semantics[i]);
+        ASSERT_EQ(ovstage_release_groups(stage_, &group, 1), OVSTAGE_OK);
+        EXPECT_EQ(ovstage_fetch_read_next(stage_, read, OVSTAGE_TIMEOUT_INFINITE, &group, 1, &fetchedGroupCount),
                   OVSTAGE_ERROR_END_OF_ITERATION);
         ASSERT_TRUE(waitOp(stage_, ovstage_release_read(stage_, read), "release_read"));
     }
@@ -390,3 +402,81 @@ TEST_F(MinimalTest, ConvenienceFixedShapesReadBackInCanonicalLaneForm)
 }
 
 } // namespace
+
+TEST_F(MinimalTest, SignedOrdinalsStartSealedAtMinimum)
+{
+    static_assert(sizeof(ovstage_ordinal_t) == sizeof(int64_t));
+    static_assert(ovstage_ordinal_t(-1) < ovstage_ordinal_t(0));
+    const auto floor = [&](ovx_token_or_string_t attribute) {
+        ovstage_ordinal_query_handle_t handle = OVSTAGE_INVALID_ORDINAL_QUERY_HANDLE;
+        EXPECT_TRUE(waitOp(stage_, ovstage_get_attribute_write_floor(stage_, attribute, &handle), "floor"));
+        ovstage_ordinal_t value = 0;
+        EXPECT_EQ(ovstage_fetch_ordinal(stage_, handle, OVSTAGE_TIMEOUT_INFINITE, &value), OVSTAGE_OK);
+        EXPECT_TRUE(waitOp(stage_, ovstage_release_ordinal_query(stage_, handle), "release floor"));
+        return value;
+    };
+    EXPECT_EQ(floor({}), OVSTAGE_ORDINAL_MIN);
+    EXPECT_EQ(floor({ attr_, {} }), OVSTAGE_ORDINAL_MIN);
+
+    ovstage_ordinal_range_t range{ 0, OVSTAGE_ORDINAL_MIN, false };
+    ovstage_read_handle_t read = OVSTAGE_INVALID_READ_HANDLE;
+    ASSERT_TRUE(waitOp(stage_, ovstage_read_attributes(stage_, query_, &attr_, 1, range, &read), "empty snapshot"));
+    ovstage_read_group_t group{};
+    size_t count = 99;
+    ASSERT_EQ(ovstage_fetch_read_next(stage_, read, OVSTAGE_TIMEOUT_INFINITE, &group, 1, &count),
+              OVSTAGE_ERROR_END_OF_ITERATION);
+    EXPECT_EQ(count, 0u);
+    ASSERT_TRUE(waitOp(stage_, ovstage_release_read(stage_, read), "release empty snapshot"));
+
+    float values[] = { 1.f, 2.f, 3.f };
+    int64_t shape[] = { 3 };
+    DLTensor tensor{};
+    tensor.data = values;
+    tensor.device = { kDLCPU, 0 };
+    tensor.ndim = 1;
+    tensor.dtype = { kDLFloat, 32, 1 };
+    tensor.shape = shape;
+    ovstage_write_data_t write{};
+    write.tensors = &tensor;
+    write.tensor_count = 1;
+    const auto rejectedWrite = [&](ovstage_ordinal_t ordinal) {
+        const auto enq = ovstage_write_attribute(stage_, query_, { attr_, {} }, ordinal, write, OVSTAGE_PRIM_MODE_UPSERT);
+        if (enq.status != OVSTAGE_OK)
+        {
+            EXPECT_EQ(enq.status, OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION);
+            return;
+        }
+        ovstage_op_wait_result_t result{};
+        EXPECT_EQ(ovstage_wait_op(stage_, enq.op_index, OVSTAGE_TIMEOUT_INFINITE, &result), OVSTAGE_ERROR_OP_FAILED);
+        const ovx_string_t error = ovstage_get_last_op_error(stage_, enq.op_index);
+        EXPECT_NE(std::string(error.ptr ? error.ptr : "", error.length).find("floor"), std::string::npos);
+        EXPECT_EQ(ovstage_release_op(stage_, enq.op_index), OVSTAGE_OK);
+    };
+    rejectedWrite(OVSTAGE_ORDINAL_MIN);
+    const ovstage_ordinal_t ordinals[] = { OVSTAGE_ORDINAL_MIN + 1, -2, -1, 0, 1, OVSTAGE_ORDINAL_MAX };
+    for (ovstage_ordinal_t ordinal : ordinals)
+    {
+        SCOPED_TRACE(ordinal);
+        ASSERT_TRUE(waitOp(stage_, ovstage_write_attribute(stage_, query_, { attr_, {} }, ordinal, write,
+                                                        OVSTAGE_PRIM_MODE_UPSERT), "signed write"));
+        ovstage_write_floor_desc_t seal{};
+        seal.ordinal = ordinal;
+        seal.scope = OVSTAGE_SCOPE_ALL;
+        ASSERT_TRUE(waitOp(stage_, ovstage_advance_write_floor(stage_, &seal), "signed seal"));
+        EXPECT_EQ(floor({}), ordinal);
+        range.end_ordinal = ordinal;
+        ASSERT_TRUE(waitOp(stage_, ovstage_read_attributes(stage_, query_, &attr_, 1, range, &read), "signed snapshot"));
+        ASSERT_EQ(ovstage_fetch_read_next(stage_, read, OVSTAGE_TIMEOUT_INFINITE, &group, 1, &count), OVSTAGE_OK);
+        ASSERT_EQ(count, 1u);
+        ASSERT_EQ(group.column_count, 1u);
+        EXPECT_EQ(group.columns[0].ordinal, ordinal);
+        EXPECT_EQ(group.columns[0].meta.attribute_write_floor_ordinal, ordinal);
+        EXPECT_FLOAT_EQ(static_cast<const float*>(group.columns[0].data.tensors[0].data)[0], values[0]);
+        EXPECT_EQ(ovstage_release_groups(stage_, &group, 1), OVSTAGE_OK);
+        ASSERT_TRUE(waitOp(stage_, ovstage_release_read(stage_, read), "release signed snapshot"));
+        rejectedWrite(ordinal);
+        seal.ordinal = OVSTAGE_ORDINAL_MIN;
+        ASSERT_TRUE(waitOp(stage_, ovstage_advance_write_floor(stage_, &seal), "backward seal"));
+        EXPECT_EQ(floor({}), ordinal);
+    }
+}

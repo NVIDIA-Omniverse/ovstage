@@ -115,7 +115,7 @@ def part2_ovstage() -> None:
         # write of the reserved usd-prim-type column creates all 5 prims AND
         # stamps their types: one interned token id (uint64) per prim.
         prim_type = paths.intern_token("usd-prim-type")
-        type_ids = np.array([paths.intern_token(name) for name in PRIM_TYPES], dtype=np.uint64)
+        type_ids = np.array([paths.intern_token(name).raw_id for name in PRIM_TYPES], dtype=np.uint64)
         stage.write_attribute(all_query, prim_type, ordinal=1, tensors=type_ids,
                               is_array=False, prim_mode=PrimMode.INSERT).wait()
         stage.advance_write_floor(ordinal=1).wait()
@@ -125,7 +125,7 @@ def part2_ovstage() -> None:
         token_ids = _read_column(stage, paths, all_query, prim_type,
                                  end_ordinal=1, expected_paths=PRIM_PATHS)
         print("created prims:", ", ".join(
-            f"{path} ({paths.token_to_string(int(token))})"
+            f"{path} ({paths.token_to_string(ovstage.Token(token))})"
             for path, token in zip(PRIM_PATHS, token_ids)))
         # [/snippet:ovstage-create-prims]
 
@@ -140,7 +140,8 @@ def part2_ovstage() -> None:
         stage.advance_write_floor(ordinal=2).wait()
         print(f"one-by-one: {len(child_queries)} write ops (one per prim)")
         print("temperature:", _fmt(_read_column(stage, paths, children_query, temperature,
-                                                end_ordinal=2, expected_paths=CHILD_PATHS)))
+                                                end_ordinal=2, expected_paths=CHILD_PATHS)),
+        )
         # [/snippet:ovstage-write-one-by-one]
 
         # [snippet:ovstage-write-vectorized]
@@ -152,7 +153,8 @@ def part2_ovstage() -> None:
         stage.advance_write_floor(ordinal=3).wait()
         print(f"vectorized: 1 write op (one column covering all {len(CHILD_PATHS)} prims)")
         print("temperature:", _fmt(_read_column(stage, paths, children_query, temperature,
-                                                end_ordinal=3, expected_paths=CHILD_PATHS)))
+                                                end_ordinal=3, expected_paths=CHILD_PATHS)),
+        )
         # [/snippet:ovstage-write-vectorized]
 
         # [snippet:ovstage-write-batched]
@@ -165,13 +167,16 @@ def part2_ovstage() -> None:
         stage.write_attributes(children_query, [
             WriteDesc(attribute=humidity, tensors=np.array(HUMIDITY, np.float64), is_array=False),
             WriteDesc(attribute=pressure, tensors=np.array(PRESSURE, np.float64), is_array=False),
-        ], ordinal=4).wait()
+        ], ordinal=4,
+        ).wait()
         stage.advance_write_floor(ordinal=4).wait()
         print("batched: 1 write op (2 columns: humidity + pressure)")
         print("humidity:", _fmt(_read_column(stage, paths, children_query, humidity,
-                                             end_ordinal=4, expected_paths=CHILD_PATHS)))
+                                             end_ordinal=4, expected_paths=CHILD_PATHS)),
+        )
         print("pressure:", _fmt(_read_column(stage, paths, children_query, pressure,
-                                             end_ordinal=4, expected_paths=CHILD_PATHS)))
+                                             end_ordinal=4, expected_paths=CHILD_PATHS)),
+        )
         # [/snippet:ovstage-write-batched]
 
         # Release every handle before Stage.__exit__ tears the instance down
@@ -198,11 +203,12 @@ def _read_column(stage, paths, query, attribute_token, end_ordinal, expected_pat
     with stage.read_attributes(query, [attribute_token], OrdinalRange.latest(end_ordinal)) as read:
         read.wait()
         for group in read.groups():
+            column = group.columns[0]
             handles = paths.get_paths(group.prim_list)
-            rows = np.asarray(group.array(0)).ravel()
+            rows = np.asarray(column.array(0)).ravel()
             for local in range(group.prim_count):
                 path = paths.path_to_string(handles[group.prim_index(local)])
-                row = group.data_row_index(local) if group.has_data_index_map else local
+                row = column.data_row_index(local) if column.has_data_index_map else local
                 values[index_by_path[path]] = rows[row]
             stage.release_group(group)
     return values

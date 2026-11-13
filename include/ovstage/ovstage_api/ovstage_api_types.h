@@ -9,7 +9,7 @@
 
 /**
  * @file ovstage_api_types.h
- * @brief ovstage_api — shared types, handles, and instance bundle.
+ * @brief ovstage_api — shared types, handles, and the instance.
  *
  * @details
  * ovstage_api is a vtable-based contract for asynchronous, ordinal-keyed
@@ -17,8 +17,8 @@
  * stage implementations can provide.
  *
  * This header defines the data types (handles, error codes, enums, payload
- * structs), the forward declarations for the vtable and context, and the
- * `ovstage_instance_t` bundle that pairs them.
+ * structs), the forward declarations for the vtables and the context, and the
+ * `ovstage_instance_t` struct that holds them.
  *
  * The vtable itself is defined in `ovstage_api.h`. Convenience
  * `static inline` wrappers around the core data-plane slots live in
@@ -28,14 +28,16 @@
  * ## Lifecycle policy
  *
  * The vtable owns *resource* lifecycles (queries, reads, maps, ops, groups,
- * query results, ordinal queries) but **not** the instance's own lifecycle.
- * Each implementation provides its own factory function and its own destructor —
- * those are intentionally not part of this contract.
+ * query results, ordinal queries) but **not** the creation of the instance.
+ * Each implementation provides its own factory function, which is not part of
+ * this contract. The destruction of an instance is the destroy_instance member
+ * of the lifecycle family vtable (ovstage_ext_vtables.h), which the factory
+ * fills with the destructor of its implementation.
  *
  * The execution-model documentation lives at the top of `ovstage_api.h`
  * alongside the vtable definition.
  *
- * @version 0.3.0
+ * @version 0.4.0
  * @date 2026-05-28
  */
 
@@ -48,7 +50,7 @@
 #include <dlpack/dlpack.h>              /* DLTensor, DLDataType, DLManagedTensorVersioned */
 /* The path dictionary types header drags in the canonical <ovx/types.h> +
  * <ovx/string_types.h>, giving us ovx_token_t, ovx_primpath_t,
- * ovx_primpath_list_t, ovx_string_or_token_t, ovx_api_result_t, and the
+ * ovx_primpath_list_t, ovx_token_or_string_t, ovx_api_result_t, and the
  * opaque path_dictionary_instance_t bundle used by the get_path_dictionary
  * vtable slot. */
 #include <ovx/path_dictionary/path_dictionary_types.h>
@@ -57,7 +59,7 @@
  * exactly these values, so a compile-time `#if` check and a runtime query
  * always agree. */
 #define OVSTAGE_VERSION_MAJOR 0
-#define OVSTAGE_VERSION_MINOR 3
+#define OVSTAGE_VERSION_MINOR 4
 #define OVSTAGE_VERSION_PATCH 0
 
 /* Marks a deprecated public entry point: OVSTAGE_DEPRECATED("Use <new> instead")
@@ -85,11 +87,30 @@ extern "C" {
  * Forward Declarations / Opaque Types
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
-/** @brief Opaque per-implementation context, stored in ovstage_instance_t. */
-typedef struct ovstage_context_t ovstage_context_t;
+/** @brief The opaque context of the data plane, stored in the data-plane
+ *         instance. A slot of the vtable takes it first. */
+typedef struct ovstage_data_plane_context_t ovstage_data_plane_context_t;
 
 /** @brief Vtable defined in ovstage_api.h. */
-typedef struct ovstage_vtable_t  ovstage_vtable_t;
+typedef struct ovstage_data_plane_vtable_t  ovstage_data_plane_vtable_t;
+
+/** @brief The family vtables of the extension instances, defined in
+ *         ovstage_ext_vtables.h. The extension instances below point at them. */
+typedef struct ovstage_lifecycle_vtable_t  ovstage_lifecycle_vtable_t;
+typedef struct ovstage_hierarchy_vtable_t  ovstage_hierarchy_vtable_t;
+typedef struct ovstage_population_vtable_t ovstage_population_vtable_t;
+typedef struct ovstage_usd_vtable_t        ovstage_usd_vtable_t;
+typedef struct ovstage_instancing_vtable_t ovstage_instancing_vtable_t;
+
+/** @brief The opaque context of each family, stored in the extension instance
+ *         of the family. An incomplete type like ovstage_data_plane_context_t:
+ *         the bodies of the family vtable cast it to the state type of their
+ *         implementation, and a member of the family vtable takes it first. */
+typedef struct ovstage_lifecycle_context_t  ovstage_lifecycle_context_t;
+typedef struct ovstage_hierarchy_context_t  ovstage_hierarchy_context_t;
+typedef struct ovstage_population_context_t ovstage_population_context_t;
+typedef struct ovstage_usd_context_t        ovstage_usd_context_t;
+typedef struct ovstage_instancing_context_t ovstage_instancing_context_t;
 
 /* ═══════════════════════════════════════════════════════════════════════════════
  * Error Codes
@@ -113,7 +134,7 @@ typedef enum ovstage_api_status_t
     OVSTAGE_ERROR_PRIM_NOT_FOUND        = 4,  /**< INSERT mode and prim already exists. */
     OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION = 5,  /**< Mutation blocked by an effective floor or retained value/prim-lifecycle change; read selects an unsealed change at/before its end. */
     OVSTAGE_ERROR_NOT_SUPPORTED         = 6,
-    OVSTAGE_ERROR_QUEUE_FULL            = 7,  /**< Backpressure: submit queue full. */
+    OVSTAGE_ERROR_QUEUE_FULL            = 7,  /**< The call cannot be admitted now; retry it after the operation that blocks it returns. The implementation remarks name the cases. */
     OVSTAGE_ERROR_END_OF_ITERATION      = 8,  /**< No more groups to iterate. */
     OVSTAGE_ERROR_OUT_OF_MEMORY         = 9,
     OVSTAGE_ERROR_LAYOUT_CHANGED        = 10, /**< Layout changed during map. */
@@ -136,12 +157,25 @@ typedef enum ovstage_api_status_t
  * physical time should carry an explicit ordinal-to-time mapping outside this
  * scalar or in metadata.
  *
- * Valid range: any uint64_t value. There is no sentinel; see
- * ovstage_ordinal_range_t for how "latest" reads are expressed.
+ * Signed int64_t ordering. Every stage starts sealed and empty through
+ * OVSTAGE_ORDINAL_MIN (inclusive), so writes at that minimum are rejected.
+ * Writable ordinals are OVSTAGE_ORDINAL_MIN + 1 through OVSTAGE_ORDINAL_MAX,
+ * including negative values and zero.
+ * Sealing through zero rejects subsequent writes at or below zero.
+ * See ovstage_ordinal_range_t for how "latest" reads are expressed.
  */
 #ifndef OVSTAGE_ORDINAL_T_DECLARED
 #define OVSTAGE_ORDINAL_T_DECLARED
-typedef uint64_t ovstage_ordinal_t;
+typedef int64_t ovstage_ordinal_t;
+#endif
+
+/** Smallest representable ordinal; the initial sealed empty floor, not writable. */
+#ifndef OVSTAGE_ORDINAL_MIN
+#define OVSTAGE_ORDINAL_MIN ((ovstage_ordinal_t)INT64_MIN)
+#endif
+/** Largest representable ordinal; also the current-value read end. */
+#ifndef OVSTAGE_ORDINAL_MAX
+#define OVSTAGE_ORDINAL_MAX ((ovstage_ordinal_t)INT64_MAX)
 #endif
 
 /**
@@ -198,8 +232,15 @@ typedef uint64_t ovstage_timeout_ns_t;
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
 /** @brief Monotonic per-instance operation identifier. */
-typedef uint64_t ovstage_op_id_t;
-#define OVSTAGE_INVALID_OP_ID ((ovstage_op_id_t)0)
+typedef struct ovstage_op_id_t
+{
+    uint64_t raw_id;
+} ovstage_op_id_t;
+#ifdef __cplusplus
+#define OVSTAGE_INVALID_OP_ID ovstage_op_id_t{0}
+#else
+#define OVSTAGE_INVALID_OP_ID ((ovstage_op_id_t){0})
+#endif
 
 /**
  * @brief Result of an asynchronous enqueue call.
@@ -217,6 +258,11 @@ typedef struct {
 /* ═══════════════════════════════════════════════════════════════════════════════
  * Handle Types
  *
+ * Handles are distinct C-compatible structs containing uint64_t raw_id.
+ * Use .raw_id only at numeric boundaries; keep API arguments and storage typed.
+ * Types distinguish kinds, not owners or resource liveness. Copying a handle
+ * does not retain its resource.
+ *
  * Stage-data-producing enqueues reserve a typed handle that is valid as soon
  * as the enqueue returns. The handle may be passed to subsequent enqueues as
  * input before the underlying op has executed; consumers see the producer's
@@ -228,31 +274,73 @@ typedef struct {
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
 /** @brief Query handle — identifies a logical set of prims. */
-typedef uint64_t ovstage_query_handle_t;
-#define OVSTAGE_INVALID_QUERY_HANDLE ((ovstage_query_handle_t)0)
+typedef struct ovstage_query_handle_t
+{
+    uint64_t raw_id;
+} ovstage_query_handle_t;
+#ifdef __cplusplus
+#define OVSTAGE_INVALID_QUERY_HANDLE ovstage_query_handle_t{0}
+#else
+#define OVSTAGE_INVALID_QUERY_HANDLE ((ovstage_query_handle_t){0})
+#endif
 
 /** @brief Read handle — identifies an enqueued multi-attribute read. */
-typedef uint64_t ovstage_read_handle_t;
-#define OVSTAGE_INVALID_READ_HANDLE ((ovstage_read_handle_t)0)
+typedef struct ovstage_read_handle_t
+{
+    uint64_t raw_id;
+} ovstage_read_handle_t;
+#ifdef __cplusplus
+#define OVSTAGE_INVALID_READ_HANDLE ovstage_read_handle_t{0}
+#else
+#define OVSTAGE_INVALID_READ_HANDLE ((ovstage_read_handle_t){0})
+#endif
 
 /** @brief Map handle — identifies an enqueued mapped-write session. */
-typedef uint64_t ovstage_map_handle_t;
-#define OVSTAGE_INVALID_MAP_HANDLE ((ovstage_map_handle_t)0)
+typedef struct ovstage_map_handle_t
+{
+    uint64_t raw_id;
+} ovstage_map_handle_t;
+#ifdef __cplusplus
+#define OVSTAGE_INVALID_MAP_HANDLE ovstage_map_handle_t{0}
+#else
+#define OVSTAGE_INVALID_MAP_HANDLE ((ovstage_map_handle_t){0})
+#endif
 
 /**
  * @brief Ordinal-query handle — identifies an enqueued read of an ordinal
  *        scalar, such as the global or per-attribute write floor.
  */
-typedef uint64_t ovstage_ordinal_query_handle_t;
-#define OVSTAGE_INVALID_ORDINAL_QUERY_HANDLE ((ovstage_ordinal_query_handle_t)0)
+typedef struct ovstage_ordinal_query_handle_t
+{
+    uint64_t raw_id;
+} ovstage_ordinal_query_handle_t;
+#ifdef __cplusplus
+#define OVSTAGE_INVALID_ORDINAL_QUERY_HANDLE ovstage_ordinal_query_handle_t{0}
+#else
+#define OVSTAGE_INVALID_ORDINAL_QUERY_HANDLE ((ovstage_ordinal_query_handle_t){0})
+#endif
 
 /** @brief Opaque identity for a fetched read group payload. */
-typedef uint64_t ovstage_read_group_id_t;
-#define OVSTAGE_INVALID_READ_GROUP_ID ((ovstage_read_group_id_t)0)
+typedef struct ovstage_read_group_id_t
+{
+    uint64_t raw_id;
+} ovstage_read_group_id_t;
+#ifdef __cplusplus
+#define OVSTAGE_INVALID_READ_GROUP_ID ovstage_read_group_id_t{0}
+#else
+#define OVSTAGE_INVALID_READ_GROUP_ID ((ovstage_read_group_id_t){0})
+#endif
 
 /** @brief Opaque identity for a fetched query result payload. */
-typedef uint64_t ovstage_query_result_id_t;
-#define OVSTAGE_INVALID_QUERY_RESULT_ID ((ovstage_query_result_id_t)0)
+typedef struct ovstage_query_result_id_t
+{
+    uint64_t raw_id;
+} ovstage_query_result_id_t;
+#ifdef __cplusplus
+#define OVSTAGE_INVALID_QUERY_RESULT_ID ovstage_query_result_id_t{0}
+#else
+#define OVSTAGE_INVALID_QUERY_RESULT_ID ((ovstage_query_result_id_t){0})
+#endif
 
 /* ═══════════════════════════════════════════════════════════════════════════════
  * Wait Result
@@ -278,6 +366,34 @@ typedef struct {
 } ovstage_op_wait_result_t;
 
 /* ═══════════════════════════════════════════════════════════════════════════════
+ * Clone Result
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * @brief Completion report of a finished clone operation (the `clone` slot).
+ *
+ * Plain values copied out by the `fetch_clone_result` slot; nothing to release.
+ * `prims_cloned` sums the sizes of the targets' scene hierarchy subtrees after
+ * cloning, including each target root. It counts prims created or merged into and
+ * any prims already attached beneath them, including children entered in the
+ * hierarchy from a deleted root that the clone re-attaches under its new root. A
+ * prim whose path lies beneath a target but remains detached from its scene
+ * hierarchy is not counted. For disjoint targets that merge into no existing
+ * prims, it equals
+ * `source_prim_count * target_count`. A zero-target clone reports
+ * `{ordinal, 0, source_prim_count, 0}`.
+ *
+ * @remark Target paths are expected to be disjoint and outside the source
+ *         subtree; a target nested under another target is counted as enumerated.
+ */
+typedef struct {
+    ovstage_ordinal_t ordinal;           /**< Ordinal the clone was recorded at. */
+    size_t            target_count;      /**< `num_target_paths` as submitted. */
+    size_t            source_prim_count; /**< Prims in the source subtree, root inclusive. */
+    size_t            prims_cloned;      /**< Prims in all target scene hierarchy subtrees after cloning. */
+} ovstage_clone_result_t;
+
+/* ═══════════════════════════════════════════════════════════════════════════════
  * Enumerations
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
@@ -285,13 +401,11 @@ typedef struct {
  * @brief Filter predicate operators for query matching.
  *
  * Notes:
- * - CONTAINS tests whether a composite value (array, string) contains at least
- *   one of the provided match values. For "contains all", use multiple CONTAINS
- *   predicates (one per required value).
- * - CONTAINS works on string attributes (substring match), array attributes
- *   (element membership), and any other composite data types.
- * - Comparison operators (LT, LE, GT, GE) work on numeric and string attributes.
- *   String comparison is binary (byte-wise).
+ * - Only a closed list of (attribute, operator) pairs is supported; every other pair is rejected synchronously by the query call with OVSTAGE_ERROR_NOT_SUPPORTED. Supported pairs: HAS and NOT_HAS on any attribute name except "usd-active"; IN on "usd-path", "usd-parent", "usd-prim-type"; CONTAINS on "usd-children", "usd-schemas", "usd-ancestor-types"; PREFIX on "usd-path". See ovstage_filter_t.
+ * - NOT_HAS is the complement of HAS on the same attribute: it accepts the same attributes, and a live prim matches exactly one of the two.
+ * - CONTAINS matches at least one of the provided values. For "contains all", use multiple CONTAINS predicates (one per required value).
+ * - IN, CONTAINS, and PREFIX are not general value operators: they do not apply to ordinary (non-built-in) attributes.
+ * - LT, LE, GT, and GE are reserved: they are not supported on any attribute in this release and return OVSTAGE_ERROR_NOT_SUPPORTED.
  */
 typedef enum {
     OVSTAGE_FILTER_OP_HAS      = 0,  /**< Attribute exists on prim (no value test). */
@@ -302,6 +416,7 @@ typedef enum {
     OVSTAGE_FILTER_OP_LE       = 5,  /**< Attribute value <= value. */
     OVSTAGE_FILTER_OP_GT       = 6,  /**< Attribute value > value. */
     OVSTAGE_FILTER_OP_GE       = 7,  /**< Attribute value >= value. */
+    OVSTAGE_FILTER_OP_NOT_HAS  = 8,  /**< Attribute does not exist on prim (no value test). */
 } ovstage_filter_op_t;
 
 /**
@@ -372,7 +487,7 @@ typedef enum {
  *   row-major.
  *
  * Tensor count is not an attribute-kind signal. Read results report logical
- * kind in ovstage_read_group_t::is_array. Copy-in writes declare it in
+ * kind in ovstage_read_column_t::is_array. Copy-in writes declare it in
  * ovstage_write_data_t::is_array.
  *
  * index_map usage (applies across the logical element axis):
@@ -408,7 +523,7 @@ typedef enum {
  * @invariant Every published tensor has non-NULL `strides` with
  *            compact row-major strides; NULL strides are never produced
  *            (DLPack v1.2+ forbids NULL strides when `ndim != 0`).
- * @invariant For delete/tombstone read groups (`is_delete == true`),
+ * @invariant For delete/tombstone read columns (`is_delete == true`),
  *            `tensor_count == 0`, `tensors == NULL`, and `count == 0`.
  * @invariant `index_map` and `mask` are mutually exclusive.
  * @invariant `count` is set (non-zero) when index_map or mask is non-NULL.
@@ -485,7 +600,7 @@ typedef struct {
  * A selected change at or before the end and above the effective write floor
  * fails with OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION. If the read detects that the
  * requested values are no longer available, it fails with OVSTAGE_ERROR_OUT_OF_RANGE.
- * Use UINT64_MAX as the end to request current values; a selected unsealed
+ * Use OVSTAGE_ORDINAL_MAX as the end to request current values; a selected unsealed
  * change still fails with OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION.
  *
  * The requested end need not be at or below the attribute's write floor
@@ -498,7 +613,7 @@ typedef struct {
  * state, changes that ovstage_compute_hierarchy records at or below the floor,
  * or history below the retention frontier (see below).
  *
- * A returned group's ordinal (ovstage_read_group_t::ordinal) is informational.
+ * A returned column's ordinal (ovstage_read_column_t::ordinal) is informational.
  * It may be above or below the requested end, and it is not, by itself, proof
  * of which state the payload represents.
  *
@@ -516,7 +631,7 @@ typedef struct {
  * Otherwise, a recorded change after end_ordinal on a selected path causes
  * OVSTAGE_ERROR_OUT_OF_RANGE, whether that later change is sealed or not.
  * Sealing the later change does not restore the older values. A read stops
- * at the first attribute that fails either check. An end of UINT64_MAX skips
+ * at the first attribute that fails either check. An end of OVSTAGE_ORDINAL_MAX skips
  * this later-change check. Because a later change after the end makes a
  * bounded request fail with OVSTAGE_ERROR_OUT_OF_RANGE, a bounded read is not
  * a replay point.
@@ -551,7 +666,7 @@ typedef struct {
  */
 typedef struct {
     ovstage_ordinal_t start_ordinal;     /**< Range start (only when has_start_ordinal). */
-    ovstage_ordinal_t end_ordinal;       /**< Upper-bound ordinal; UINT64_MAX requests current values. */
+    ovstage_ordinal_t end_ordinal;       /**< Upper-bound ordinal; OVSTAGE_ORDINAL_MAX requests current values. */
     bool              has_start_ordinal; /**< false = snapshot at end; true = changes in [start, end]. */
 } ovstage_ordinal_range_t;
 
@@ -559,13 +674,17 @@ typedef struct {
     *  bytes, orthogonal to its `DLDataType` storage shape. ovpopulation derives
     *  this from the USD `SdfValueTypeName` (role + scalar type) and carries it
     *  through writes; consumers (e.g. runtime→USD export) use it to recover the
-    *  authored USD type (point3f vs float3, asset vs string, etc.). It is NOT
-    *  part of the bucket key — `float3` and `point3f` share bytes and a column.
+    *  authored USD type (point3f vs float3, asset vs string, etc.).
     *  Tuple width comes from `dtype.lanes`, precision from `dtype.bits`; these
     *  roles deliberately do not encode dimensional suffixes such as 3f or 4d.
     *
-    *  The semantic round-trips through the attribute column: write records it on
-    *  the column at creation, read recovers it by decoding the column.
+    *  Attributes with the same name and numeric layout may have different
+    *  semantics on different prims. The semantic is part of each attribute's
+    *  schema. Changing an existing target's schema requires
+    *  `OVSTAGE_ATTRIBUTE_MODE_FORCE`, or deletion followed by recreation at a
+    *  later ordinal. `OVSTAGE_SEMANTIC_NONE` requests no role; it preserves the
+    *  existing role when the attribute's storage is unchanged. Read results
+    *  report the attribute's semantic.
     *
     *    - Geometric semantics (POINT, VECTOR, NORMAL, COLOR, QUATERNION,
     *      MATRIX, FRAME, TEXTURE_COORDINATE) record a geometric role on the
@@ -621,9 +740,7 @@ typedef struct {
     *      so export refuses a STRING row that contains one and reports it as
     *      unsupported. Only an untyped (SEMANTIC_NONE) byte row keeps the
     *      legacy reading where one trailing NUL is an optional terminator.
-    *
-    *  Either way, borrow and replicate modes converge on the same authored
-    *  interpretation because they consult the same attribute column. */
+    */
 typedef enum
 {
     OVSTAGE_SEMANTIC_NONE                   = 0,
@@ -647,33 +764,62 @@ typedef enum
 } ovstage_attribute_semantic_t;
 
 /* ═══════════════════════════════════════════════════════════════════════════════
- * Read Group
+ * Read Groups and Columns
  *
- * Each group represents attribute data for a subset of prims; see
- * ovstage_read_group_t::ordinal. Groups are independently allocated and released.
+ * A group owns one logical prim-row layout shared by one or more independently
+ * mapped attribute columns. Groups are independently acquired and released.
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
 /**
- * @brief A single read result group.
+ * @brief One attribute column in a read result group.
  */
 typedef struct {
-    ovstage_read_group_id_t read_group_id; /**< Opaque payload identity for release_group. */
-    ovx_token_t              attribute; /**< Which attribute this group contains. */
-    ovstage_ordinal_t        ordinal;   /**< Informational ordinal; may differ from the requested end and does not by itself prove which state the payload represents. See ovstage_ordinal_range_t. */
-    bool                     is_delete; /**< true = tombstone group (deletions). */
-    bool                     is_array;   /**< true = source is a ragged (variable-length / USD-array or byte-string) column; false = fixed scalar. The data is CSR either way, so this is the only signal that distinguishes e.g. a 1-byte string from a scalar uint8. */
-    ovstage_attribute_semantic_t semantic; /**< Authored USD interpretation of the column's bytes (point vs float3, asset vs string, …). NONE when unspecified. Orthogonal to dtype/is_array; see ovstage_attribute_semantic_t. */
-    ovstage_prim_group_t     prims;     /**< Which prims this group covers. */
-    ovstage_data_t           data;      /**< Attribute data (array of tensors). */
-    ovstage_attribute_meta_t meta;      /**< Write floor + layout generation. */
+    ovx_token_t attribute;       /**< Attribute represented by this column. */
+    ovstage_ordinal_t ordinal;   /**< Informational ordinal; may differ from the requested end and does not by itself prove which state the payload represents. See ovstage_ordinal_range_t. */
+    bool is_delete;              /**< true = tombstone column (deletions). */
+    bool is_array;               /**< true = ragged (variable-length / USD-array or byte-string) values; false =
+                                      fixed-size values. This is the attribute-kind signal regardless of transport. */
+    ovstage_attribute_semantic_t semantic; /**< Authored interpretation of the column's bytes (point vs float3,
+                                                asset vs string, …). NONE when unspecified. Orthogonal to
+                                                dtype/is_array; see ovstage_attribute_semantic_t. */
+    ovstage_data_t data;                  /**< Attribute values and their mapping to the group's logical rows. */
+    ovstage_attribute_meta_t meta;        /**< Write floor + attribute layout generation. */
+} ovstage_read_column_t;
+
+/**
+ * @brief A read result group containing aligned attribute columns.
+ *
+ * Logical row i identifies the same prim for every column. Each column resolves
+ * its value for that row independently through its ovstage_data_t mapping.
+ * Columns are ordered by the caller's requested attribute order after duplicate
+ * attribute tokens are removed.
+ *
+ * OVStage combines only backend fragments that already have the same logical
+ * prim-row layout. It does not intersect, reorder, repartition, copy, or
+ * synthesize values to force alignment. An attribute absent from every group row
+ * is omitted; a read whose requested attributes are absent everywhere returns no
+ * groups. Partial presence is represented by the column's data mapping or by a
+ * separate group. Single-column groups therefore remain valid.
+ *
+ * No ordering, disjointness, or stable-partition guarantee applies across
+ * different groups. The group owns every borrowed prim, column, tensor, mapping,
+ * and metadata view until ovstage_release_groups() is called. Releasing the read
+ * handle does not release an already fetched group.
+ */
+typedef struct {
+    ovstage_read_group_id_t read_group_id; /**< Opaque payload identity for ovstage_release_groups(). */
+    ovstage_prim_group_t prims;            /**< Shared logical prim rows for every column. */
+    const ovstage_read_column_t* columns;  /**< Ordered borrowed columns; non-NULL when column_count is nonzero. */
+    size_t column_count;                   /**< Number of columns; always at least one for a returned group. */
 } ovstage_read_group_t;
 
 /* ═══════════════════════════════════════════════════════════════════════════════
  * Map Group (Write Iterator)
  *
- * Mirrors ovstage_read_group_t but with writable data. Returned by the
- * fetch_map_next slot. Caller fills data, then commits via the unmap_group
- * slot (or unmap_attribute at the end).
+ * Map groups retain the single-attribute writable result model; unlike a read
+ * group, a map group has one data payload rather than an array of columns.
+ * Returned by the fetch_map_next slot. Caller fills data, then commits via the
+ * unmap_group slot (or unmap_attribute at the end).
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
 /**
@@ -701,7 +847,7 @@ typedef struct {
  * @brief Descriptor for a map session (map_attribute).
  */
 typedef struct {
-    ovx_string_or_token_t        attribute;  /**< Attribute to map (name or interned token). */
+    ovx_token_or_string_t        attribute;  /**< Attribute to map (name or interned token). */
     DLDataType                   dtype;      /**< Requested element type. Required to create a new mapped attribute. Leave zero-initialized only when the target prims already have one unambiguous schema for this attribute name. `dtype.lanes` carries the tuple width. */
     ovstage_attribute_semantic_t semantic;   /**< Authored USD interpretation (point vs float3, asset vs string, ...). NONE = unspecified; adopts an unambiguous compatible existing identity. Conflicting authored roles on a target prim/name are rejected unless attribute_mode is FORCE. Takes effect only when unmap succeeds. */
     ovstage_prim_mode_t          prim_mode;  /**< UPSERT (create absent prims, update present) or INSERT (create-only; OVSTAGE_ERROR_PRIM_NOT_FOUND if a prim already exists). */
@@ -716,6 +862,8 @@ typedef struct {
  * @brief Single filter predicate (tests one attribute).
  *
  * - HAS: attribute exists (values/value_count ignored).
+ * - NOT_HAS: attribute does not exist (values/value_count ignored). Several
+ *   NOT_HAS predicates leave out every prim that has any of their attributes.
  * - IN: attribute value matches one of the provided values.
  * - CONTAINS: composite attribute contains at least one of the values.
  *   Works on arrays (element membership), strings (substring), and composites.
@@ -724,10 +872,10 @@ typedef struct {
  * - LT/LE/GT/GE: numeric or binary (byte-wise) comparison (single value expected).
  */
 typedef struct {
-    ovx_string_or_token_t       attribute;     /**< Which attribute to test. */
+    ovx_token_or_string_t       attribute;     /**< Which attribute to test. */
     ovstage_filter_op_t     op;            /**< Comparison operator. */
-    const ovx_string_t*         values;        /**< Match values (NULL for HAS). */
-    size_t                      value_count;   /**< Number of values (0 for HAS). */
+    const ovx_string_t*         values;        /**< Match values (NULL for HAS and NOT_HAS). */
+    size_t                      value_count;   /**< Number of values (0 for HAS and NOT_HAS). */
 } ovstage_predicate_t;
 
 /**
@@ -757,6 +905,10 @@ typedef struct {
  *
  * - `"usd-children"` (string array): Child prim paths. Use CONTAINS to find
  *   prims with a specific child.
+ *
+ * - `"usd-ancestor-types"` (string array): Ancestor prim type names. Use CONTAINS to find prims by a base type.
+ *
+ * Supported (attribute, operator) pairs: HAS and NOT_HAS on any attribute name except "usd-active"; IN on "usd-path", "usd-parent", "usd-prim-type"; CONTAINS on "usd-children", "usd-schemas", "usd-ancestor-types"; PREFIX on "usd-path". Any other pair is rejected synchronously with OVSTAGE_ERROR_NOT_SUPPORTED.
  */
 typedef struct {
     const ovstage_predicate_t* predicates;  /**< Array of predicates (AND). */
@@ -838,6 +990,15 @@ typedef struct {
  * Exactly one of `tensors` and `managed_tensors` is non-NULL, selecting the
  * lifetime model for the supplied tensors. Both arrays, when present, have
  * length `tensor_count`.
+ *
+ * @remark The caller must ensure that destination writes do not overwrite or
+ * invalidate source memory before it is consumed. Keeping a source alive,
+ * including through `managed_tensors`, does not by itself make
+ * source/destination aliasing safe. Do not rely on an implicit input snapshot.
+ * If input may overlap storage affected by the write, copy its values into
+ * independent memory before submission and retain that copy for the required
+ * input lifetime. Reusing an independent source row for multiple destinations
+ * through `index_map` remains supported.
  *
  * @invariant Exactly one of `tensors` / `managed_tensors` is non-NULL.
  * @invariant `tensor_count >= 1`.
@@ -926,36 +1087,137 @@ typedef struct {
  * semantic, and existing storage never substitute for that declaration.
  */
 typedef struct {
-    ovx_string_or_token_t attribute; /**< Attribute to write (name or interned token). */
+    ovx_token_or_string_t attribute; /**< Attribute to write (name or interned token). */
     ovstage_write_data_t  data;      /**< Write payload for this attribute. */
 } ovstage_attribute_write_t;
 
 /* ═══════════════════════════════════════════════════════════════════════════════
- * Instance Bundle
+ * Instance
  *
- * Pairs a per-implementation context with the vtable that operates on it.
- * Consumers receive an ovstage_instance_t* and either call
- * `instance->vtable->slot(instance->context, ...)` directly or use the
- * convenience wrappers in `ovstage_api_utils.h` and sibling extension APIs.
+ * An ovstage_instance_t holds the data-plane instance, that is the public
+ * vtable with its context, and the extension instances, one per family. Every
+ * instance of the API has the same form: a vtable pointer and the context its
+ * bodies read. Consumers receive an ovstage_instance_t* and either call
+ * `instance->data_plane.vtable->slot(instance->data_plane.context, ...)`
+ * directly or use the wrappers in `ovstage_api_utils.h` and the clone
+ * wrappers in ovstage.h. The functions of the hierarchy, population, usd and
+ * instancing families are inline wrappers in ovstage.h, ovstage_population.h,
+ * ovstage_population_export.h and ovstage_instancing.h. Every wrapper has two
+ * forms. The pair form, `ovstage_<name>_ex`, takes the data-plane instance,
+ * `&instance->data_plane`, or the extension instance of its family,
+ * `&instance->ext_instances.<family>`. It calls
+ * `<pair>->vtable-><member>(<pair>->context, ...)`. A member of a family
+ * vtable takes the context of its own pair first, as a data-plane slot takes
+ * the data-plane context. The instance form, `ovstage_<name>`, takes the
+ * ovstage_instance_t* and calls the pair form on that pair. C++ overloads
+ * `ovstage_<name>` for both receivers. The lifecycle functions
+ * `ovstage_get_config` and `ovstage_destroy_instance` are exported functions
+ * whose bodies call the lifecycle instance with the instance itself, because
+ * destroy_instance frees the instance struct. ovstage_ext_vtables.h defines
+ * the family vtables and states the rules of the extension instances.
  *
- * Instance creation and destruction are NOT part of the contract. Each
- * implementation (e.g. ovstage) provides its own factory function.
+ * `data_plane` is the first member, so the layout `{vtable, context}` of the
+ * data-plane instance is a prefix of the instance. An instance of a family is
+ * a vtable pointer and a context pointer and never grows: new per-instance
+ * state goes behind a context. The context of a family has the type of its
+ * family, ovstage_<family>_context_t, so a body cannot take the context of
+ * another family without a cast.
+ * A new function appends a member to its family vtable. A new family appends
+ * a member to ovstage_ext_instances_t. Each such change is a new revision of
+ * the library version, the one version of the API. An appended member or
+ * family promises no compatibility between a binary of the old revision and
+ * a binary of the new one: the consumer, the provider of an instance and the
+ * library share one revision. A consumer checks the library version against
+ * the headers it compiled with, through ovstage_get_build_info, before it
+ * reads an instance or a vtable layout.
+ *
+ * Instance creation is NOT part of the contract. Each implementation (e.g.
+ * ovstage) provides its own factory function, which fills every member.
  * ═══════════════════════════════════════════════════════════════════════════════ */
+
+/** @brief The data-plane instance: the public vtable and its context. */
+typedef struct ovstage_data_plane_instance_t {
+    const ovstage_data_plane_vtable_t* vtable;  /**< The public vtable (see ovstage_api.h). */
+    ovstage_data_plane_context_t*      context; /**< The context of the data plane, the first argument of every slot. */
+} ovstage_data_plane_instance_t;
+
+/** @brief The lifecycle instance: the lifecycle family vtable and its context. */
+typedef struct ovstage_lifecycle_instance_t {
+    const ovstage_lifecycle_vtable_t* vtable;
+    ovstage_lifecycle_context_t*      context;
+} ovstage_lifecycle_instance_t;
+
+/** @brief The hierarchy instance: the hierarchy family vtable and its context. */
+typedef struct ovstage_hierarchy_instance_t {
+    const ovstage_hierarchy_vtable_t* vtable;
+    ovstage_hierarchy_context_t*      context;
+} ovstage_hierarchy_instance_t;
+
+/** @brief The population instance: the population family vtable and its context. */
+typedef struct ovstage_population_instance_t {
+    const ovstage_population_vtable_t* vtable;
+    ovstage_population_context_t*      context;
+} ovstage_population_instance_t;
+
+/** @brief The usd instance: the usd family vtable and its context. */
+typedef struct ovstage_usd_instance_t {
+    const ovstage_usd_vtable_t* vtable;
+    ovstage_usd_context_t*      context;
+} ovstage_usd_instance_t;
+
+/** @brief The instancing instance: the instancing family vtable and its context. */
+typedef struct ovstage_instancing_instance_t {
+    const ovstage_instancing_vtable_t* vtable;
+    ovstage_instancing_context_t*      context;
+} ovstage_instancing_instance_t;
+
+/**
+ * @brief The extension instances of an instance, one per family.
+ *
+ * Every member is filled before the instance is public: the library writes
+ * the stub pairs and its lifecycle pair, and the factory of the selected
+ * implementation writes the pairs it serves. The vtable of a member points at
+ * a complete family vtable of ovstage_ext_vtables.h, or at a vtable of stubs
+ * for a family the implementation does not serve. The context of a member is
+ * the pointer the bodies of that vtable read. A stub reads no context, and
+ * its member carries NULL. Whoever writes a member owns its context.
+ * ovstage_ext_vtables.h states the rules in full.
+ */
+typedef struct ovstage_ext_instances_t {
+    ovstage_lifecycle_instance_t  lifecycle;
+    ovstage_hierarchy_instance_t  hierarchy;
+    ovstage_population_instance_t population;
+    ovstage_usd_instance_t        usd;
+    ovstage_instancing_instance_t instancing;
+} ovstage_ext_instances_t;
 
 #ifndef OVSTAGE_INSTANCE_T_DECLARED
 #define OVSTAGE_INSTANCE_T_DECLARED
 typedef struct ovstage_instance_t {
-    const ovstage_vtable_t* vtable;  /**< Vtable pointer (see ovstage_api.h). */
-    ovstage_context_t*      context; /**< Implementation-specific context. */
+    ovstage_data_plane_instance_t data_plane;    /**< The data plane: the public vtable and its context. */
+    ovstage_ext_instances_t       ext_instances; /**< One instance per family (see ovstage_ext_vtables.h). */
 } ovstage_instance_t;
 #else
 struct ovstage_instance_t {
-    const ovstage_vtable_t* vtable;  /**< Vtable pointer (see ovstage_api.h). */
-    ovstage_context_t*      context; /**< Implementation-specific context. */
+    ovstage_data_plane_instance_t data_plane;    /**< The data plane: the public vtable and its context. */
+    ovstage_ext_instances_t       ext_instances; /**< One instance per family (see ovstage_ext_vtables.h). */
 };
 #endif
 
 #ifdef __cplusplus
+}
+#endif
+
+#ifdef __cplusplus
+extern "C++"
+{
+OVX_DEFINE_HANDLE_CPP_OPERATORS(ovstage_op_id_t)
+OVX_DEFINE_HANDLE_CPP_OPERATORS(ovstage_query_handle_t)
+OVX_DEFINE_HANDLE_CPP_OPERATORS(ovstage_read_handle_t)
+OVX_DEFINE_HANDLE_CPP_OPERATORS(ovstage_map_handle_t)
+OVX_DEFINE_HANDLE_CPP_OPERATORS(ovstage_ordinal_query_handle_t)
+OVX_DEFINE_HANDLE_CPP_OPERATORS(ovstage_read_group_id_t)
+OVX_DEFINE_HANDLE_CPP_OPERATORS(ovstage_query_result_id_t)
 }
 #endif
 

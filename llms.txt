@@ -1,0 +1,107 @@
+# ovstage
+
+ovstage is a standalone C and Python library that gives simulation and visualization applications one shared, in-process store for scene and simulation data. Applications can author data directly or populate it from OpenUSD, then let physics, rendering, sensors, and other consumers query, read, and update that data through a common API. The application controls execution and when updates become visible, while ovstage provides bulk data access, shared scene identities, and change tracking so each consumer can read the state it needs.
+
+ovstage represents data in arrays for bulk access and uses DLPack tensors for CPU/GPU interchange. CUDA tensors are accepted as write sources; reads and map/unmap buffers use CPU memory by default. Experimental device placement also supports CUDA buffers (docs/concepts/dlpack_tensors.rst). The default history_latest implementation retains current values and tracks changes. Experimental selective history can retain earlier values for explicitly enabled (prim, attribute) pairs (docs/scene/reading_attributes.rst).
+
+ovstage is pre-release: the API, runtime behavior, and packaging may change.
+
+## Primary Docs
+
+- README.md: overview, packaging and dependencies, system requirements, quick starts
+- AGENTS.md: coding-agent guide, execution model, task-to-skill routing, where to find answers
+- OVERVIEW.md: design rationale, capabilities, and principles
+- CHANGELOG.md: release history, including the 0.4 changes
+- docs/index.rst: Sphinx docs entrypoint
+- examples/README.md: C and Python example index
+- skills/: task-level agent skills (one SKILL.md per directory)
+
+## Core Workflows
+
+- Python minimal example: examples/python/minimal
+- C minimal example: examples/c/minimal
+- Runtime loop (populate from USD, update, read): examples/c/runtime-loop, examples/python/runtime-loop
+- USD export: examples/c/usd-export, examples/python/usd-export
+- Python getting started: docs/python_api/getting_started.rst
+- C getting started: docs/c_api/getting_started.rst
+- C project setup: docs/guides/project_setup_c.rst
+- Python project setup: docs/guides/project_setup_python.rst
+- Runtime loop guide: docs/guides/runtime_loop.rst
+
+## Concepts
+
+- Overview and data model: docs/concepts/overview.rst
+- Application flow: docs/concepts/application_flow.rst
+- Async model (ordinals, watermark/write floor, op ids, waits): docs/concepts/async_model.rst
+- Error handling: docs/concepts/error_handling.rst
+- DLPack tensors (residency, CUDA writes, sparse writes, map/unmap): docs/concepts/dlpack_tensors.rst
+- String handling: docs/concepts/string_handling.rst
+- Choosing operations for common tasks: docs/concepts/choosing_api.rst
+- Limitations and current behavior: docs/concepts/limitations.rst
+- Threading, blocking, and lifetime: docs/concepts/threading_lifetime.rst
+
+## Scene Pages
+
+- Reading attributes: docs/scene/reading_attributes.rst
+- Writing attributes: docs/scene/writing_attributes.rst
+- Queries: docs/scene/queries.rst
+- Transforms: docs/scene/transforms.rst
+- Cloning: docs/scene/cloning.rst
+- Instancing: docs/scene/instancing.rst
+- Path dictionary: docs/scene/path_dictionary.rst
+- Populating from USD: docs/scene/population.rst
+- Exporting to USD: docs/scene/exporting_to_usd.rst
+
+## Upgrading
+
+- Upgrading from ovstage 0.3: docs/guides/upgrading_from_0_3.rst
+- Agent skill for the 0.3 to 0.4 migration: skills/update-0-3-to-0-4/SKILL.md
+- Upgrading from ovstage 0.2: docs/guides/upgrading_from_0_2.rst
+- Agent skill for the 0.2 to 0.3 migration: skills/update-0-2-to-0-3/SKILL.md
+
+## Skills
+
+- skills/application-flow/SKILL.md: end-to-end lifecycle (create, write, seal, read, release)
+- skills/project-setup-c/SKILL.md: set up a C/C++ consumer
+- skills/project-setup-python/SKILL.md: set up a Python project
+- skills/loading-usd/SKILL.md: populate from USD files or inline USDA, references, live edits
+- skills/exporting-to-usd/SKILL.md: export runtime state to USD
+- skills/runtime-loop/SKILL.md: headless load, populate, read, update, read loop
+- skills/stage-queries/SKILL.md: filter queries over prim metadata and attribute presence
+- skills/clone-subtree-multienv/SKILL.md: clone subtrees and multi-environment copies
+- skills/cpu-ahead-gpu-async/SKILL.md: async submit/observe, op ids, waits, overlap limits
+- skills/dlpack-tensor-exchange/SKILL.md: DLPack tensor exchange, residency, sparsity, map/unmap
+- skills/error-handling/SKILL.md: status codes and diagnostics
+- skills/string-handling/SKILL.md: ovx_string_t and ovx_token_or_string_t
+- skills/path-dictionary/SKILL.md: tokens, prim paths, prim-path lists
+- skills/logging/SKILL.md: log callback, severity, channel filters
+- skills/usd-to-ovstage-migration/SKILL.md: port USD (pxr) authoring code to ovstage
+- skills/update-0-2-to-0-3/SKILL.md: migrate C and Python apps from ovstage 0.2 to 0.3
+- skills/update-0-3-to-0-4/SKILL.md: migrate C and Python apps from ovstage 0.3 to 0.4
+
+## C Headers
+
+- include/ovstage/ovstage.h: umbrella header; instance descriptor, create/destroy, instance helpers
+- include/ovstage/ovstage_types.h: type surface specific to ovstage (generic types live in ovstage_api_types.h)
+- include/ovstage/ovstage_config.h: instance configuration entry builders
+- include/ovstage/ovstage_api/ovstage_api.h: data-plane vtable contract and execution/ordering model
+- include/ovstage/ovstage_api/ovstage_api_types.h: handles, enums, status codes, operation descriptors
+- include/ovstage/ovstage_api/ovstage_api_utils.h: inline wrappers over the data-plane slots, the pair form ovstage_<slot>_ex over the data-plane instance and the instance form ovstage_<slot>
+- include/ovstage/ovstage_instancing.h: instancing queries (prototype and instance roots)
+- include/ovstage/ovstage_population.h: populate an instance from USD (files or inline USDA)
+- include/ovstage/ovstage_population_types.h: the types of the population family, the export types among them
+- include/ovstage/ovstage_population_predicate.h: composable prim and property selection predicates
+- include/ovstage/ovstage_population_expression.h: the expressions a derived property computes its value from
+- include/ovstage/ovstage_population_export.h: export selected runtime state to USD
+- include/ovstage/ovstage_ext_vtables.h: the family vtables of the lifecycle, hierarchy, population, usd and instancing families, and the rules of the extension instances of ovstage_instance_t
+
+## Python Package
+
+- python/ovstage/__init__.py: public Python entry point (ctypes bindings over the C API)
+
+## Constraints
+
+- The package supports Python 3.10-3.14. The examples currently require Python 3.10-3.13 because they pin NumPy 2.2.6. Updating the examples to a newer NumPy with Python 3.14 support is planned after the 0.4 release.
+- C/C++ examples require CMake and a C++ toolchain.
+- If a doc and a header disagree, the header wins.
+- Preserve snippet markers in examples and tests; docs and skills reference source snippets rather than duplicating API examples.

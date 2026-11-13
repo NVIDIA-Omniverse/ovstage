@@ -39,8 +39,9 @@ or authoring new geometry from scratch; route those to the population/write skil
 
 Resolve inputs in this order: existing repository files and referenced snippets, explicit user request, then broader agent context.
 
-- The source subtree path (must already exist on the stage) and one or more target paths
-  (each must be a valid path and must **not** already exist).
+- The source subtree path (must already exist on the stage and be canonical and
+  absolute) and one or more target paths (each must be a canonical absolute prim,
+  variant-selection, or property path and must **not** already exist).
 - Target API surface: C, Python, or both.
 - The clone ordinal must clear applicable floors and satisfy the configured
   admission policy for target cells and prim lifecycle. Under the strict policy,
@@ -54,8 +55,8 @@ Resolve inputs in this order: existing repository files and referenced snippets,
 - Read the relevant `> **Source:**` snippet before writing or explaining API usage.
 - Understand the async **submit/observe** model (`cpu-ahead-gpu-async`): clone is an enqueue —
   its `op_index` identifies accepted work; confirm completion with `wait_op` / `.wait()`.
-- Confirm the source exists and every target path is free: the clone is **create-only and
-  all-or-nothing** — a batch with any pre-existing target clones nothing.
+- Confirm the source exists and every target path is free: the clone is create-only,
+  and a batch with any pre-existing target clones nothing.
 
 ## Instructions
 
@@ -88,7 +89,7 @@ This skill has no scripts.
 
 - The referenced snippets remain the source of truth; update or add tested snippets before
   documenting new API usage.
-- **Create-only, all-or-nothing.** Every target must be new; a batch mixing fresh and existing
+- **Create-only targets.** Every target must be new; a batch mixing fresh and existing
   targets clones nothing (rejected before any prim is created).
   A prim that already exists below a new target is merged into. The merge is partial:
   the prim keeps attributes the source prim lacks and, if the source prim has no prim
@@ -106,8 +107,9 @@ This skill has no scripts.
   identity of an attribute name that has different types on different source
   prims. Scene hierarchy changes, such as parent child lists, are not. A name held
   both as a value and as a connection is tracked under its value type only.
-- **Latest-snapshot build** — clones become visible at/below the write floor once you advance it;
-  don't design around reading historical ordinals.
+- **Latest values by default** — clones become visible at/below the write floor once you advance it.
+  Retaining earlier values requires opting into experimental
+  [selective history](../../docs/scene/reading_attributes.rst#earlier-values-of-selected-pairs).
 - **⚠️ Draft — API in flux.** Treat exact symbols/ordering as provisional against the headers.
 
 ## Overview
@@ -209,9 +211,9 @@ The same test reads the completion report — `prims_cloned`, `target_count`,
   *executed*. Await the op (C `ovstage_wait_op`; Python `.wait()`), and advance the write floor
   to/above the clone ordinal to read the clones.
 - **`OVSTAGE_ERROR_INVALID_ARGUMENT` at enqueue with "duplicate target path" or
-  "is not a valid path"** — the same target path appears more than once in one call;
-  the enqueue is rejected before anything runs. An empty or unparseable target path
-  is rejected the same way.
+  "is not a valid absolute path"** — the default `history_latest` implementation
+  rejects invalid paths before anything runs. Supply canonical absolute paths;
+  targets must not repeat or name the stage root.
   Nested targets (one under another target of the same batch) are *not* rejected and inflate
   `prims_cloned`, unless a nested target is also a prim cloned under another target; that clone
   fails at execution with `OVSTAGE_ERROR_OP_FAILED`.

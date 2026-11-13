@@ -22,8 +22,9 @@ import ctypes
 import weakref
 from typing import List, Sequence
 
+from ..handles import Token, PrimPath, PrimPathList
 from . import bindings as _b
-from .types import _warn_dropped_resource, check_handle, check_int, check_token, check_token_sequence
+from .types import _warn_dropped_resource, check_path_list, check_primpath, check_int, check_token
 
 __all__ = ["PathDictionary", "PathList", "OvxError"]
 
@@ -60,7 +61,7 @@ def _check_pd_result(pd, result: "_b.ovx_api_result_t") -> None:
     raise OvxError(int(result.status), message)
 
 
-def _release_path_list_reference(pd, handle: int) -> None:
+def _release_path_list_reference(pd, handle: PrimPathList) -> None:
     """Drop one C reference on ``handle`` through a raw dictionary pointer."""
     vtable = pd.contents.vtable.contents
     _check_pd_result(pd, vtable.release_path_list_reference(pd.contents.context, handle))
@@ -70,7 +71,7 @@ def _release_path_list_reference(pd, handle: int) -> None:
 _CREATED, _ADDED = 0, 1
 
 
-def _prune(registry: dict, handle: int, owner: List[int]) -> None:
+def _prune(registry: dict, handle: PrimPathList, owner: List[int]) -> None:
     """Drop ``handle``'s entry once nothing about it is worth remembering.
 
     Pruning matters: an entry left behind on the *correct* create/destroy path
@@ -83,22 +84,21 @@ def _prune(registry: dict, handle: int, owner: List[int]) -> None:
         del registry[handle]
 
 
-def _disown(registry: dict, handle: int, owner: List[int]) -> None:
+def _disown(registry: dict, handle: PrimPathList, owner: List[int]) -> None:
     """Mark the create reference for ``handle`` released."""
     owner[_CREATED] = 0
     _prune(registry, handle, owner)
 
 
-class PathList(int):
+class PathList(PrimPathList):
     """One owned reference to an interned path list (``ovx_primpath_list_t``).
 
-    This *is* the handle — it subclasses :class:`int`, so it passes into
-    :meth:`Stage.query_from_path_list`, :meth:`PathDictionary.path_list_count`,
-    and every other slot that takes a path list unchanged, and
-    ``isinstance(handle, int)`` still holds.
+    This is a :class:`PrimPathList` with ownership of one C reference. It
+    passes directly into every path-list API; tokens, prim paths and raw
+    integers are rejected. ``PrimPathList(plist)`` makes a non-owning copy.
 
     What it adds is lifetime management. Path lists are refcounted C-side, and
-    dropping a bare ``int`` does not decrement that refcount — the reference
+    dropping a non-owning handle does not decrement that refcount — the reference
     leaks for the life of the dictionary. Use it as a context manager so the
     reference is released even when an error interrupts processing::
 
@@ -108,7 +108,7 @@ class PathList(int):
 
     Explicit :meth:`release` (or :meth:`PathDictionary.destroy_path_list`) is
     equally fine. If that reference is still outstanding when the object is
-    garbage-collected, :meth:`__del__` releases it and emits a
+    garbage-collected, ``__del__`` releases it and emits a
     :class:`ResourceWarning`; treat that as a bug report, not a strategy — in a
     per-frame loop, create the list once outside the loop and reuse it.
 
@@ -124,12 +124,12 @@ class PathList(int):
     inline, which leaves nothing to release and ends in the warning above.
 
     Only ``create_path_list*`` mints a :class:`PathList`. Borrowed lists handed
-    back by read groups and query results stay plain ``int``, because the caller
+    back by read groups and query results stay non-owning ``PrimPathList``, because the caller
     does not own a reference on them and must not release one.
 
     Ownership is tracked by handle on the backing :class:`Stage` — not by object
-    identity, and not per wrapper — so releasing through a plain ``int`` copy of
-    the handle (see :meth:`__copy__`) or through a different
+    identity, and not per wrapper — so releasing through a non-owning ``PrimPathList`` copy of
+    the handle (see ``__copy__``) or through a different
     :class:`PathDictionary` over the same stage still clears this object's claim.
 
     That bookkeeping is unsynchronized, like the rest of the binding's handle
@@ -143,15 +143,15 @@ class PathList(int):
     lives, so an outstanding list is still reclaimed and reported.
     """
 
-    def __new__(cls, path_list: int, dictionary: "PathDictionary", owner: List[int]) -> "PathList":
-        self = super().__new__(cls, check_handle(path_list, "path_list"))
+    def __init__(self, path_list, dictionary: "PathDictionary", owner: List[int]):
+        super().__init__(check_path_list(path_list))
         # Weak, so a live path list cannot keep the dictionary (and its backing
         # Stage) alive.
         self._dictionary = weakref.ref(dictionary)
         # Single-element box shared with the Stage's registry, keyed by handle: 1
         # while this object still owns the reference create_path_list* minted, 0
         # once it is released. Keyed by handle rather than object identity so a
-        # release routed through a *plain int* copy (see __copy__/__reduce__) or
+        # release routed through a non-owning PrimPathList copy (see __copy__/__reduce__) or
         # through a different PathDictionary wrapper over the same Stage clears
         # the same flag; otherwise the finalizer would release a second time on a
         # handle the C side may already have recycled.
@@ -161,7 +161,6 @@ class PathList(int):
         # can distinguish a closed wrapper from a destroyed Stage.
         self._pd = dictionary._pd
         self._stage = weakref.ref(dictionary._stage)
-        return self
 
     @property
     def released(self) -> bool:
@@ -189,7 +188,7 @@ class PathList(int):
         if self.released:
             raise OvxError(
                 _b.OVX_API_ERROR,
-                f"path list {int(self)} has already been released; "
+                f"path list {self.raw_id} has already been released; "
                 "its reference is no longer owned by this object",
             )
 
@@ -205,11 +204,11 @@ class PathList(int):
         if not self._c_dictionary_alive():
             raise OvxError(
                 _b.OVX_API_ERROR,
-                f"path list {int(self)} outlived the Stage backing its dictionary; "
+                f"path list {self.raw_id} outlived the Stage backing its dictionary; "
                 "the reference died with it",
             )
-        _release_path_list_reference(self._pd, int(self))
-        _disown(self._registry, int(self), self._owner)
+        _release_path_list_reference(self._pd, self)
+        _disown(self._registry, self, self._owner)
 
     def release(self) -> None:
         """Release this object's reference (see :meth:`PathDictionary.destroy_path_list`)."""
@@ -235,26 +234,7 @@ class PathList(int):
                 pass
 
     def __repr__(self) -> str:
-        return f"PathList({int(self)}, {'released' if self.released else 'owned'})"
-
-    # Formatting stays byte-identical to the bare ``int`` this replaced: defining
-    # __repr__ alone would also change str()/f-strings, because int has no __str__
-    # of its own — it inherits object.__str__, which defers to __repr__ — silently
-    # rewriting callers' log output. Bind the digits-producing int.__repr__ here.
-    __str__ = int.__repr__
-
-    # A copy is not an owner. Copying/pickling yields the plain int handle rather
-    # than a second object that would release the same reference twice — and it
-    # keeps handles usable inside structures that get copied or serialized, which
-    # a bare int always supported.
-    def __copy__(self) -> int:
-        return int(self)
-
-    def __deepcopy__(self, memo) -> int:
-        return int(self)
-
-    def __reduce__(self):
-        return (int, (int(self),))
+        return f"PathList({self.raw_id}, {'released' if self.released else 'owned'})"
 
     def __del__(self):
         # Safety net only. Skip when nothing is outstanding, or once the C
@@ -281,7 +261,7 @@ class PathList(int):
         except Exception:
             pass  # report what we found regardless of how far the release got
         _warn_dropped_resource(
-            f"PathList({int(self)}) was garbage-collected without release(); issued a "
+            f"PathList({self.raw_id}) was garbage-collected without release(); issued a "
             "best-effort release of the reference create_path_list* minted. Use a 'with' "
             "block or call release() explicitly, and reuse one list across a per-frame loop."
         )
@@ -348,7 +328,7 @@ class PathDictionary:
         """
         return self._stage._path_list_refs
 
-    def _track(self, handle: int) -> "PathList":
+    def _track(self, handle: PrimPathList) -> "PathList":
         """Register the create reference for ``handle`` and wrap it."""
         registry = self._registry()
         owner = registry.get(handle)
@@ -371,30 +351,33 @@ class PathDictionary:
         ``int`` as its digits).
         """
         arr = (_b.ovx_string_t * len(values))()
-        refs = []  # keep each ovx_string_t's _bytes buffer alive across the call
+        refs = []  # Keep the encoded bytes alive while native code reads the string views.
         for i, value in enumerate(values):
             if not isinstance(value, str):
                 raise TypeError(f"expected str, got {type(value).__name__}: {value!r}")
-            s = _b.ovx_string_t(value)
-            arr[i] = s
-            refs.append(s)
+            encoded = str(value).encode("utf-8")
+            arr[i].ptr = encoded
+            arr[i].length = len(encoded)
+            refs.append(encoded)
         return arr, refs
 
     # ── tokens ───────────────────────────────────────────────────────────────
-    def intern_token(self, string: str) -> int:
+    def intern_token(self, string: str) -> Token:
+        """Intern a string; the empty string always returns token id 0."""
         arr, _refs = self._string_array([string])
         out = (_b.ovx_token_t * 1)()
         self._check(self._vtable.create_tokens_from_strings(self._context, arr, 1, out))
-        return int(out[0])
+        return out[0]
 
-    def token_to_string(self, token: int) -> str:
+    def token_to_string(self, token: Token) -> str:
+        """Resolve a token; 0 returns "", while UINT64_MAX raises OvxError."""
         tokens = (_b.ovx_token_t * 1)(check_token(token, "token"))
         out = (_b.ovx_string_t * 1)()
         self._check(self._vtable.get_strings_from_tokens(self._context, tokens, 1, out))
         return str(out[0])
 
     # ── prim paths ────────────────────────────────────────────────────────────
-    def intern_path(self, path: str) -> int:
+    def intern_path(self, path: str) -> PrimPath:
         """Intern a prim-path string and return its dictionary-lifetime handle.
 
         An absolute path yields the same handle as construction from its
@@ -404,9 +387,9 @@ class PathDictionary:
         arr, _refs = self._string_array([path])
         out = (_b.ovx_primpath_t * 1)()
         self._check(self._vtable.create_paths_from_strings(self._context, arr, 1, out))
-        return int(out[0])
+        return out[0]
 
-    def path_to_string(self, primpath: int) -> str:
+    def path_to_string(self, primpath: PrimPath) -> str:
         """Resolve a prim-path handle to its path string.
 
         Raises :class:`OvxError` if the handle is invalid, unknown, or expired.
@@ -414,7 +397,7 @@ class PathDictionary:
         handle never resolves to the empty string, so ``""`` is exclusively the
         shape no successful decode produces.
         """
-        prim_paths = (_b.ovx_primpath_t * 1)(check_handle(primpath, "primpath"))
+        prim_paths = (_b.ovx_primpath_t * 1)(check_primpath(primpath))
         buffer_size = _TOKEN_DECOMPOSE_BUFFER
         while True:
             token_buffer = (_b.ovx_token_t * buffer_size)()
@@ -451,30 +434,53 @@ class PathDictionary:
                 )
 
     # ── path lists ─────────────────────────────────────────────────────────────
-    def create_path_list(self, primpaths: Sequence[int]) -> "PathList":
+    def create_path_list(self, primpaths: Sequence[PrimPath]) -> "PathList":
         """Build a path list from interned prim paths, owning one reference.
 
-        The returned :class:`PathList` is the handle (an ``int`` subclass) and
+        The returned :class:`PathList` is the handle (a ``PrimPathList`` subclass) and
         releases that reference on ``with``-exit, :meth:`PathList.release`, or
         :meth:`destroy_path_list`.
         """
-        paths = check_token_sequence(primpaths, "primpaths entries")
+        paths = [check_primpath(path) for path in primpaths]
         arr = (_b.ovx_primpath_t * len(paths))(*paths)
         out = (_b.ovx_primpath_list_t * 1)()
         self._check(self._vtable.create_path_list_from_paths(self._context, arr, len(paths), out))
-        return self._track(int(out[0]))
+        return self._track(out[0])
 
     def create_path_list_from_strings(self, paths: Sequence[str]) -> "PathList":
         """Build a path list from path strings, owning one reference.
+
+        Accepts a plain Python ``list[str]`` or another sequence of strings
+        and automatically interns each path. No prior call to
+        :meth:`intern_path` is needed.
+
+        Args:
+            paths: Sequence of prim-path strings, such as
+                ``["/World/A", "/World/B"]``.
+
+        Returns:
+            An owned :class:`PathList` containing the paths in input order.
+
+        Example::
+
+            with paths.create_path_list_from_strings(["/World/A", "/World/B"]) as plist:
+                ...
+
+        This produces the same path-list contents as interning each string
+        individually and passing the identifiers to :meth:`create_path_list`::
+
+            strings = ["/World/A", "/World/B"]
+            with paths.create_path_list([paths.intern_path(s) for s in strings]) as plist:
+                ...
 
         See :meth:`create_path_list` for the returned handle's lifetime.
         """
         arr, _refs = self._string_array(list(paths))
         out = (_b.ovx_primpath_list_t * 1)()
         self._check(self._vtable.create_path_list_from_strings(self._context, arr, len(arr), out))
-        return self._track(int(out[0]))
+        return self._track(out[0])
 
-    def add_path_list_reference(self, path_list: int) -> None:
+    def add_path_list_reference(self, path_list: PrimPathList) -> None:
         """Increment a path list's refcount (pair with :meth:`destroy_path_list`).
 
         The added reference is yours alone: dropping the :class:`PathList` never
@@ -484,16 +490,16 @@ class PathDictionary:
         with a matching :meth:`destroy_path_list`.
 
         The count is still recorded, so a later ``destroy_path_list`` through a
-        plain ``int`` is attributed to one of *these* references rather than
+        non-owning ``PrimPathList`` is attributed to one of *these* references rather than
         silently consuming the owner's claim.
         """
-        handle = check_handle(path_list, "path_list")
+        handle = check_path_list(path_list)
         self._check(self._vtable.add_path_list_reference(self._context, handle))
         owner = self._registry().get(handle)
         if owner is not None:
             owner[_ADDED] += 1
 
-    def destroy_path_list(self, path_list: int) -> None:
+    def destroy_path_list(self, path_list: PrimPathList) -> None:
         """Release one reference on a path list (erases it at refcount zero).
 
         Which reference this drops is attributed as follows, because the C API
@@ -501,20 +507,20 @@ class PathDictionary:
 
         * passing the :class:`PathList` releases *its* reference, clearing the
           owner flag so the finalizer will not release it a second time;
-        * passing a plain ``int`` releases one you added with
+        * passing a non-owning ``PrimPathList`` releases one you added with
           :meth:`add_path_list_reference` when any are outstanding, and only falls
           through to the owner's reference when none are. Otherwise releasing an
           added reference through the handle would steal the owner's claim and
           strand the create reference for good.
 
         Ownership is keyed by handle on the :class:`Stage`, so this holds whether
-        the call goes through the ``PathList``, a plain ``int`` copy of the handle,
+        the call goes through the ``PathList``, a non-owning ``PrimPathList`` copy of the handle,
         or a different :class:`PathDictionary` wrapper over the same stage. A
         handle no wrapper minted — a borrowed list from a read result, or one
         already fully released — is untracked and passes straight through to the C
         API, exactly as before.
         """
-        handle = check_handle(path_list, "path_list")
+        handle = check_path_list(path_list)
         by_object = isinstance(path_list, PathList)
         registry = self._registry()
         owner = registry.get(handle)
@@ -536,16 +542,16 @@ class PathDictionary:
         else:
             _disown(registry, handle, owner)
 
-    def path_list_count(self, path_list: int) -> int:
+    def path_list_count(self, path_list: PrimPathList) -> int:
         count = ctypes.c_size_t()
         self._check(
             self._vtable.get_num_paths_from_path_list(
-                self._context, check_handle(path_list, "path_list"), ctypes.byref(count)
+                self._context, check_path_list(path_list), ctypes.byref(count)
             )
         )
         return int(count.value)
 
-    def get_paths(self, path_list: int) -> List[int]:
+    def get_paths(self, path_list: PrimPathList) -> List[PrimPath]:
         count = self.path_list_count(path_list)
         if count == 0:
             return []
@@ -553,10 +559,14 @@ class PathDictionary:
         retrieved = ctypes.c_size_t()
         self._check(
             self._vtable.get_paths_from_path_list(
-                self._context, check_handle(path_list, "path_list"), 0, count, out, ctypes.byref(retrieved)
+                self._context, check_path_list(path_list), 0, count, out, ctypes.byref(retrieved)
             )
         )
-        return [int(out[i]) for i in range(int(retrieved.value))]
+        # Native output is already typed uint64 data. Copy directly to detached
+        # handles, avoiding a temporary Structure view and constructor validation.
+        copy_path = PrimPath.from_buffer_copy
+        path_size = ctypes.sizeof(PrimPath)
+        return [copy_path(out, offset) for offset in range(0, retrieved.value * path_size, path_size)]
 
-    def get_path_strings(self, path_list: int) -> List[str]:
+    def get_path_strings(self, path_list: PrimPathList) -> List[str]:
         return [self.path_to_string(p) for p in self.get_paths(path_list)]

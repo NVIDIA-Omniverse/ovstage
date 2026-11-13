@@ -27,8 +27,8 @@ custom metadata. ``/World`` has a translation of 10 along X.
 Loading the Scene
 -----------------
 
-Create the runtime stage and load the physics domain. Later Python snippets run
-inside the same context managers; keep the C stage alive until the example ends.
+Create the runtime stage and load the prims that apply a physics API. Later Python snippets
+run inside the same context managers; keep the C stage alive until the example ends.
 
 .. tab-set::
 
@@ -51,7 +51,7 @@ Selecting Values and Metadata
 -----------------------------
 
 Select the Cube's properties and metadata, then populate at ordinal 2.
-The complete program first populates the physics domain at ordinal 1.
+The complete program first populates those physics prims at ordinal 1.
 
 .. tab-set::
 

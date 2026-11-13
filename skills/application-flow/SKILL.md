@@ -53,9 +53,11 @@ Resolve inputs in this order: existing repository files and referenced snippets,
 - Understand the async **submit/observe** model (`cpu-ahead-gpu-async`): state-mutating and
   data-producing calls are enqueues; confirm completion with `wait_op` / `fetch_*`
   and check the result before relying on it.
-- Remember this build is **latest-snapshot only for payloads**. Exact change membership is
+- Remember an instance of `history_latest` (the default) keeps history off: it is
+  **latest-snapshot only for payloads**. Exact change membership is
   retained across a bounded set of completed write-floor epochs; query
-  `ovstage_get_oldest_preserved_ordinal` before consuming an older range.
+  `ovstage_get_oldest_preserved_ordinal` before consuming an older range. Historical payloads
+  for exact `(prim, attribute)` pairs need the opt-in history capability (see Limitations).
 
 ## Instructions
 
@@ -72,7 +74,8 @@ Resolve inputs in this order: existing repository files and referenced snippets,
 4. **Seal:** advance the write floor to that ordinal (`ovstage_advance_write_floor`) so data
    at/below it is immutable and readable.
 5. **Read:** `ovstage_read_attributes` over an ordinal range → `ovstage_fetch_read_next` →
-   consume `group.data` tensors.
+   iterate `group.columns` and consume each `column.data` tensor view over the shared
+   `group.prims` logical rows.
 6. **Release in reverse:** the read group, the read handle, the path-list reference, then
    destroy the instance. Balance any successful explicit `ovstage_initialize` with
    `ovstage_shutdown` after instance teardown.
@@ -95,17 +98,29 @@ This skill has no scripts.
 
 - The referenced snippets remain the source of truth; this skill composes the minimal
   example's snippets in lifecycle order rather than introducing new code.
-- **Ordinal surface, latest-only payloads:** ordinals, write floors, ordinal ranges, and
+- **Ordinal surface, latest-only payloads by default:** ordinals, write floors, ordinal ranges, and
   `ovstage_get_oldest_preserved_ordinal` describe ordering, sealing, and retained
-  change/deletion membership — that surface is part of the API contract. **In the current
-  build**, payload reads are latest-snapshot only and do not provide historical payload
+  change/deletion membership — that surface is part of the API contract. **By default**,
+  payload reads are latest-snapshot only and do not provide historical payload
   versions. At or above the reported inclusive retention frontier, a range selects exact
   changed/deleted membership; a snapshot selects all queried paths. Reads require selected
   changes through the requested end to be sealed. They return `OVSTAGE_ERROR_OUT_OF_RANGE`
   if history records a later change for a selected `(attribute, path)`, because older values
-  are not retained. End `UINT64_MAX` requests current values; a selected unsealed change still returns `WRITE_FLOOR_VIOLATION`.
+  are not retained. End `OVSTAGE_ORDINAL_MAX` requests current values; a selected unsealed change still returns `WRITE_FLOOR_VIOLATION`.
   Below the frontier, membership may be coalesced or discarded, so a successful
   snapshot read does not guarantee the requested earlier state.
+  Historical payloads are an explicit opt-in. Create an instance of `history_selective`
+  (C `ovstage_instance_desc_t.implementation` set to `history_selective`,
+  Python `StageConfig(implementation="history_selective", retention_window=N)`). Then turn history
+  on for exact `(prim, attribute)` pairs with `ovstage_enable_history()` (`ovstage_history.h`). Only the selected pairs answer a finite
+  `end_ordinal` or a fixed range from retained history; every other pair keeps the rules above.
+  History support (the `history_selective` implementation and `ovstage_history.h`) is
+  experimental and can change between releases without a deprecation period.
+  The public tests assert the opt-in round-trip against the produced package and wheel:
+
+  > **Source:** `tests/c/test_history.cpp` snippet `history-enable-read-c`
+  >
+  > Python: `tests/python/test_history.py` snippet `history-enable-read`
   Do not treat an ordinal range as a historical-payload event log.
 - **USD population not covered here.** Ingesting existing USD uses the population API
   (`ovstage_population.h`); this skill documents the direct write/read lifecycle.
@@ -193,7 +208,7 @@ values) against the produced package, not just prints it:
 The essential ordering is: `ovstage_create_instance` → `ovstage_get_path_dictionary` →
 intern token / `path_dictionary_create_path_list_from_strings` → `ovstage_query_from_path_list`
 → `ovstage_write_attribute` *(ordinal)* → `ovstage_advance_write_floor` *(seal)* →
-`ovstage_read_attributes` → `ovstage_fetch_read_next` → release (`ovstage_release_group` →
+`ovstage_read_attributes` → `ovstage_fetch_read_next` → release (`ovstage_release_groups` →
 `ovstage_release_read` → `path_dictionary_release_path_list_reference`) →
 `ovstage_destroy_instance`.
 
@@ -207,7 +222,7 @@ intern token / `path_dictionary_create_path_list_from_strings` → `ovstage_quer
 | Query target prims | `ovstage_query_from_path_list` | `path-dictionary` |
 | Write (ordinal-keyed) | `ovstage_write_attribute` (+ `ovstage_write_data_t`) | `dlpack-tensor-exchange`, `cpu-ahead-gpu-async` |
 | Seal | `ovstage_advance_write_floor` | `cpu-ahead-gpu-async` |
-| Read | `ovstage_read_attributes` → `ovstage_fetch_read_next` → `ovstage_release_group` | `dlpack-tensor-exchange` |
+| Read | `ovstage_read_attributes` → `ovstage_fetch_read_next` → `ovstage_release_groups` | `dlpack-tensor-exchange` |
 | Observe / errors | `ovstage_wait_op`, `ovstage_get_error_string`, `ovstage_get_last_op_error` | `cpu-ahead-gpu-async`, `error-handling` |
 
 ## Troubleshooting
@@ -217,16 +232,20 @@ intern token / `path_dictionary_create_path_list_from_strings` → `ovstage_quer
   success means *accepted*, not *executed* (wait/fetch first). See `cpu-ahead-gpu-async`.
 - **Read fails with `OVSTAGE_ERROR_OUT_OF_RANGE`** — a selected `(attribute, path)` has a
   recorded change after the requested end, and older values are not retained. If newer values
-  are acceptable, move the end forward or use `UINT64_MAX` (Python: `(1 << 64) - 1`) for current
+  are acceptable, move the end forward or use `OVSTAGE_ORDINAL_MAX` (Python: `ovstage.ORDINAL_MAX`) for current
   values; a selected unsealed change still returns `WRITE_FLOOR_VIOLATION`. Advancing the floor alone does not restore older values.
 - **Write rejected (`OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION`)** — the ordinal conflicts with an
   applicable floor or the configured admission policy for an affected cell or prim
   lifecycle. The strict policy requires a newer ordinal for a second modification
   of the same cell. Disjoint cells may share an ordinal.
-- **Expecting historical payloads from an ordinal range** — unsupported in this
-  latest-snapshot build. Ranges at or above the reported retention frontier provide exact
+- **Expecting historical payloads from an ordinal range** — unsupported for an instance of
+  `history_latest`, the default, where history is off. Ranges at or above the reported
+  retention frontier provide exact
   changed-prim membership; representable ranges carry current payload/delete state, while a
-  retained same-key successor after the range end produces `OUT_OF_RANGE`.
+  retained same-key successor after the range end produces `OUT_OF_RANGE`. To read earlier
+  payloads, create an instance of `history_selective` (`ovstage_instance_desc_t.implementation` set to
+  `history_selective`). Select the exact pairs with `ovstage_enable_history()` before the writes
+  you want to retain. History support is experimental (see Limitations).
 - **Leaks / teardown crashes** — release in reverse: the read group, the read handle, the
   path-list reference, *then* destroy the instance (the path dictionary is instance-owned —
   never free it yourself).

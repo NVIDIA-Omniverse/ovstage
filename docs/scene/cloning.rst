@@ -13,8 +13,8 @@ Cloning Subtrees
 
 :meth:`ovstage.Stage.clone()` copies a subtree to one or more target paths.
 For example, copy a robot subtree to create several simulation environments
-in one call. The source is a :term:`prim <Prim>` path; each target becomes the
-root of a copy.
+in one call. The source is an absolute :term:`prim <Prim>` path or the stage
+root ``/``; each target becomes the root of a copy.
 
 .. note::
 
@@ -64,8 +64,12 @@ Clone Rules
 
 * The source must exist and every target must be new. A batch containing an
   existing target creates nothing.
-* Empty, invalid, or duplicate target paths fail at submission with
-  ``ErrorCode.INVALID_ARGUMENT``. A property path cannot hold child prims.
+* Supply canonical absolute source and target paths. The source may be the
+  stage root ``/``; targets must be prim, variant-selection, or property paths.
+  The default ``history_latest`` implementation rejects empty, relative, or
+  malformed paths, unsupported target path kinds, and duplicate targets at
+  submission with ``ErrorCode.INVALID_ARGUMENT``. A property path cannot hold
+  child prims.
 * Nested targets can be accepted, but a target that also names a prim created
   by another target fails with ``ErrorCode.OP_FAILED`` before cloning. For
   example, targets ``/World/T`` and ``/World/T/Inner`` conflict when the source
@@ -77,8 +81,52 @@ Clone Rules
   type of a mixed-type attribute name. If a name has both a value and a
   connection, it is tracked under the value type. Parent-child lists are not
   change-tracked. Watermarks on copied metadata also gate the clone.
-* Cloned prims attach to their remapped hierarchy parent. If that parent is
-  absent, they attach to the nearest existing ancestor.
+* Cloned prims are entered in the scene hierarchy and attach to their remapped
+  hierarchy parent, so :meth:`ovstage.Stage.get_hierarchy()` (C:
+  :c:func:`ovstage_get_hierarchy()`) reports a cloned prim under its parent in
+  the copy, and a clone root under its destination parent whenever that parent
+  is a prim, whether it was created through the API (by a write, a map, or a
+  clone) or by USD population. If the destination parent is absent, the clone
+  root attaches to the nearest existing ancestor, is reported as having no
+  parent, and its derived transforms compose under that ancestor; while it hangs
+  there, that ancestor's ``CHILDREN`` and the ``SIBLINGS`` of its other children
+  list the root, as the derived ``usd-children`` attribute does, and ``PARENT``
+  reports none until the parent exists.
+
+  When a later write, map, clone or USD
+  population creates the parent, the clone root is reconnected under it and its
+  derived transforms are recomputed on the next computation trigger (see
+  :doc:`transforms`); prims that population created under a parent that was not
+  a prim yet are reconnected the same way (see
+  :ref:`population-ancestors-transforms`). A reconnection that USD population
+  would make while a fetched read group covers a prim it would give
+  ``omni:fabric:worldMatrix`` is deferred until the next population step,
+  ``compute_hierarchy()`` call, or write, map or clone of that parent after the
+  group is released; a write, map or clone that would make such a promotion
+  fails instead (see :doc:`transforms`).
+
+  A written or mapped parent of clones that carry
+  ``omni:fabric:worldMatrix`` receives that attribute itself once it has both
+  the clones under it and a local transform, in whichever order they arrive,
+  so the recomputation has a parent transform to compose with.
+  The ancestor a clone root attaches to while its destination parent is absent
+  receives it the same way when the clone is published.
+
+  Receiving that attribute changes the prim's storage layout, so the operation
+  that would give it (the write or map that creates or completes the parent, or
+  the clone itself when the prim that receives it already exists) fails with
+  ``ErrorCode.OP_FAILED`` while a fetched read group still covers any attribute
+  of that parent or of an ancestor that would receive it, although the
+  operation does not target them, and the rejected operation creates nothing
+  (in a write with several entries, entries already applied remain committed;
+  the rejected one and any not yet applied create nothing). Release the group
+  and repeat the operation. A prim without a transform between the parent and
+  the clones (one created by a token write, for example) does not hide them
+  from this rule.
+
+  Create destination parents before cloning when you can: the
+  copies then land in their final place at once, with nothing to reconnect
+  later.
 
 A new target root can still have existing descendants, for example after an
 older root was deleted. Cloning merges into those descendants. They keep
@@ -86,8 +134,12 @@ attributes absent from the source, combine applied schemas and ancestor types,
 and retain their type when the source has none. A conflicting attribute or prim
 type, or a missing connection-only destination attribute, fails the clone before
 creation. If the source has both a value and connection under one name, the
-connection is copied only if the existing prim already has one. Delete existing
-descendants first when you need an exact copy.
+connection is copied only if the existing prim already has one. Descendants
+that stayed entered in the scene hierarchy under the deleted root (they hang
+under the nearest remaining ancestor meanwhile) are re-attached under the new
+root and counted in ``prims_cloned``, as a write or map recreating that root
+would re-attach them. Delete existing descendants first when you need an exact
+copy.
 
 
 These snippets demonstrate duplicate-target rejection. The runnable example
@@ -161,6 +213,13 @@ of a failed operation exposes the more specific code:
   watermark or retained target-cell/prim-lifecycle change under the configured
   admission policy. Execution failures can surface as ``OP_FAILED`` from wait;
   inspect the diagnostic as described in :doc:`/concepts/error_handling`.
+* ``ErrorCode.OP_FAILED`` — a merge conflict with an existing descendant (see
+  `Clone Rules`_), or a prim that would receive ``omni:fabric:worldMatrix``
+  from the clone (the destination parent, one of its ancestors, or an existing
+  descendant the clone merges into) while a fetched read group still covers it.
+  Nothing is cloned. After a merge conflict, remove or rename the conflicting
+  descendant, or choose another target, before cloning again; after a covered
+  prim, release the group and clone again.
 
 Python's :meth:`CloneOperation.wait() <ovstage.CloneOperation.wait>` and :meth:`result() <ovstage.CloneOperation.result>` release native operation
 tracking on completion. To inspect a specific failure code, call

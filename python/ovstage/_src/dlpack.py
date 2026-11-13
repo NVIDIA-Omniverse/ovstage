@@ -563,7 +563,7 @@ def _to_dlpack_capsule(
 class ManagedDLTensor:
     """A DLPack-exportable view of an ovstage tensor.
 
-    Obtained from :meth:`ovstage.ReadGroup.dlpack` / :meth:`ovstage.MapGroup.dlpack`.
+    Obtained from :meth:`ovstage.ReadColumn.dlpack` / :meth:`ovstage.MapGroup.dlpack`.
     Pass the instance to ``np.from_dlpack()`` / ``wp.from_dlpack()`` /
     ``torch.from_dlpack()`` for zero-copy access (CPU or CUDA), or call
     :meth:`numpy` for a CPU numpy view.
@@ -595,11 +595,14 @@ class ManagedDLTensor:
     view does **not** keep the group alive. For example::
 
         group = read.fetch_next()
-        arr = np.from_dlpack(group.dlpack(0))  # `group` must outlive `arr`
+        arr = np.from_dlpack(group.columns[0].dlpack(0))  # `group` must outlive `arr`
 
-    ``np.from_dlpack(read.fetch_next().dlpack(0))`` drops the group on the same
-    line: its finalizer releases the pinned storage and ``arr`` is left reading
-    memory that has been handed back.
+    A column borrows its group through a weak reference. Chaining
+    ``read.fetch_next().columns[0].dlpack(0)`` can therefore raise ``OvstageError``
+    before export because the temporary group has already been finalized.
+    The separate consumer-view hazard occurs after a successful export: if
+    ``group`` is released after the example above, ``arr`` still refers to the
+    released storage. Copy the values before release if they must outlive it.
     """
 
     def __init__(
@@ -678,9 +681,7 @@ class ManagedDLTensor:
                 )
         # Versioned capsule only when the consumer supports the same major and >= (1, 0);
         # minor bumps are ABI-compatible. NumPy 2.1+ requests (1, 0) then honors the RO flag.
-        use_versioned = (
-            max_version is not None and max_version[0] == DLPACK_MAJOR_VERSION and max_version >= (1, 0)
-        )
+        use_versioned = max_version is not None and max_version[0] == DLPACK_MAJOR_VERSION and max_version >= (1, 0)
 
         if self._deleter_callback is not None:
             original_cb = self._deleter_callback

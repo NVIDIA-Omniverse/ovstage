@@ -8,13 +8,16 @@
 
 """ovstage population: populate an ovstage instance from USD.
 
-Thin wrappers over the ``ovstage_population_*`` C entry points (the USD ->
-ovstage bridge in ``ovstage_population.h``). The application owns the ordinal
+Thin wrappers over the ``ovstage_population_*`` C functions (the USD ->
+ovstage bridge in ``ovstage_population.h``). Each function that takes a stage
+is a member of the population family vtable of the instance. The wrappers
+reach it through the facade of the stage (``stage._api``) under its historical
+name. The application owns the ordinal
 lifecycle and must pass an explicit ordinal to every call that carries one.
 Under the strict admission policy, overlapping writes need successively
 newer ordinals; the wrappers do not allocate or advance ordinals automatically.
 
-The surface follows the ovrtx Python conventions: every mutating entry point
+The surface follows the ovrtx Python conventions: every mutating function
 comes as a blocking ``foo(...)`` that returns once the work has completed, plus
 an asynchronous ``foo_async(...)`` that returns an :class:`Operation` to wait on
 explicitly. Per-stage population state is created lazily on first use and
@@ -25,6 +28,7 @@ import ctypes
 import math
 import os
 
+from ..handles import PopulationOpId, PopulationUsdReferenceHandle
 from . import bindings as _b
 from .population_export import (
     OVSTAGE_POPULATION_EXPORT_DESTINATION_EMPTY,
@@ -39,6 +43,8 @@ from .population_export import (
     OVSTAGE_POPULATION_EXPORT_NAME_MATCH_GLOB,
     OVSTAGE_POPULATION_EXPORT_PATH_MATCH_EXACT,
     OVSTAGE_POPULATION_EXPORT_PATH_MATCH_PREFIX,
+    OVSTAGE_POPULATION_EXPORT_PROJECTION_EXPLICIT_RULES,
+    OVSTAGE_POPULATION_EXPORT_PROJECTION_SCHEMA_DECLARED,
     OVSTAGE_POPULATION_EXPORT_PROPERTY_CONNECTION,
     OVSTAGE_POPULATION_EXPORT_PROPERTY_MATERIAL_BINDING,
     OVSTAGE_POPULATION_EXPORT_PROPERTY_RELATIONSHIP,
@@ -49,17 +55,15 @@ from .population_export import (
     OVSTAGE_POPULATION_EXPORT_RULE_REQUIRED,
     OVSTAGE_POPULATION_EXPORT_SELECTION_CHANGED_PROPERTIES_SINCE_ORDINAL,
     OVSTAGE_POPULATION_EXPORT_SELECTION_EXPLICIT_PREDICATE,
+    OVSTAGE_POPULATION_EXPORT_SOURCE_API_SCHEMAS_APPLY_RECORDED,
+    OVSTAGE_POPULATION_EXPORT_SOURCE_API_SCHEMAS_EXPLICIT_ONLY,
     OVSTAGE_POPULATION_EXPORT_TRANSFORM_NONE,
     OVSTAGE_POPULATION_EXPORT_TRANSFORM_USD_MATRIX_OP,
     OVSTAGE_POPULATION_EXPORT_TRANSFORM_USD_XFORM_OP,
+    OVSTAGE_POPULATION_EXPORT_UNKNOWN_APPLIED_API_SCHEMAS_CUSTOM_DATA_KEY,
     OVSTAGE_POPULATION_EXPORT_UNKNOWN_METADATA_DROP,
     OVSTAGE_POPULATION_EXPORT_UNKNOWN_METADATA_FAIL,
     OVSTAGE_POPULATION_EXPORT_UNKNOWN_METADATA_PRESERVE,
-    OVSTAGE_POPULATION_EXPORT_SOURCE_API_SCHEMAS_EXPLICIT_ONLY,
-    OVSTAGE_POPULATION_EXPORT_SOURCE_API_SCHEMAS_APPLY_RECORDED,
-    OVSTAGE_POPULATION_EXPORT_PROJECTION_EXPLICIT_RULES,
-    OVSTAGE_POPULATION_EXPORT_PROJECTION_SCHEMA_DECLARED,
-    OVSTAGE_POPULATION_EXPORT_UNKNOWN_APPLIED_API_SCHEMAS_CUSTOM_DATA_KEY,
     DestinationCreateOperation,
     DestinationOperation,
     ExportDestination,
@@ -83,14 +87,15 @@ from .population_export import (
     export_typed_hierarchy_to_usd_layer,
     export_typed_hierarchy_to_usd_layer_async,
 )
-from .selectors import Desc, PrimPredicate, PropertyPredicate, Selector, build_descs
+from .selectors import DerivedProperty, Desc, Expression, PrimPredicate, PropertyPredicate, Selector, build_descs
 from .types import (
+    DeriveWhen,
+    ExpressionKind,
     OvstageError,
     PopulationDomain,
     PrimPredicateKind,
     PropertyPredicateKind,
     check_domains,
-    check_handle,
     check_int,
     check_ordinal,
     check_timeout,
@@ -109,6 +114,10 @@ __all__ = [
     "PrimPredicateKind",
     "PropertyPredicate",
     "PropertyPredicateKind",
+    "Expression",
+    "ExpressionKind",
+    "DerivedProperty",
+    "DeriveWhen",
     "Selector",
     "Desc",
     "open_usd",
@@ -190,9 +199,14 @@ __all__ = [
 
 
 def available() -> bool:
-    """True when the loaded ``libovstage`` exports the ovstage population bridge."""
+    """True when the loaded ``libovstage`` exports the population error accessors.
+
+    The population functions that take a stage are members of the population
+    family vtable of every instance. An implementation that does not serve them
+    answers ``OVSTAGE_ERROR_NOT_SUPPORTED`` at the call.
+    """
     try:
-        return hasattr(_b.load(), "ovstage_population_open_usd_from_file")
+        return hasattr(_b.load(), "ovstage_population_get_last_error")
     except Exception:  # noqa: BLE001 — library not loadable in this environment
         return False
 
@@ -203,18 +217,13 @@ def last_error() -> str:
 
 
 def descs_available() -> bool:
-    """True when the loaded ``libovstage`` exports the description-taking entry points.
+    """True when the description-taking population functions are reachable.
 
-    A library older than the descriptions still answers :func:`available`, so the two are
-    probed separately. Both entry points are required: the binding layer configures their
-    prototypes as a unit, so a library exporting one without the other leaves neither
-    callable.
+    They are members of the population family vtable, so every library that
+    answers :func:`available` has them. An implementation that does not serve
+    them answers ``OVSTAGE_ERROR_NOT_SUPPORTED`` at the call.
     """
-    try:
-        lib = _b.load()
-        return all(hasattr(lib, name) for name in _b.POPULATION_DESC_ENTRY_POINTS)
-    except Exception:  # noqa: BLE001 — library not loadable in this environment
-        return False
+    return available()
 
 
 #: The ``time`` value selecting USD's default time code rather than a numeric
@@ -237,19 +246,15 @@ def is_default_time(time: float) -> bool:
 
 
 def _require(stage):
+    """Return the facade and the instance pointer of ``stage`` for a population call.
+
+    The facade (:class:`bindings._InstanceApi`) serves each population function
+    by its historical name through the population family vtable of the instance.
+    It rejects a destroyed stage with the invalid instance error of the stage.
+    """
     if not available():
         raise OvstageError(_b.OVSTAGE_ERROR_NOT_SUPPORTED, "libovstage was built without the ovstage population bridge")
-    return stage._lib, stage._inst
-
-
-def _require_descs(stage):
-    lib, inst = _require(stage)
-    if not descs_available():
-        raise OvstageError(
-            _b.OVSTAGE_ERROR_NOT_SUPPORTED,
-            "libovstage predates the description-taking population entry points",
-        )
-    return lib, inst
+    return stage._api, stage._inst
 
 
 class Operation:
@@ -258,14 +263,14 @@ class Operation:
     Mirrors the ovrtx ``Operation`` ergonomics: :meth:`wait` blocks until the op
     (and the ordinal-keyed ops before it) completes, returning the op's payload
     on success — a USD reference handle for an add-reference op, ``True`` for a
-    void op — or ``None`` on timeout, and raising :class:`OvstageError` on
+    void op — or ``None`` on timeout, and raising :class:`~ovstage.OvstageError` on
     failure. ``status`` is the enqueue status (``OVSTAGE_OK`` = accepted).
     """
 
-    def __init__(self, stage, status: int, op_id: int, *, value=True, keepalive=None, name: str = ""):
+    def __init__(self, stage, status: int, op_id: PopulationOpId, *, value=True, keepalive=None, name: str = ""):
         self._stage = stage
         self.status = check_int(status, "status")
-        self.op_id = check_handle(op_id, "op_id")
+        self.op_id = _b.ovstage_population_op_id_t(_b.ovstage_population_op_id_t._require(op_id, "op_id"))
         self._value = value
         self._keepalive = keepalive  # holds ovx_string_t input buffers alive until waited
         self._name = name
@@ -275,7 +280,7 @@ class Operation:
         return self.status == _b.OVSTAGE_OK
 
     def error_message(self) -> str:
-        lib = self._stage._lib
+        lib = self._stage._api
         return str(lib.ovstage_population_get_last_op_error(self.op_id))
 
     def wait(self, timeout: int = _b.OVSTAGE_TIMEOUT_INFINITE):
@@ -289,7 +294,7 @@ class Operation:
         timeout = check_timeout(timeout)
         if self.status != _b.OVSTAGE_OK:
             raise OvstageError(self.status, last_error())
-        lib, inst = self._stage._lib, self._stage._inst
+        lib, inst = self._stage._api, self._stage._inst
         wait_result = _b.ovstage_population_op_wait_result_t()
         code = lib.ovstage_population_wait_op(inst, self.op_id, timeout, ctypes.byref(wait_result))
         if code == _b.OVSTAGE_ERROR_TIMEOUT:
@@ -327,7 +332,7 @@ def open_usd(
     ``time`` is in **seconds** (converted via the stage's
     ``timeCodesPerSecond``, like the C ``time`` parameter). The default,
     :data:`DEFAULT_TIME`,
-    evaluates at USD's default time code. Wraps the C entry point
+    evaluates at USD's default time code. Wraps the C function
     ``ovstage_population_open_usd_from_file``.
 
     An open writes over what the stage already holds and removes nothing an
@@ -398,19 +403,19 @@ def _build_descs(descs):
 def open_usd_with_desc(stage, path: str, ordinal: int, time: float, descs) -> None:
     """Open a USD file and populate the stage through a description (blocking).
 
-    ``descs`` is a :class:`Desc` or a sequence of them, mirroring the C entry point:
+    ``descs`` is a :class:`Desc` or a sequence of them, mirroring the C function:
     each contributor supplies one, their ``domains`` are OR-ed and their selectors and
     stage metadata paths combined. A description carrying only ``domains`` is exactly
     :func:`open_usd`. An empty sequence selects nothing. ``time`` follows the same
     contract as :func:`open_usd`, including :data:`DEFAULT_TIME`; it is
-    required here rather than defaulted, matching the C entry point.
+    required here rather than defaulted, matching the C function.
     """
     open_usd_with_desc_async(stage, path, ordinal, time, descs).wait()
 
 
 def open_usd_with_desc_async(stage, path: str, ordinal: int, time: float, descs) -> Operation:
     """Open a USD file through a description (asynchronous). See :func:`open_usd_with_desc`."""
-    lib, inst = _require_descs(stage)
+    lib, inst = _require(stage)
     path_s = _b.ovx_string_t(path)
     array, count, keepalive = _build_descs(descs)
     res = lib.ovstage_population_open_usd_from_file_with_desc(
@@ -429,7 +434,7 @@ def open_usd_from_string_with_desc(stage, usda: str, ordinal: int, time: float, 
 
 def open_usd_from_string_with_desc_async(stage, usda: str, ordinal: int, time: float, descs) -> Operation:
     """Open inline USDA through a description (asynchronous). See :func:`open_usd_with_desc`."""
-    lib, inst = _require_descs(stage)
+    lib, inst = _require(stage)
     usda_s = _b.ovx_string_t(usda)
     array, count, keepalive = _build_descs(descs)
     res = lib.ovstage_population_open_usd_from_string_with_desc(
@@ -448,7 +453,8 @@ def repopulate_usd_with_desc(stage, ordinal: int, time: float, descs) -> None:
     population scope; ``time`` is in seconds or :data:`DEFAULT_TIME`, as for
     :func:`open_usd_with_desc`.
 
-    Raises :class:`OvstageError` with NOT_SUPPORTED on an older runtime.
+    Raises :class:`~ovstage.OvstageError` with NOT_SUPPORTED when the implementation
+    does not serve this function.
     """
     repopulate_usd_with_desc_async(stage, ordinal, time, descs).wait()
 
@@ -456,16 +462,13 @@ def repopulate_usd_with_desc(stage, ordinal: int, time: float, descs) -> None:
 def repopulate_usd_with_desc_async(stage, ordinal: int, time: float, descs) -> Operation:
     """Rebuild from the retained USD source asynchronously; see :func:`repopulate_usd_with_desc`."""
     lib, inst = _require(stage)
-    name = "ovstage_population_repopulate_usd_with_desc"
-    if not hasattr(lib, name):
-        raise OvstageError(_b.OVSTAGE_ERROR_NOT_SUPPORTED, "runtime does not support repopulating the current USD source")
     array, count, keepalive = _build_descs(descs)
-    res = getattr(lib, name)(inst, check_ordinal(ordinal), float(time), array, count)
+    res = lib.ovstage_population_repopulate_usd_with_desc(inst, check_ordinal(ordinal), float(time), array, count)
     return _enqueue(stage, "repopulate_usd_with_desc", res, keepalive=[array, keepalive])
 
 
 # ── add / remove USD references (USD-source edits; no ordinal) ────────────────
-def add_usd_reference(stage, ref_file_path: str, target_path: str) -> int:
+def add_usd_reference(stage, ref_file_path: str, target_path: str) -> PopulationUsdReferenceHandle:
     """Add a USD file as a reference at ``target_path`` (blocking). Returns the handle.
 
     The merge is additive in every case; ``target_path`` selects its shape: the root
@@ -484,10 +487,10 @@ def add_usd_reference_async(stage, ref_file_path: str, target_path: str) -> Oper
     target_s = _b.ovx_string_t(target_path)
     handle = _b.ovstage_population_usd_reference_handle_t()
     res = lib.ovstage_population_add_usd_reference_from_file(inst, path_s, target_s, ctypes.byref(handle))
-    return _enqueue(stage, "add_usd_reference", res, value=int(handle.value), keepalive=[path_s, target_s])
+    return _enqueue(stage, "add_usd_reference", res, value=handle, keepalive=[path_s, target_s])
 
 
-def add_usd_reference_from_string(stage, ref_str: str, target_path: str) -> int:
+def add_usd_reference_from_string(stage, ref_str: str, target_path: str) -> PopulationUsdReferenceHandle:
     """Add inline USDA content as a reference at ``target_path`` (blocking). Returns the handle.
 
     Same additive ``target_path`` semantics as :func:`add_usd_reference` (root ``"/"``
@@ -504,18 +507,29 @@ def add_usd_reference_from_string_async(stage, ref_str: str, target_path: str) -
     target_s = _b.ovx_string_t(target_path)
     handle = _b.ovstage_population_usd_reference_handle_t()
     res = lib.ovstage_population_add_usd_reference_from_string(inst, usda_s, target_s, ctypes.byref(handle))
-    return _enqueue(stage, "add_usd_reference_from_string", res, value=int(handle.value), keepalive=[usda_s, target_s])
+    return _enqueue(stage, "add_usd_reference_from_string", res, value=handle, keepalive=[usda_s, target_s])
 
 
-def remove_usd(stage, handle: int) -> None:
-    """Remove a USD reference previously added by ``add_usd_reference*`` (blocking)."""
+def remove_usd(stage, handle: PopulationUsdReferenceHandle) -> None:
+    """Remove a USD reference previously added by ``add_usd_reference*`` (blocking).
+
+    This edits only the USD source. :func:`apply_usd_changes` then applies the
+    removal to the stage and removes the prims that no longer exist in USD. With
+    ``PopulationDomain.RENDERING``, a range read gives no ``usd-path`` tombstone
+    for those prims.
+    """
     remove_usd_async(stage, handle).wait()
 
 
-def remove_usd_async(stage, handle: int) -> Operation:
-    """Remove a USD reference previously added by ``add_usd_reference*`` (asynchronous)."""
+def remove_usd_async(stage, handle: PopulationUsdReferenceHandle) -> Operation:
+    """Remove a USD reference previously added by ``add_usd_reference*`` (asynchronous).
+
+    See :func:`remove_usd`.
+    """
     lib, inst = _require(stage)
-    res = lib.ovstage_population_remove_usd_reference(inst, check_handle(handle, "handle"))
+    res = lib.ovstage_population_remove_usd_reference(
+        inst, _b.ovstage_population_usd_reference_handle_t._require(handle, "handle")
+    )
     return _enqueue(stage, "remove_usd", res)
 
 
@@ -524,7 +538,8 @@ def reset_usd(stage) -> None:
 
     This edits only the USD source. What was populated from it stays until
     :func:`apply_usd_changes` propagates the clear, and a later open merges into
-    it rather than replacing it.
+    it rather than replacing it. With ``PopulationDomain.RENDERING``, a range
+    read gives no ``usd-path`` tombstone for the prims that apply removes.
     """
     reset_usd_async(stage).wait()
 
@@ -546,7 +561,7 @@ def update_from_usd_time(stage, ordinal: int, time: float) -> None:
     ``time`` is in **seconds** (converted via the stage's
     ``timeCodesPerSecond``, like the C ``time`` parameter);
     :data:`DEFAULT_TIME` advances to
-    USD's default time code. Wraps the C entry point
+    USD's default time code. Wraps the C function
     ``ovstage_population_apply_usd_time``.
 
     Every in-scope time-sampled property is overwritten, whether or not

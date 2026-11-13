@@ -16,6 +16,8 @@
 import numpy as np
 import pytest
 
+import ovstage
+from ovstage import PrimPath, PrimPathList
 from ovstage import (AttributeSemantic, DLDataType, DLDataTypeCode, ErrorCode,
                      OrdinalRange, OVX_API_ERROR, OvxError, PathDictionary, make_dltensor)
 
@@ -34,12 +36,12 @@ def test_path_dictionary_errors_are_actionable(stage):
         with pytest.raises(OvxError, match="Path string must be non-empty"):
             paths.intern_path("")
         with pytest.raises(OvxError, match="Path list handle was not found"):
-            paths.path_list_count(0xDEADBEEF)
+            paths.path_list_count(PrimPathList(0xDEADBEEF))
         for handle in (0, 0xDEADBEEF):
             with pytest.raises(
                 OvxError, match="Prim path handle was not found in this dictionary"
             ) as exc:
-                paths.path_to_string(handle)
+                paths.path_to_string(PrimPath(handle))
             assert exc.value.code == OVX_API_ERROR
 
 
@@ -62,7 +64,7 @@ def test_path_dictionary_root_succeeds_while_invalid_raises(stage):
         assert paths.intern_path(paths.path_to_string(root)) == root
 
         with pytest.raises(OvxError, match="Prim path handle was not found in this dictionary"):
-            paths.path_to_string(0xDEADBEEF)
+            paths.path_to_string(PrimPath(0xDEADBEEF))
 
 
 def test_path_dictionary_creates_empty_path_lists(stage):
@@ -107,10 +109,10 @@ def test_write_advance_read(stage):
             read.wait()
             group = read.fetch_next()
             assert group is not None
-            # group.array(i) is a zero-copy view into the group's storage; copy it
+            # column.array(i) is a zero-copy view into the group's storage; copy it
             # out (np.array) so it stays valid after the group is released.
             # [snippet:dlpack-copy-result]
-            values = np.array(group.array(0))
+            values = np.array(group.columns[0].array(0))
             stage.release_group(group)
             # [/snippet:dlpack-copy-result]
             read.release().wait()
@@ -153,7 +155,7 @@ def test_wait_returns_its_receiver_for_chaining(stage):
                 group = read.wait().fetch_next()
                 assert group is not None
                 with group:
-                    values = np.array(group.array(0))
+                    values = np.array(group.columns[0].array(0))
             # [/snippet:wait-chaining]
             np.testing.assert_allclose(values, [1.0, 2.0])
             # A synchronously-created handle has no reserving op; wait() still
@@ -186,8 +188,9 @@ def test_read_group_array_is_read_only(stage):
                 read.wait()
                 group = read.fetch_next()
                 assert group is not None
-                tensor = group.tensor(0)
-                values = group.array(0)
+                column = group.columns[0]
+                tensor = column.tensor(0)
+                values = column.array(0)
 
                 assert values.ctypes.data == int(tensor.data) + int(tensor.byte_offset)
                 assert not values.flags.writeable
@@ -226,7 +229,7 @@ def test_convenience_fixed_shapes_read_back_with_type_aware_shapes(stage):
                 semantic=AttributeSemantic.POINT,
             )
             assert rejected_flat.status == ErrorCode.INVALID_ARGUMENT
-            assert rejected_flat.op_id == 0
+            assert rejected_flat.op_id == ovstage.INVALID_OP_ID
 
             stage.write_attribute(
                 query,
@@ -270,30 +273,31 @@ def test_convenience_fixed_shapes_read_back_with_type_aware_shapes(stage):
                 group = read.fetch_next()
                 if group is None:
                     break
-                exported_shape, values = expected[group.attribute]
-                raw = group.tensor(0)
-                assert raw.ndim == len(exported_shape)
-                assert raw.shape_tuple == exported_shape
-                assert raw.dtype.lanes == 1
-                exported = np.from_dlpack(group.dlpack(0))
-                assert exported.shape == exported_shape
-                assert group.array(0).shape == exported_shape
-                np.testing.assert_allclose(exported, values)
-                seen.add(group.attribute)
+                for column in group.columns:
+                    exported_shape, values = expected[column.attribute]
+                    raw = column.tensor(0)
+                    assert raw.ndim == len(exported_shape)
+                    assert raw.shape_tuple == exported_shape
+                    assert raw.dtype.lanes == 1
+                    exported = np.from_dlpack(column.dlpack(0))
+                    assert exported.shape == exported_shape
+                    assert column.array(0).shape == exported_shape
+                    np.testing.assert_allclose(exported, values)
+                    seen.add(column.attribute)
                 stage.release_group(group)
             assert seen == {point, matrix}
             read.release().wait()
             with stage.read_attributes(query, [point_array], OrdinalRange.latest(1)) as array_read:
                 array_read.wait()
                 with array_read.fetch_next() as array_group:
-                    assert array_group.is_array
-                    assert array_group.tensor_count == 2
+                    assert array_group.columns[0].is_array
+                    assert array_group.columns[0].tensor_count == 2
                     for row, values in enumerate((point_values[:1], point_values)):
-                        raw = array_group.tensor(row)
+                        raw = array_group.columns[0].tensor(row)
                         assert raw.shape_tuple == values.shape
                         assert raw.dtype.lanes == 1
-                        assert array_group.array(row).shape == values.shape
-                        np.testing.assert_allclose(np.from_dlpack(array_group.dlpack(row)), values)
+                        assert array_group.columns[0].array(row).shape == values.shape
+                        np.testing.assert_allclose(np.from_dlpack(array_group.columns[0].dlpack(row)), values)
             # [/snippet:canonical-fixed-shapes]
         finally:
             stage.release_query(query).wait()

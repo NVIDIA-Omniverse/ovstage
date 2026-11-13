@@ -9,7 +9,18 @@
 import numpy as np
 import pytest
 
-from ovstage import DLDataType, DLDataTypeCode, OrdinalRange, PathDictionary
+from ovstage import (
+    DLDataType,
+    DLDataTypeCode,
+    ErrorCode,
+    Filter,
+    FilterOp,
+    OrdinalRange,
+    PathDictionary,
+    Predicate,
+    PrimMode,
+    Token,
+)
 
 FLOAT3 = DLDataType(code=DLDataTypeCode.kDLFloat, bits=32, lanes=3)
 
@@ -25,10 +36,11 @@ def _rows_by_prim(stage, query, attr, end_ordinal, lanes):
     read.wait()
     rows = {}
     for group in read.groups():
-        if not group.is_delete:
-            values = np.asarray(group.array(0)).reshape(-1)
+        column = group.columns[0]
+        if not column.is_delete:
+            values = np.asarray(column.array(0)).reshape(-1)
             for local in range(group.prim_count):
-                row = group.data_row_index(local) if group.has_data_index_map else local
+                row = column.data_row_index(local) if column.has_data_index_map else local
                 rows[group.prim_index(local)] = [float(v) for v in values[row * lanes:row * lanes + lanes]]
         stage.release_group(group)
     read.release().wait()
@@ -191,10 +203,10 @@ def test_read_map_share_typed_layout(stage, components, matrix, array, streaming
                     with group:
                         for local in range(group.prim_count):
                             index = group.prim_index(local)
-                            row = group.data_row_index(local)
-                            value = group.array(row) if array else group.array(0)[row]
+                            row = group.columns[0].data_row_index(local)
+                            value = group.columns[0].array(row) if array else group.columns[0].array(0)[row]
                             np.testing.assert_array_equal(value, expected[index])
-                            assert not group.array(row if array else 0).flags.writeable
+                            assert not group.columns[0].array(row if array else 0).flags.writeable
                             seen.add(index)
                 assert seen == {0, 1}
             finally:
@@ -226,3 +238,145 @@ def test_typed_write_adapter_preserves_outer_stride(stride):
         typed_tensor_to_write(source)
 
 # [/snippet:typed-write-adapter-outer-stride]
+
+
+UINT64 = DLDataType(code=DLDataTypeCode.kDLUInt, bits=64, lanes=1)
+
+
+def _token_rows(stage, paths, query, attribute, end_ordinal, prim_count):
+    """Token names per list-relative prim index at `end_ordinal`: one name for a
+    fixed column, the prim's sorted set for an array column."""
+    read = stage.read_attributes(query, [attribute], OrdinalRange.latest(end_ordinal))
+    read.wait()
+    rows = [None] * prim_count
+    try:
+        for group in read.groups():
+            with group:
+                column = group.columns[0]  # one attribute requested, so one column per group
+                for local in range(group.prim_count):
+                    row = column.data_row_index(local) if column.has_data_index_map else local
+                    if column.is_array:
+                        ids = np.asarray(column.array(row)).reshape(-1)
+                    else:
+                        ids = np.asarray(column.array(0)).reshape(-1)[row:row + 1]
+                    rows[group.prim_index(local)] = sorted(paths.token_to_string(Token(int(i))) for i in ids)
+    finally:
+        read.release().wait()
+    return rows
+
+
+def _matching(stage, attribute, op, *values):
+    with stage.query(filter=Filter([Predicate(attribute, op, list(values))])) as query:
+        query.wait()
+        return query.result().total_prim_count
+
+
+def test_map_reserved_metadata_round_trip(stage):
+    """usd-prim-type, usd-schemas and usd-ancestor-types are lowered to the prim's
+    type / applied-schema / ancestor-type tags rather than stored as value
+    columns. A map of one of them stages interned token ids and its commit lowers
+    them exactly like a copy-in write, so reads and filters observe the mapped
+    value."""
+    with PathDictionary(stage) as paths:
+        plist = paths.create_path_list_from_strings(["/World/Reserved/A", "/World/Reserved/B"])
+        query = stage.query_from_path_list(plist)
+        try:
+            prim_type = paths.intern_token("usd-prim-type")
+            schemas = paths.intern_token("usd-schemas")
+            mesh, sphere = paths.intern_token("Mesh"), paths.intern_token("Sphere")
+            rigid_body = paths.intern_token("PhysicsRigidBodyAPI")
+            mass = paths.intern_token("PhysicsMassAPI")
+            collision = paths.intern_token("PhysicsCollisionAPI")
+            stage.write_attribute(
+                query, prim_type, ordinal=1, tensors=np.array([mesh.raw_id, mesh.raw_id], np.uint64), is_array=False
+            ).wait()
+            stage.write_attribute(
+                query,
+                schemas,
+                ordinal=1,
+                tensors=[np.array([rigid_body.raw_id], np.uint64), np.array([rigid_body.raw_id], np.uint64)],
+                is_array=True,
+            ).wait()
+            stage.advance_write_floor(ordinal=1).wait()
+
+            # [snippet:map-reserved-metadata]
+            # Reserved metadata maps like any recorded column: fill the staging
+            # buffer with the interned tokens' raw ids (dtype uint64, semantic
+            # NONE). One id per prim retypes both prims ...
+            with stage.map_attribute(query, prim_type, ordinal=2, dtype=UINT64) as session:
+                session.wait()
+                for group in session.groups():
+                    buffer = group.array(0)
+                    for local in range(group.prim_count):
+                        row = group.data_row_index(local) if group.has_data_index_map else local
+                        buffer[row] = sphere.raw_id
+                    session.unmap_group(group).wait()
+            # ... and one ragged row per prim, sized by element_sizes, replaces that
+            # prim's whole applied-schema set (an empty row clears it). Array map
+            # groups carry one tensor per prim in group order.
+            with stage.map_attribute(query, schemas, ordinal=2, dtype=UINT64, element_sizes=[1, 2]) as session:
+                session.wait()
+                for group in session.groups():
+                    for i in range(group.tensor_count):
+                        group.array(i)[:] = (
+                            [mass.raw_id] if group.prim_index(i) == 0 else [mass.raw_id, collision.raw_id]
+                        )
+            stage.advance_write_floor(ordinal=2).wait()
+            # [/snippet:map-reserved-metadata]
+
+            assert _token_rows(stage, paths, query, prim_type, 2, 2) == [["Sphere"], ["Sphere"]]
+            assert _token_rows(stage, paths, query, schemas, 2, 2) == [
+                ["PhysicsMassAPI"],
+                ["PhysicsCollisionAPI", "PhysicsMassAPI"],
+            ]
+            assert _matching(stage, "usd-prim-type", FilterOp.IN, "Sphere") == 2
+            assert _matching(stage, "usd-prim-type", FilterOp.IN, "Mesh") == 0
+            assert _matching(stage, "usd-schemas", FilterOp.CONTAINS, "PhysicsRigidBodyAPI") == 0
+            assert _matching(stage, "usd-schemas", FilterOp.CONTAINS, "PhysicsCollisionAPI") == 1
+        finally:
+            stage.release_query(query).wait()
+            paths.destroy_path_list(plist)
+
+
+def test_map_reserved_metadata_insert_and_schema_clear(stage):
+    """An INSERT map of usd-prim-type creates the typed prim, so a second INSERT
+    is rejected at enqueue like any create-only write; a zero-length usd-schemas
+    row clears the applied-schema set."""
+    with PathDictionary(stage) as paths:
+        plist = paths.create_path_list_from_strings(["/World/Reserved/New"])
+        query = stage.query_from_path_list(plist)
+        try:
+            prim_type = paths.intern_token("usd-prim-type")
+            schemas = paths.intern_token("usd-schemas")
+            sphere = paths.intern_token("Sphere")
+            mass = paths.intern_token("PhysicsMassAPI")
+            with stage.map_attribute(
+                query, prim_type, ordinal=1, dtype=UINT64, prim_mode=PrimMode.INSERT
+            ) as session:
+                session.wait()
+                for group in session.groups():
+                    group.array(0)[:] = sphere.raw_id
+            stage.advance_write_floor(ordinal=1).wait()
+            assert _matching(stage, "usd-path", FilterOp.IN, "/World/Reserved/New") == 1
+            assert _matching(stage, "usd-prim-type", FilterOp.HAS) == 1
+            assert _matching(stage, "usd-prim-type", FilterOp.IN, "Sphere") == 1
+            assert _token_rows(stage, paths, query, prim_type, 1, 1) == [["Sphere"]]
+
+            again = stage.map_attribute(query, prim_type, ordinal=2, dtype=UINT64, prim_mode=PrimMode.INSERT)
+            assert again.op.status == ErrorCode.PRIM_NOT_FOUND
+
+            stage.write_attribute(
+                query, schemas, ordinal=2, tensors=[np.array([mass.raw_id], np.uint64)], is_array=True
+            ).wait()
+            stage.advance_write_floor(ordinal=2).wait()
+            assert _matching(stage, "usd-schemas", FilterOp.CONTAINS, "PhysicsMassAPI") == 1
+            with stage.map_attribute(query, schemas, ordinal=3, dtype=UINT64, element_sizes=[0]) as session:
+                session.wait()
+                for group in session.groups():
+                    assert group.tensor(0).shape_tuple == (0,)
+            stage.advance_write_floor(ordinal=3).wait()
+            assert _matching(stage, "usd-schemas", FilterOp.CONTAINS, "PhysicsMassAPI") == 0
+            assert _token_rows(stage, paths, query, schemas, 3, 1) == [[]]
+        finally:
+            stage.release_query(query).wait()
+            paths.destroy_path_list(plist)

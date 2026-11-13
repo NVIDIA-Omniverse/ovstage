@@ -1,64 +1,88 @@
-# USD export (python)
+# ovstage usd-export (Python)
 
-Export a typed USD subtree, mesh geometry, and runtime-created values. The example
-shows destination lifetime, custom attribute rules, renaming, selection, transforms,
-reports, changed properties, and asynchronous export. No USD Python binding is needed.
+Export selected runtime data to USD and inspect the result. The first workflow
+populates an inline USD scene and exports its typed `/World/Props` subtree.
+A second, separate runtime stage is authored directly to demonstrate transform
+export, property selection and renaming, destination ownership, and change export.
 
-## Run
+The [C/C++ example](../../c/usd-export/README.md) covers the same workflows.
 
-```sh
+## At a glance
+
+Start with typed-hierarchy export when the runtime data already carries USD type
+and schema information. The later cases make export choices explicit for data
+written directly by an application. Export selects and projects runtime data;
+it is not an automatic serialization of every runtime column.
+
+Pseudocode (workflow only):
+
+```text
+populate the inline scene; finish writes through ordinal 1
+export /World/Props as typed USD and inspect the file
+export the mesh subtree separately
+on a new stage, write a transform and custom properties at ordinal 1
+compare one-shot file export with an explicitly owned destination
+select, rename, and type exported properties; inspect the reports
+change temperature at ordinal 2; export changes since ordinal 1
+```
+
+## What you'll see
+
+| Case | Result and meaning |
+|---|---|
+| Typed hierarchy | The file contains Sphere `Ball` and Cube `Crate`; `OutsideSelection` is excluded. |
+| Mesh subtree | A separate file exports the meshes and their schema data. |
+| Transform-only export | One transform is exported for the directly authored ball. |
+| Reused destination | Transform and temperature exports are accumulated before an explicit save. |
+| Renamed property | Runtime `solver:collisionRadius = 2.5` becomes USD `radius` on a Sphere definition. |
+| Changed properties | Temperature changes from 20 to 24.5; the change export reports one attribute. |
+
+The program also demonstrates closing a destination without saving and rejecting
+an export request at an invalid earlier ordinal. These are deliberate lifetime
+and error-handling cases, not additional successful file exports.
+
+Files are created in a temporary directory and removed when the program exits.
+The saved-file message describes work performed during the run; it does not name
+a persistent output artifact. Inspect the file checks in the source to see what
+was exported.
+
+## How to read the code
+
+Start in `main()` in [main.py](main.py), then follow the helpers it calls.
+The names below are searchable `[snippet:name]` markers in that file.
+
+| Source markers | What to learn |
+|---|---|
+| `typed-hierarchy-python-example`, `export-mesh` | Read these blocks in main first: select a subtree, initialize typed-hierarchy export, save it, and inspect the result. Meshes use a second selection. |
+| `export-example-setup`, `export-write-runtime` | In the runtime-data helper, create a separate stage and author a transform, temperature, collision radius, and USD type information. |
+| `export-file`, `export-lifetime`, `export-reuse` | Compare the file convenience operation (export, save, close) with a destination that the caller must explicitly save and close. |
+| `export-custom`, `export-rule`, `export-rename` | Select a property namespace, then use an explicit rule when the runtime name or desired USD type differs. |
+| `export-selection`, `export-matrix` | Narrow the selected prim/properties and choose explicit matrix-op export for the transform. |
+| `export-report`, `export-async` | Inspect counts, handle the invalid-ordinal case, and wait for asynchronous file export to finish saving before using its report. |
+| `export-changed` | Update temperature at ordinal 2, finish writes, and export properties changed since ordinal 1. |
+
+## Build and run
+
+Use an ovstage package with population/export support.
+See the [shared setup](../../README.md) for package prerequisites.
+Run these commands from this example's directory.
+
+```bash
 uv run main.py
 ```
 
-Python outputs are temporary and removed on exit.
 
-## Snippet context
+## Notes
 
-The source contains `/World/Ball` with its watermark at ordinal 1. The final
-example advances it to 2. See the full program for the shared setup.
+- Closing an owned destination does not save it. The one-shot file operation
+  performs both steps; the reusable-destination path calls save explicitly.
+- Export reads through a completed write ordinal. The example waits for its
+  writes and floor advancement before requesting each export.
+- Changed-property export selects changed properties; it does not turn the
+  runtime stage into a general history archive.
 
-## Save a transform overlay
+## Further reading
 
-```python
-# A one-shot export creates, saves, and closes an overlay layer.
-report = population.export_to_usd_file(
-    stage, str(directory / "transforms.usda"), ordinal=1,
-    attribute_rules=["omni:xform"],
-)
-print("Transforms exported:", report["transforms_exported"])
-# Transforms exported: 1
-```
-
-## Accumulate exports, then save
-
-```python
-with population.ExportDestination.create(stage, str(directory / "combined.usda")) as usd:
-    usd.export(ordinal=1, attribute_rules=["omni:xform"])
-    usd.export(ordinal=1, attribute_rules=[{
-        "source_attribute_name": "userProperties:temperature",
-        "usd_type_name": "float",
-    }])
-    # Save both exports together. The destination remains open until block exit.
-    usd.save()
-```
-
-## Export a changed temperature
-
-```python
-# custom.usda already holds the baseline temperature 20 at ordinal 1.
-with paths.create_path_list_from_strings(["/World/Ball"]) as selected:
-    with stage.query_from_path_list(selected) as query:
-        stage.write_attribute(query, "userProperties:temperature", ordinal=2,
-                              tensors=np.array([24.5], dtype=np.float32), is_array=False).wait()
-stage.advance_write_floor(ordinal=2).wait()
-changed = population.export_to_usd_file(
-    stage, str(directory / "changed.usda"), ordinal=2, since_ordinal=1,
-    selection=population.OVSTAGE_POPULATION_EXPORT_SELECTION_CHANGED_PROPERTIES_SINCE_ORDINAL,
-    attribute_rules=[{
-        "source_attribute_name": "userProperties:temperature",
-        "usd_type_name": "float",
-    }],
-)
-print("Changed attributes exported:", changed["attributes_exported"])
-# Changed attributes exported: 1
-```
+- [Exporting runtime data to USD](../../../docs/scene/exporting_to_usd.rst)
+- [Population example](../population/README.md)
+- [Transform example](../transforms/README.md)

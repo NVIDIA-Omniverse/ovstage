@@ -4,16 +4,12 @@
 #include "../common/ovstage_example_utils.h"
 #include <ovx/path_dictionary/path_dictionary_utils.h>
 #include <cuda_runtime_api.h>
-#include <cstdio>
-#include <cstdlib>
+#include <stdexcept>
 
 static void checkCuda(cudaError_t status)
 {
     if (status != cudaSuccess)
-    {
-        std::fprintf(stderr, "CUDA failed: %s\n", cudaGetErrorString(status));
-        std::exit(EXIT_FAILURE);
-    }
+        throw std::runtime_error(cudaGetErrorString(status));
 }
 
 int main()

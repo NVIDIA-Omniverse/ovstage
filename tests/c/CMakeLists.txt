@@ -46,6 +46,7 @@ add_executable(ovstage_public_tests
     test_minimal.cpp
     test_population.cpp
     test_population_export.cpp
+    test_population_descriptions.cpp
     test_clone.cpp
     test_queries.cpp
     test_change_feed.cpp
@@ -58,7 +59,9 @@ add_executable(ovstage_public_tests
     test_map_attribute.cpp
     test_logging.cpp
     test_support_api.cpp
-    test_placement.cpp)
+    test_placement.cpp
+    test_read_patterns.cpp
+    test_history.cpp)
 target_link_libraries(ovstage_public_tests PRIVATE ovstage::ovstage GTest::gtest_main)
 
 include(GoogleTest)

@@ -1,8 +1,8 @@
 [project]
 name = "ovstage"
-version = "0.3.0"
+version = "0.4.0"
 description = "NVIDIA OVStage Data Plane Python API"
-requires-python = ">=3.10,<3.14"
+requires-python = ">=3.10,<3.15"
 dependencies = []
 authors = [{name = "NVIDIA Corporation"}]
 license = "LicenseRef-NvidiaProprietary"
@@ -17,6 +17,7 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Programming Language :: Python :: 3 :: Only",
     "Environment :: GPU :: NVIDIA CUDA",
     "Operating System :: OS Independent",
@@ -30,13 +31,16 @@ Changelog = "https://github.com/NVIDIA-Omniverse/ovstage/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 docs = [
+    "Pygments>=2.21.0",
     # Floor = oldest version the strict (-W) docs build is verified against;
     # cap below the next major, whose C-domain warning behavior is unproven.
     "sphinx>=7.4,<10",
     "nvidia-sphinx-theme",
     "sphinx-autodoc-typehints",
     "sphinx-copybutton",
-    "sphinx-design",
+    # 0.8 warns on the legacy card footers and its replacement syntax requires
+    # Python >=3.11. Lift this bound when the docs can drop Python 3.10.
+    "sphinx-design<0.8",
     "sphinx-mdinclude",
     # breathe 5.x (pre-release) changes what `doxygenfile` renders (it resolves
     # group-member references in file compounds); stay on the stable 4.x line
@@ -44,8 +48,10 @@ docs = [
     "breathe>=4.36,<5",
 ]
 test = [
-    "pytest==9.0.2",
-    "numpy>=2.2,<2.3",
+    "pytest==9.2.0",
+    "Pygments>=2.21.0",
+    "numpy>=2.2,<2.3; python_version < '3.14'",
+    "numpy==2.4.6; python_version >= '3.14'",
     "warp-lang>=1.11.1",
 ]
 

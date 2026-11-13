@@ -28,10 +28,20 @@ int main(int argc, char** argv)
     check(nullptr, ovstage_create_instance(&instanceDesc, &stage), "create_instance");
     auto* dict = getPathDictionary(stage);
 
-    // Select physics data and wait for population before making it readable.
-    waitPop(stage, ovstage_population_open_usd_from_file(
-        stage, scenePath, 1, OVSTAGE_POPULATION_DEFAULT_TIME,
-        OVSTAGE_POPULATION_DOMAIN_PHYSICS), "open_usd");
+    // Select the prims that apply a physics API, with their physics properties. Their
+    // ancestors are populated too. Wait for population before making it readable.
+    const ovx_string_t physicsApis[] = {literal_to_ovx_string("PhysicsRigidBodyAPI"),
+                                        literal_to_ovx_string("PhysicsCollisionAPI")};
+    const ovx_string_t physicsNamespace[] = {literal_to_ovx_string("physics")};
+    ovstage_population_selector_t physicsSelector{};
+    physicsSelector.prim_predicate = ovstage_population_prim_predicate_has_applied_schema(physicsApis, 2);
+    physicsSelector.property_predicate =
+        ovstage_population_property_predicate_in_namespace(physicsNamespace, 1);
+    ovstage_population_desc_t physicsDesc{};
+    physicsDesc.selectors = &physicsSelector;
+    physicsDesc.selector_count = 1;
+    waitPop(stage, ovstage_population_open_usd_from_file_with_desc(
+        stage, scenePath, 1, OVSTAGE_POPULATION_DEFAULT_TIME, &physicsDesc, 1), "open_usd");
     ovstage_write_floor_desc_t watermark{};
     watermark.scope = OVSTAGE_SCOPE_ALL;
     watermark.ordinal = 1;
@@ -90,15 +100,20 @@ int main(int argc, char** argv)
         range.end_ordinal = 2;
         ovstage_read_handle_t read{};
         waitOp(stage, ovstage_read_attributes(stage, query, &attribute, 1, range, &read), "read");
+        size_t fetchedGroupCount = 0;
         ovstage_read_group_t group{};
-        check(stage, ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group), "fetch");
-        const DLTensor& tensor = group.data.tensors[0];
+        check(stage, ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group, 1, &fetchedGroupCount), "fetch");
+        if (group.column_count != 1)
+            fail("single-attribute read returned multiple columns");
+        const ovstage_read_column_t& column = group.columns[0];
+        const uint32_t dataRow = column.data.index_map ? column.data.index_map[0] : 0;
+        const DLTensor& tensor = column.data.tensors[column.is_array ? dataRow : 0];
         const auto* values = reinterpret_cast<const double*>(
             static_cast<const uint8_t*>(tensor.data) + tensor.byte_offset);
-        std::printf("%.1f\n", static_cast<double>(values[0]));
+        std::printf("%.1f\n", static_cast<double>(values[dataRow * tensor.dtype.lanes]));
         // 2.0
         // Release the borrowed data before releasing the read and query.
-        ovstage_release_group(stage, &group);
+        ovstage_release_groups(stage, &group, 1);
         waitOp(stage, ovstage_release_read(stage, read), "release read");
         waitOp(stage, ovstage_release_query(stage, query), "release query");
         path_dictionary_release_path_list_reference(dict, pathList);
@@ -119,15 +134,20 @@ int main(int argc, char** argv)
         range.end_ordinal = 2;
         ovstage_read_handle_t read{};
         waitOp(stage, ovstage_read_attributes(stage, query, &attribute, 1, range, &read), "read");
+        size_t fetchedGroupCount = 0;
         ovstage_read_group_t group{};
-        check(stage, ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group), "fetch");
-        const DLTensor& tensor = group.data.tensors[0];
+        check(stage, ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group, 1, &fetchedGroupCount), "fetch");
+        if (group.column_count != 1)
+            fail("single-attribute read returned multiple columns");
+        const ovstage_read_column_t& column = group.columns[0];
+        const uint32_t dataRow = column.data.index_map ? column.data.index_map[0] : 0;
+        const DLTensor& tensor = column.data.tensors[column.is_array ? dataRow : 0];
         const auto* values = reinterpret_cast<const float*>(
             static_cast<const uint8_t*>(tensor.data) + tensor.byte_offset);
-        std::printf("%.1f\n", static_cast<double>(values[0]));
+        std::printf("%.1f\n", static_cast<double>(values[dataRow * tensor.dtype.lanes]));
         // 20.0
         // Release the borrowed data before releasing the read and query.
-        ovstage_release_group(stage, &group);
+        ovstage_release_groups(stage, &group, 1);
         waitOp(stage, ovstage_release_read(stage, read), "release read");
         waitOp(stage, ovstage_release_query(stage, query), "release query");
         path_dictionary_release_path_list_reference(dict, pathList);
@@ -148,18 +168,23 @@ int main(int argc, char** argv)
         range.end_ordinal = 2;
         ovstage_read_handle_t read{};
         waitOp(stage, ovstage_read_attributes(stage, query, &attribute, 1, range, &read), "read");
+        size_t fetchedGroupCount = 0;
         ovstage_read_group_t group{};
-        check(stage, ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group), "fetch");
-        const DLTensor& tensor = group.data.tensors[0];
+        check(stage, ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group, 1, &fetchedGroupCount), "fetch");
+        if (group.column_count != 1)
+            fail("single-attribute read returned multiple columns");
+        const ovstage_read_column_t& column = group.columns[0];
+        const uint32_t dataRow = column.data.index_map ? column.data.index_map[0] : 0;
+        const DLTensor& tensor = column.data.tensors[column.is_array ? dataRow : 0];
         const auto* values = reinterpret_cast<const uint64_t*>(
             static_cast<const uint8_t*>(tensor.data) + tensor.byte_offset);
-        ovx_token_t token = values[0];
+        ovx_token_t token{ values[dataRow * tensor.dtype.lanes] };
         ovx_string_t text{};
         checkOvx(dict, path_dictionary_get_strings_from_tokens(dict, &token, 1, &text), "resolve token");
         std::printf("%.*s\n", static_cast<int>(text.length), text.ptr);
         // ready
         // Release the borrowed data before releasing the read and query.
-        ovstage_release_group(stage, &group);
+        ovstage_release_groups(stage, &group, 1);
         waitOp(stage, ovstage_release_read(stage, read), "release read");
         waitOp(stage, ovstage_release_query(stage, query), "release query");
         path_dictionary_release_path_list_reference(dict, pathList);
@@ -180,14 +205,19 @@ int main(int argc, char** argv)
         range.end_ordinal = 2;
         ovstage_read_handle_t read{};
         waitOp(stage, ovstage_read_attributes(stage, query, &attribute, 1, range, &read), "read");
+        size_t fetchedGroupCount = 0;
         ovstage_read_group_t group{};
-        check(stage, ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group), "fetch");
-        const DLTensor& tensor = group.data.tensors[0];
+        check(stage, ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group, 1, &fetchedGroupCount), "fetch");
+        if (group.column_count != 1)
+            fail("single-attribute read returned multiple columns");
+        const ovstage_read_column_t& column = group.columns[0];
+        const uint32_t dataRow = column.data.index_map ? column.data.index_map[0] : 0;
+        const DLTensor& tensor = column.data.tensors[column.is_array ? dataRow : 0];
         // The tensor has shape (2, 3): two points with scalar float32 lanes.
         std::printf("points: %lld, lanes: %u\n", static_cast<long long>(tensor.shape[0]), tensor.dtype.lanes);
         // points: 2, lanes: 1
         // Release the borrowed data before releasing the read and query.
-        ovstage_release_group(stage, &group);
+        ovstage_release_groups(stage, &group, 1);
         waitOp(stage, ovstage_release_read(stage, read), "release read");
         waitOp(stage, ovstage_release_query(stage, query), "release query");
         path_dictionary_release_path_list_reference(dict, pathList);
@@ -208,15 +238,20 @@ int main(int argc, char** argv)
         range.end_ordinal = 2;
         ovstage_read_handle_t read{};
         waitOp(stage, ovstage_read_attributes(stage, query, &attribute, 1, range, &read), "read");
+        size_t fetchedGroupCount = 0;
         ovstage_read_group_t group{};
-        check(stage, ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group), "fetch");
-        const DLTensor& tensor = group.data.tensors[0];
+        check(stage, ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group, 1, &fetchedGroupCount), "fetch");
+        if (group.column_count != 1)
+            fail("single-attribute read returned multiple columns");
+        const ovstage_read_column_t& column = group.columns[0];
+        const uint32_t dataRow = column.data.index_map ? column.data.index_map[0] : 0;
+        const DLTensor& tensor = column.data.tensors[column.is_array ? dataRow : 0];
         const auto* values = reinterpret_cast<const uint64_t*>(
             static_cast<const uint8_t*>(tensor.data) + tensor.byte_offset);
-        std::printf("%llu\n", static_cast<unsigned long long>(values[0]));
+        std::printf("%llu\n", static_cast<unsigned long long>(values[dataRow * tensor.dtype.lanes]));
         // 0
         // Release the borrowed data before releasing the read and query.
-        ovstage_release_group(stage, &group);
+        ovstage_release_groups(stage, &group, 1);
         waitOp(stage, ovstage_release_read(stage, read), "release read");
         waitOp(stage, ovstage_release_query(stage, query), "release query");
         path_dictionary_release_path_list_reference(dict, pathList);
@@ -237,14 +272,19 @@ int main(int argc, char** argv)
         range.end_ordinal = 2;
         ovstage_read_handle_t read{};
         waitOp(stage, ovstage_read_attributes(stage, query, &attribute, 1, range, &read), "read");
+        size_t fetchedGroupCount = 0;
         ovstage_read_group_t group{};
-        check(stage, ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group), "fetch");
-        const DLTensor& tensor = group.data.tensors[0];
+        check(stage, ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group, 1, &fetchedGroupCount), "fetch");
+        if (group.column_count != 1)
+            fail("single-attribute read returned multiple columns");
+        const ovstage_read_column_t& column = group.columns[0];
+        const uint32_t dataRow = column.data.index_map ? column.data.index_map[0] : 0;
+        const DLTensor& tensor = column.data.tensors[column.is_array ? dataRow : 0];
         // The group is present even though its array has no elements.
         std::printf("elements: %lld\n", static_cast<long long>(tensor.shape[0]));
         // elements: 0
         // Release the borrowed data before releasing the read and query.
-        ovstage_release_group(stage, &group);
+        ovstage_release_groups(stage, &group, 1);
         waitOp(stage, ovstage_release_read(stage, read), "release read");
         waitOp(stage, ovstage_release_query(stage, query), "release query");
         path_dictionary_release_path_list_reference(dict, pathList);
@@ -265,14 +305,19 @@ int main(int argc, char** argv)
         range.end_ordinal = 2;
         ovstage_read_handle_t read{};
         waitOp(stage, ovstage_read_attributes(stage, query, &attribute, 1, range, &read), "read");
+        size_t fetchedGroupCount = 0;
         ovstage_read_group_t group{};
-        check(stage, ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group), "fetch");
-        const DLTensor& tensor = group.data.tensors[0];
+        check(stage, ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group, 1, &fetchedGroupCount), "fetch");
+        if (group.column_count != 1)
+            fail("single-attribute read returned multiple columns");
+        const ovstage_read_column_t& column = group.columns[0];
+        const uint32_t dataRow = column.data.index_map ? column.data.index_map[0] : 0;
+        const DLTensor& tensor = column.data.tensors[column.is_array ? dataRow : 0];
         // extent is one fixed-size value containing six float64 components.
-        std::printf("bits: %u, lanes: %u, array: %d\n", tensor.dtype.bits, tensor.dtype.lanes, group.is_array);
+        std::printf("bits: %u, lanes: %u, array: %d\n", tensor.dtype.bits, tensor.dtype.lanes, column.is_array);
         // bits: 64, lanes: 1, array: 0
         // Release the borrowed data before releasing the read and query.
-        ovstage_release_group(stage, &group);
+        ovstage_release_groups(stage, &group, 1);
         waitOp(stage, ovstage_release_read(stage, read), "release read");
         waitOp(stage, ovstage_release_query(stage, query), "release query");
         path_dictionary_release_path_list_reference(dict, pathList);
@@ -293,15 +338,20 @@ int main(int argc, char** argv)
         range.end_ordinal = 2;
         ovstage_read_handle_t read{};
         waitOp(stage, ovstage_read_attributes(stage, query, &attribute, 1, range, &read), "read");
+        size_t fetchedGroupCount = 0;
         ovstage_read_group_t group{};
-        check(stage, ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group), "fetch");
-        const DLTensor& tensor = group.data.tensors[0];
+        check(stage, ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group, 1, &fetchedGroupCount), "fetch");
+        if (group.column_count != 1)
+            fail("single-attribute read returned multiple columns");
+        const ovstage_read_column_t& column = group.columns[0];
+        const uint32_t dataRow = column.data.index_map ? column.data.index_map[0] : 0;
+        const DLTensor& tensor = column.data.tensors[column.is_array ? dataRow : 0];
         const auto* values = reinterpret_cast<const double*>(
             static_cast<const uint8_t*>(tensor.data) + tensor.byte_offset);
-        std::printf("%.1f\n", values[0]);
+        std::printf("%.1f\n", values[dataRow * tensor.dtype.lanes]);
         // 24.0
         // Release the borrowed data before releasing the read and query.
-        ovstage_release_group(stage, &group);
+        ovstage_release_groups(stage, &group, 1);
         waitOp(stage, ovstage_release_read(stage, read), "release read");
         waitOp(stage, ovstage_release_query(stage, query), "release query");
         path_dictionary_release_path_list_reference(dict, pathList);
@@ -322,18 +372,23 @@ int main(int argc, char** argv)
         range.end_ordinal = 2;
         ovstage_read_handle_t read{};
         waitOp(stage, ovstage_read_attributes(stage, query, &attribute, 1, range, &read), "read");
+        size_t fetchedGroupCount = 0;
         ovstage_read_group_t group{};
-        check(stage, ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group), "fetch");
-        const DLTensor& tensor = group.data.tensors[0];
+        check(stage, ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group, 1, &fetchedGroupCount), "fetch");
+        if (group.column_count != 1)
+            fail("single-attribute read returned multiple columns");
+        const ovstage_read_column_t& column = group.columns[0];
+        const uint32_t dataRow = column.data.index_map ? column.data.index_map[0] : 0;
+        const DLTensor& tensor = column.data.tensors[column.is_array ? dataRow : 0];
         const auto* values = reinterpret_cast<const uint64_t*>(
             static_cast<const uint8_t*>(tensor.data) + tensor.byte_offset);
-        ovx_token_t token = values[0];
+        ovx_token_t token{ values[dataRow * tensor.dtype.lanes] };
         ovx_string_t text{};
         checkOvx(dict, path_dictionary_get_strings_from_tokens(dict, &token, 1, &text), "resolve metadata");
         std::printf("%.*s\n", static_cast<int>(text.length), text.ptr);
         // C
         // Release the borrowed data before releasing the read and query.
-        ovstage_release_group(stage, &group);
+        ovstage_release_groups(stage, &group, 1);
         waitOp(stage, ovstage_release_read(stage, read), "release read");
         waitOp(stage, ovstage_release_query(stage, query), "release query");
         path_dictionary_release_path_list_reference(dict, pathList);
@@ -354,18 +409,23 @@ int main(int argc, char** argv)
         range.end_ordinal = 2;
         ovstage_read_handle_t read{};
         waitOp(stage, ovstage_read_attributes(stage, query, &attribute, 1, range, &read), "read");
+        size_t fetchedGroupCount = 0;
         ovstage_read_group_t group{};
-        check(stage, ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group), "fetch");
-        const DLTensor& tensor = group.data.tensors[0];
+        check(stage, ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group, 1, &fetchedGroupCount), "fetch");
+        if (group.column_count != 1)
+            fail("single-attribute read returned multiple columns");
+        const ovstage_read_column_t& column = group.columns[0];
+        const uint32_t dataRow = column.data.index_map ? column.data.index_map[0] : 0;
+        const DLTensor& tensor = column.data.tensors[column.is_array ? dataRow : 0];
         const auto* values = reinterpret_cast<const uint64_t*>(
             static_cast<const uint8_t*>(tensor.data) + tensor.byte_offset);
-        ovx_token_t token = values[0];
+        ovx_token_t token{ values[dataRow * tensor.dtype.lanes] };
         ovx_string_t text{};
         checkOvx(dict, path_dictionary_get_strings_from_tokens(dict, &token, 1, &text), "resolve metadata");
         std::printf("%.*s\n", static_cast<int>(text.length), text.ptr);
         // robot
         // Release the borrowed data before releasing the read and query.
-        ovstage_release_group(stage, &group);
+        ovstage_release_groups(stage, &group, 1);
         waitOp(stage, ovstage_release_read(stage, read), "release read");
         waitOp(stage, ovstage_release_query(stage, query), "release query");
         path_dictionary_release_path_list_reference(dict, pathList);
@@ -386,18 +446,23 @@ int main(int argc, char** argv)
         range.end_ordinal = 2;
         ovstage_read_handle_t read{};
         waitOp(stage, ovstage_read_attributes(stage, query, &attribute, 1, range, &read), "read");
+        size_t fetchedGroupCount = 0;
         ovstage_read_group_t group{};
-        check(stage, ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group), "fetch");
-        const DLTensor& tensor = group.data.tensors[0];
+        check(stage, ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group, 1, &fetchedGroupCount), "fetch");
+        if (group.column_count != 1)
+            fail("single-attribute read returned multiple columns");
+        const ovstage_read_column_t& column = group.columns[0];
+        const uint32_t dataRow = column.data.index_map ? column.data.index_map[0] : 0;
+        const DLTensor& tensor = column.data.tensors[column.is_array ? dataRow : 0];
         const auto* values = reinterpret_cast<const uint64_t*>(
             static_cast<const uint8_t*>(tensor.data) + tensor.byte_offset);
-        ovx_token_t token = values[0];
+        ovx_token_t token{ values[dataRow * tensor.dtype.lanes] };
         ovx_string_t text{};
         checkOvx(dict, path_dictionary_get_strings_from_tokens(dict, &token, 1, &text), "resolve type");
         std::printf("%.*s\n", static_cast<int>(text.length), text.ptr);
         // Cube
         // Release the borrowed data before releasing the read and query.
-        ovstage_release_group(stage, &group);
+        ovstage_release_groups(stage, &group, 1);
         waitOp(stage, ovstage_release_read(stage, read), "release read");
         waitOp(stage, ovstage_release_query(stage, query), "release query");
         path_dictionary_release_path_list_reference(dict, pathList);
@@ -418,22 +483,27 @@ int main(int argc, char** argv)
         range.end_ordinal = 2;
         ovstage_read_handle_t read{};
         waitOp(stage, ovstage_read_attributes(stage, query, &attribute, 1, range, &read), "read");
+        size_t fetchedGroupCount = 0;
         ovstage_read_group_t group{};
-        check(stage, ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group), "fetch");
-        const DLTensor& tensor = group.data.tensors[0];
+        check(stage, ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group, 1, &fetchedGroupCount), "fetch");
+        if (group.column_count != 1)
+            fail("single-attribute read returned multiple columns");
+        const ovstage_read_column_t& column = group.columns[0];
+        const uint32_t dataRow = column.data.index_map ? column.data.index_map[0] : 0;
+        const DLTensor& tensor = column.data.tensors[column.is_array ? dataRow : 0];
         const auto* values = reinterpret_cast<const uint64_t*>(
             static_cast<const uint8_t*>(tensor.data) + tensor.byte_offset);
         // One token per applied API schema, stored in a USD array.
         for (int64_t i = 0; i < tensor.shape[0]; ++i)
         {
-            ovx_token_t token = values[i];
+            ovx_token_t token{ values[i] };
             ovx_string_t text{};
             checkOvx(dict, path_dictionary_get_strings_from_tokens(dict, &token, 1, &text), "resolve type");
             std::printf("%.*s\n", static_cast<int>(text.length), text.ptr);
             // PhysicsRigidBodyAPI
         }
         // Release the borrowed data before releasing the read and query.
-        ovstage_release_group(stage, &group);
+        ovstage_release_groups(stage, &group, 1);
         waitOp(stage, ovstage_release_read(stage, read), "release read");
         waitOp(stage, ovstage_release_query(stage, query), "release query");
         path_dictionary_release_path_list_reference(dict, pathList);
@@ -454,16 +524,22 @@ int main(int argc, char** argv)
         range.end_ordinal = 2;
         ovstage_read_handle_t read{};
         waitOp(stage, ovstage_read_attributes(stage, query, &attribute, 1, range, &read), "read");
+        size_t fetchedGroupCount = 0;
         ovstage_read_group_t group{};
-        check(stage, ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group), "fetch");
-        const DLTensor& tensor = group.data.tensors[0];
+        check(stage, ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group, 1, &fetchedGroupCount), "fetch");
+        if (group.column_count != 1)
+            fail("single-attribute read returned multiple columns");
+        const ovstage_read_column_t& column = group.columns[0];
+        const uint32_t dataRow = column.data.index_map ? column.data.index_map[0] : 0;
+        const DLTensor& tensor = column.data.tensors[column.is_array ? dataRow : 0];
         const auto* values = reinterpret_cast<const double*>(
             static_cast<const uint8_t*>(tensor.data) + tensor.byte_offset);
         // Row-major matrices store translation in the last row.
-        std::printf("World translation: %.1f %.1f %.1f\n", values[12], values[13], values[14]);
+        std::printf("World translation: %.1f %.1f %.1f\n", values[dataRow * tensor.strides[0] + 12],
+                    values[dataRow * tensor.strides[0] + 13], values[dataRow * tensor.strides[0] + 14]);
         // World translation: 10.0 0.0 0.0
         // Release the borrowed data before releasing the read and query.
-        ovstage_release_group(stage, &group);
+        ovstage_release_groups(stage, &group, 1);
         waitOp(stage, ovstage_release_read(stage, read), "release read");
         waitOp(stage, ovstage_release_query(stage, query), "release query");
         path_dictionary_release_path_list_reference(dict, pathList);
@@ -488,15 +564,20 @@ int main(int argc, char** argv)
         range.end_ordinal = 3;
         ovstage_read_handle_t read{};
         waitOp(stage, ovstage_read_attributes(stage, query, &attribute, 1, range, &read), "read");
+        size_t fetchedGroupCount = 0;
         ovstage_read_group_t group{};
-        check(stage, ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group), "fetch");
-        const DLTensor& tensor = group.data.tensors[0];
+        check(stage, ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group, 1, &fetchedGroupCount), "fetch");
+        if (group.column_count != 1)
+            fail("single-attribute read returned multiple columns");
+        const ovstage_read_column_t& column = group.columns[0];
+        const uint32_t dataRow = column.data.index_map ? column.data.index_map[0] : 0;
+        const DLTensor& tensor = column.data.tensors[column.is_array ? dataRow : 0];
         const auto* values = reinterpret_cast<const float*>(
             static_cast<const uint8_t*>(tensor.data) + tensor.byte_offset);
-        std::printf("%.1f\n", static_cast<double>(values[0]));
+        std::printf("%.1f\n", static_cast<double>(values[dataRow * tensor.dtype.lanes]));
         // 30.0
         // Release the borrowed data before releasing the read and query.
-        ovstage_release_group(stage, &group);
+        ovstage_release_groups(stage, &group, 1);
         waitOp(stage, ovstage_release_read(stage, read), "release read");
         waitOp(stage, ovstage_release_query(stage, query), "release query");
         path_dictionary_release_path_list_reference(dict, pathList);
@@ -517,7 +598,7 @@ int main(int argc, char** argv)
 
 
     // [snippet:population-subtree-c]
-    // Add size for Cube prims below /World to the predefined physics selection.
+    // Add size for Cube prims below /World to the physics selection.
     const ovx_string_t roots[] = {literal_to_ovx_string("/World")};
     const ovx_string_t types[] = {literal_to_ovx_string("Cube")};
     const ovx_string_t subtreeProperties[] = {literal_to_ovx_string("size")};
@@ -527,10 +608,10 @@ int main(int argc, char** argv)
     ovstage_population_selector_t subtreeSelector{};
     subtreeSelector.prim_predicate = ovstage_population_prim_predicate_and(conditions, 2);
     subtreeSelector.property_predicate = ovstage_population_property_predicate_has_name(subtreeProperties, 1);
+    const ovstage_population_selector_t subtreeSelectors[] = {physicsSelector, subtreeSelector};
     ovstage_population_desc_t subtreeDesc{};
-    subtreeDesc.domains = OVSTAGE_POPULATION_DOMAIN_PHYSICS;
-    subtreeDesc.selectors = &subtreeSelector;
-    subtreeDesc.selector_count = 1;
+    subtreeDesc.selectors = subtreeSelectors;
+    subtreeDesc.selector_count = 2;
     waitPop(stage, ovstage_population_open_usd_from_file_with_desc(
         stage, scenePath, 7, OVSTAGE_POPULATION_DEFAULT_TIME, &subtreeDesc, 1), "populate subtree");
     watermark.ordinal = 7;
@@ -546,7 +627,7 @@ int main(int argc, char** argv)
     ovstage_ordinal_t retryOrdinal = ordinal;
     const auto operation = ovstage_population_open_usd_from_file(
         stage, {missing.c_str(), missing.size()}, ordinal,
-        OVSTAGE_POPULATION_DEFAULT_TIME, OVSTAGE_POPULATION_DOMAIN_PHYSICS);
+        OVSTAGE_POPULATION_DEFAULT_TIME, OVSTAGE_POPULATION_DOMAIN_RENDERING);
     if (operation.status == OVSTAGE_OK)
     {
         ovstage_population_op_wait_result_t result{};
@@ -568,7 +649,7 @@ int main(int argc, char** argv)
     // Population failed: <diagnostic for the missing file>
     waitPop(stage, ovstage_population_open_usd_from_file(
         stage, scenePath, retryOrdinal, OVSTAGE_POPULATION_DEFAULT_TIME,
-        OVSTAGE_POPULATION_DOMAIN_PHYSICS), "retry with valid file");
+        OVSTAGE_POPULATION_DOMAIN_RENDERING), "retry with valid file");
     watermark.ordinal = retryOrdinal;
     waitOp(stage, ovstage_advance_write_floor(stage, &watermark), "advance watermark");
     // [/snippet:population-failure-c]

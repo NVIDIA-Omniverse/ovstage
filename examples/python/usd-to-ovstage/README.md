@@ -86,17 +86,16 @@ uv run main.py
 
 ## Snippets
 
-The `[snippet:name]` markers in `main.py` fence regions referenced by the
-ovstage skills under `../../../skills/`; keep them intact when editing.
+The `[snippet:name]` markers in [main.py](main.py) identify the source regions described below and referenced by the [ovstage skills](../../../skills/). Keep the markers intact when editing.
 
-- `usd-create-prims` — the in-memory `pxr` stage and one `DefinePrim` per prim
-- `usd-author-one-by-one` — the USD habit: `CreateAttribute(...).Set(...)` per prim, `attr.Get()` per prim
-- `usd-changeblock-batch` — 8 `Set` calls under one `Sdf.ChangeBlock` (notification-only batching)
-- `ovstage-create-prims` — ONE INSERT write of `usd-prim-type` creates the prims and stamps types
-- `ovstage-write-one-by-one` — the naive port: a loop of one-prim write ops (works, unbatched)
-- `ovstage-write-vectorized` — the idiomatic port: one write op, one column over all prims
-- `ovstage-write-batched` — `write_attributes`: two columns in one batched op
-- `ovstage-read-column` — one read op returns the whole column, rows placed via `prim_index`
+- `usd-create-prims` — Creates an in-memory stage with `Usd.Stage.CreateInMemory()` and calls `DefinePrim()` once for each of five paths. This establishes the USD hierarchy used by the first half of the comparison.
+- `usd-author-one-by-one` — Calls `CreateAttribute(...).Set(...)` to write temperature separately on each of the four child prims. It reads each value back with `Get()` and prints the resulting temperatures.
+- `usd-changeblock-batch` — Groups eight humidity and pressure `Set()` calls inside `Sdf.ChangeBlock()`. This combines change notifications while the individual attribute edits remain separate calls.
+- `ovstage-create-prims` — Interns the five type names and writes their identifiers to `usd-prim-type` with `PrimMode.INSERT`. One `write_attribute()` call creates the selected prims; after advancing the write floor, the example reads back their types.
+- `ovstage-write-one-by-one` — Writes temperature through four single-prim queries at ordinal 2, waiting for each operation. It advances the write floor and reads the values back, matching the USD example's per-prim authoring pattern.
+- `ovstage-write-vectorized` — Supplies all four temperatures as one NumPy column to `write_attribute()` at ordinal 3. After completion and a write-floor advance, the readback shows the same values as the per-prim writes.
+- `ovstage-write-batched` — Builds two `WriteDesc` entries for humidity and pressure and submits them with one `write_attributes()` call at ordinal 4. The example waits, advances the write floor, and reads both columns; batching does not make the writes an atomic transaction.
+- `ovstage-read-column` — `_read_column()` reads one attribute for the selected prims, resolves each group's paths with `prim_index()`, and handles its data-row index map. It returns a Python list in the caller's expected path order and releases each group after copying its values.
 
 ## Notes
 

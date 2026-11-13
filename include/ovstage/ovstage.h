@@ -18,13 +18,37 @@
  * (transitively included from `ovstage_api.h`) and sibling extension APIs.
  *
  * This header adds the pieces specific to ovstage: an instance descriptor,
- * create/destroy entry points, and instance helpers. Once an
- * `ovstage_instance_t*` has been produced by `ovstage_create_instance`,
- * call the generic `ovstage_*` wrappers declared in `ovstage_api.h` and the
- * ovstage-specific entry points declared here to drive it.
+ * the process-level functions, the functions of the lifecycle, hierarchy and
+ * usd families, and the subtree clone wrappers. Once an `ovstage_instance_t*`
+ * has been produced by `ovstage_create_instance`, call the generic `ovstage_*`
+ * wrappers declared in `ovstage_api.h` and the functions declared here to
+ * drive it.
  *
- * @version 0.3.0
- * @date 2026-05-27
+ * The lifecycle functions `ovstage_create_instance`, `ovstage_get_config` and
+ * `ovstage_destroy_instance` are exported C functions of the library. The
+ * exported bodies of `ovstage_get_config` and `ovstage_destroy_instance` call
+ * their members through the lifecycle instance. `ovstage_ext_vtables.h`
+ * defines the family vtables and states the rules of the extension instances.
+ *
+ * The functions of the hierarchy and usd families are `static inline`
+ * wrappers, like the data-plane wrappers of `ovstage_api_utils.h`. Each
+ * wrapper has two forms. The pair form, `ovstage_<name>_ex`, takes the
+ * extension instance of its family, `ovstage_<family>_instance_t*`. It
+ * rejects a NULL pair with the documented answer. Then it calls its member
+ * with the context of that pair first,
+ * `<family>->vtable-><member>(<family>->context, ...)`. The instance form
+ * takes `ovstage_instance_t*` and passes `&instance->ext_instances.<family>`
+ * to the pair form, or NULL for a NULL instance. C++ overloads the name of
+ * the instance form over the pair type, so both receivers share one name.
+ *
+ * `ovstage_clone` and `ovstage_fetch_clone_result` are `static inline`
+ * wrappers over the slots `clone` and `fetch_clone_result` of the public
+ * vtable: a clone is an operation of the data plane. Their pair form takes
+ * `ovstage_data_plane_instance_t*`, and the instance form passes
+ * `&instance->data_plane`.
+ *
+ * @version 0.4.0
+ * @date 2026-10-29
  */
 
 #ifndef OVSTAGE_H
@@ -32,6 +56,7 @@
 
 #include "ovstage_api/ovstage_api.h"
 #include "ovstage_config.h"
+#include "ovstage_ext_vtables.h"
 #include "ovstage_types.h"
 
 #ifdef __cplusplus
@@ -62,21 +87,11 @@ const ovstage_build_info_t* ovstage_get_build_info(void);
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
 /**
- * @brief Acquire a reference to process-scoped ovstage state.
+ * @brief Initialize process-wide ovstage configuration and resources.
  *
- * Reference-counted: each successful call must be balanced by one
- * ovstage_shutdown(). Process-scoped state is set up on the first reference
- * (0 -> 1) and torn down on the last (1 -> 0). Instances created with
- * ovstage_create_instance also hold a reference, so process state stays alive
- * while any instance exists.
+ * Pair each successful call with one ovstage_shutdown(). Explicit initialization lets applications supply configuration before creating stages and keep process-level resources available between stage lifetimes.
  *
- * Calling ovstage_initialize() is optional when linking the ovstage shared
- * library directly: instance creation acquires process state on demand. Call it
- * explicitly to (1) pin process-scoped state independent of instance lifetime —
- * so process-level resources stay alive when no instance is live or across
- * instance create/destroy churn — and (2) bootstrap the runtime eagerly, so a
- * framework/plugin failure surfaces here instead of at the first
- * create_instance.
+ * Explicit initialization is optional when linking the shared library directly and using default configuration. Static-loader applications must supply the required package location before other ovstage calls. Initialization also reports startup failures before the first stage is created.
  *
  * @param config Optional process configuration (see ovstage_config_t / the
  *               entry builders in ovstage_config.h).
@@ -88,6 +103,16 @@ const ovstage_build_info_t* ovstage_get_build_info(void);
  *               updates and the RUNTIME_DEFAULT selector for new instances.
  *               OVSTAGE_CONFIG_RUNTIME_DEFAULT_ORDINAL_ADMISSION_POLICY
  *               selects mutation admission, defaulting to NONDECREASING.
+ *               OVSTAGE_CONFIG_POPULATION_THREAD_LIMIT bounds the threads a
+ *               population operation may use to read what its selectors
+ *               select, defaulting to 1 (serial).
+ *               OVSTAGE_CONFIG_RETENTION_WINDOW sets the number of sealed
+ *               ordinals a history-capable instance retains, defaulting to 4.
+ *               The implementation of an instance is a per-instance choice.
+ *               The `implementation` member of ovstage_instance_desc_t
+ *               selects it at ovstage_create_instance: the default keeps
+ *               history off, and a history-capable implementation turns
+ *               history on for the selected pairs.
  *               Omitted settings and their DEFAULT selectors inherit active
  *               process settings, or select defaults on the first reference.
  *               Later concrete settings must match the active settings. All
@@ -95,6 +120,10 @@ const ovstage_build_info_t* ovstage_get_build_info(void);
  *               of them and acquires no reference. A policy can change only
  *               after all initialization and instance references are released,
  *               including retained instance handles and attachments.
+ * @note Experimental. The setting OVSTAGE_CONFIG_RETENTION_WINDOW and the
+ *       history-capable implementation "history_selective" are experimental.
+ *       Their API, ABI and semantics can change between releases without a
+ *       deprecation period.
  * @return OVSTAGE_OK on success; OVSTAGE_ERROR_INVALID_ARGUMENT for malformed,
  *         duplicate, unknown, or conflicting runtime configuration.
  * @post Balance every successful call with one ovstage_shutdown().
@@ -116,15 +145,15 @@ ovstage_api_status_t ovstage_initialize(const ovstage_config_t* config);
  * @param instance Initialized ovstage instance.
  * @param[out] out_config Borrowed view of the instance's process config.
  * @return OVSTAGE_OK on success; OVSTAGE_ERROR_INVALID_ARGUMENT if either
- *         argument is NULL.
+ *         argument is NULL. The library serves this function for every
+ *         implementation it creates an instance of.
  */
 ovstage_api_status_t ovstage_get_config(const ovstage_instance_t* instance, ovstage_config_t* out_config);
 
 /**
- * @brief Release one reference acquired by ovstage_initialize().
+ * @brief Finish one successful explicit ovstage initialization.
  *
- * On the last outstanding reference (explicit initializations and live
- * instances both count), process-scoped state is torn down.
+ * Call once for each successful ovstage_initialize(). This does not destroy application stages; destroy them separately after completing their work. Process-level configuration remains active while stages or unmatched successful initialization calls remain.
  *
  * @return OVSTAGE_OK on success; OVSTAGE_ERROR_INVALID_ARGUMENT if called
  *         without a matching outstanding ovstage_initialize().
@@ -142,14 +171,9 @@ ovstage_api_status_t ovstage_shutdown(void);
  * to @p callback. Process-global: one callback for the whole process, replacing
  * any previous one. Pass @p callback = NULL to disable delivery.
  *
- * Messages are delivered asynchronously on a dedicated dispatcher thread, so the
- * callback never runs on the logging hot path and invocations are serialized.
- * Use ovstage_flush_log to force pending messages through before a checkpoint.
+ * Messages are delivered asynchronously, one callback invocation at a time. Do not assume delivery on the calling thread. Use ovstage_flush_log to wait for pending messages before a checkpoint.
  *
- * The dispatcher thread and runtime log hook are created lazily on the first
- * non-null callback and torn down when the callback is cleared, so a client that
- * never installs a callback pays nothing. Passing @p callback = NULL flushes any
- * pending messages to the current callback and then disables delivery.
+ * Passing @p callback = NULL delivers pending messages to the current callback and then disables delivery.
  *
  * When ovstage runs standalone (the shipped package used directly), this
  * callback is the only diagnostics sink: with no callback installed the runtime
@@ -162,10 +186,7 @@ ovstage_api_status_t ovstage_shutdown(void);
  * USD coding errors at OVSTAGE_LOG_WARNING, other errors at OVSTAGE_LOG_ERROR),
  * never call-site file/line details.
  *
- * Requires the ovstage runtime to be bootstrapped (an ovstage_initialize() or a
- * live instance); otherwise returns OVSTAGE_ERROR_OP_FAILED. Keep a process
- * reference (or clear the callback) before releasing the last one — the last
- * ovstage_shutdown / instance destroy flushes and tears the bridge down.
+ * Requires a successful ovstage_initialize() not yet matched by ovstage_shutdown(), or a live instance; otherwise returns OVSTAGE_ERROR_OP_FAILED. When no live stages or unmatched successful initialization calls remain, logging is disabled after pending messages are delivered. Register the callback again after reinitialization. To preserve logging between stage lifetimes, initialize explicitly and call the matching shutdown only when finished.
  *
  * @param severity       Default severity threshold for channels not matched by a
  *                       rule in @p channel_filter. Messages below it are dropped.
@@ -205,31 +226,80 @@ ovstage_api_status_t ovstage_flush_log(ovstage_timeout_ns_t timeout);
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
 /**
- * @brief Create an ovstage instance.
+ * @brief Create an ovstage instance of the implementation the descriptor selects.
+ *
+ * The `implementation` member of @p desc points to the name of the
+ * implementation. NULL or an empty string selects the default
+ * implementation. A name that no implementation registered fails the call
+ * with OVSTAGE_ERROR_INVALID_ARGUMENT. The call then acquires no process
+ * reference and writes no instance, and ovstage_get_last_error reports the
+ * name. The selection is per instance: instances of different
+ * implementations share one process. The call acquires a process reference
+ * that the instance holds until ovstage_destroy_instance releases it.
+ *
+ * @remark The implementations of this release are "history_latest", the
+ *         default, and "history_selective". "history_latest" keeps history
+ *         off: the instance keeps the latest value of every cell, a read
+ *         returns it, and the history selection calls report
+ *         OVSTAGE_ERROR_NOT_SUPPORTED. "history_selective" turns history on
+ *         for the pairs the application selects: ovstage_enable_history()
+ *         (ovstage_history.h) selects the (prim, attribute) pairs that
+ *         retain their earlier sealed values, up to
+ *         OVSTAGE_CONFIG_RETENTION_WINDOW. Every other cell keeps the latest
+ *         value.
+ * @note Experimental. The implementation "history_selective" and the history
+ *       selection API of ovstage_history.h are experimental. Their API, ABI
+ *       and semantics can change between releases without a deprecation
+ *       period.
+ *
  * @param desc Configuration descriptor.
- * @param[out] out_instance Receives the new instance (vtable + context bundle).
- * @return OVSTAGE_OK on success.
+ * @param[out] out_instance Receives the new instance. The library fills the lifecycle pair and the stub pairs, and the factory of the selected implementation fills the pairs it serves.
+ * @return OVSTAGE_OK on success; OVSTAGE_ERROR_INVALID_ARGUMENT when no
+ *         implementation registered the name in @p desc.
  * @post Caller owns the instance; destroy via ovstage_destroy_instance.
+ * @remark The instance's backing USD stage captures its resolver context here:
+ *  the `ArResolverContext` bound on the calling thread (`ArResolverContextBinder`),
+ *  merged with the resolver's default context with the bound objects taking
+ *  precedence per context type, or the default context alone when nothing is
+ *  bound. USD population binds that captured context around its layer opens for
+ *  the instance's lifetime, so a context-dependent resolver's context must be in
+ *  place before this call; one bound only afterwards is not seen. This call may
+ *  also be the process's first `ArGetResolver()`, which fixes OpenUSD's primary
+ *  resolver: a host that selects one (`ArSetPreferredResolver`) does so before
+ *  creating its first instance. Destroy the instance before releasing the
+ *  resolver runtime its context refers to.
  */
 ovstage_api_status_t ovstage_create_instance(
     const ovstage_instance_desc_t* desc,
     ovstage_instance_t**           out_instance);
 
 /**
- * @brief Release an ovstage instance handle.
- * @param instance Instance handle to release. May be NULL (no-op).
- * @pre If this is the final handle retaining the stage, all operations, handles,
- *      and result payloads associated with the stage must be released first.
- * @pre No other thread may invoke any `ovstage_*` wrapper, vtable slot, or
- *      internal accessor on this `instance` while or after destroy runs. The
- *      supplied bundle is deallocated before this call returns; any concurrent
- *      or post-destroy use of that handle is a use-after-free.
- * @details Another component may retain a distinct handle to the same stage.
- *          In that case the shared stage state and resources remain alive until
- *          the final retained handle is released. In-flight work remains valid
- *          and must be completed and released through a surviving handle.
+ * @brief Destroy the caller's ovstage instance handle.
+ * @param instance Instance handle to destroy. May be NULL (no-op).
+ * @pre Complete required work and release application-owned operations, query/read/map handles, and result payloads before final stage cleanup.
+ * @pre No other thread may use this instance while or after destruction runs.
+ * @details The supplied handle is invalid after a call that returns OVSTAGE_OK. Destroying it does not detach an already attached renderer; use that renderer's public detach or destruction API to end the attachment. Do not use the destroyed handle to access data, submit operations, or wait for work.
+ * @return OVSTAGE_OK when the instance is destroyed, and for a NULL instance.
+ *         An implementation may refuse the destroy while it still needs the
+ *         instance, with a status other than OVSTAGE_OK that it documents.
+ *         The library then frees nothing and the instance stays valid, with
+ *         its process reference. Call this function again after the condition
+ *         the implementation documents is cleared. The library serves this
+ *         function for every implementation it creates an instance of.
  */
 ovstage_api_status_t ovstage_destroy_instance(ovstage_instance_t* instance);
+
+/** @brief The pair form of ovstage_get_usd_stage_id: the same call on the usd
+ *         instance, `&instance->ext_instances.usd`. C++ overloads
+ *         ovstage_get_usd_stage_id for this receiver. */
+static inline ovstage_api_status_t ovstage_get_usd_stage_id_ex(
+    ovstage_usd_instance_t* usd,
+    uint64_t*               out_usd_stage_id)
+{
+    if (usd == NULL)
+        return OVSTAGE_ERROR_INVALID_ARGUMENT;
+    return usd->vtable->get_usd_stage_id(usd->context, out_usd_stage_id);
+}
 
 /**
  * @brief Get the source USD stage id backing this ovstage instance.
@@ -249,9 +319,34 @@ ovstage_api_status_t ovstage_destroy_instance(ovstage_instance_t* instance);
  * @return OVSTAGE_ERROR_INVALID_ARGUMENT if @p instance or @p out_usd_stage_id is NULL.
  * @return OVSTAGE_ERROR_NOT_SUPPORTED if the instance has no associated USD stage.
  */
-ovstage_api_status_t ovstage_get_usd_stage_id(
+static inline ovstage_api_status_t ovstage_get_usd_stage_id(
     ovstage_instance_t* instance,
-    uint64_t*           out_usd_stage_id);
+    uint64_t*           out_usd_stage_id)
+{
+    return ovstage_get_usd_stage_id_ex(
+        instance != NULL ? &instance->ext_instances.usd : NULL, out_usd_stage_id);
+}
+
+/** @brief The pair form of ovstage_clone: the same call on the data-plane
+ *         instance, `&instance->data_plane`. C++ overloads ovstage_clone for
+ *         this receiver. */
+static inline ovstage_enqueue_result_t ovstage_clone_ex(
+    ovstage_data_plane_instance_t* data_plane,
+    ovx_string_t                   source_path,
+    const ovx_string_t*            target_paths,
+    size_t                         num_target_paths,
+    ovstage_ordinal_t              ordinal)
+{
+    if (data_plane == NULL)
+    {
+        ovstage_enqueue_result_t rejected;
+        rejected.status = OVSTAGE_ERROR_INVALID_ARGUMENT;
+        rejected.op_index = OVSTAGE_INVALID_OP_ID;
+        return rejected;
+    }
+    return data_plane->vtable->clone(
+        data_plane->context, source_path, target_paths, num_target_paths, ordinal);
+}
 
 /**
  * @brief Enqueue an asynchronous operation to clone the subtree under the source
@@ -303,9 +398,39 @@ ovstage_api_status_t ovstage_get_usd_stage_id(
  * different source prims. Scene hierarchy changes, such as the source/target parents'
  * child lists, are not.
  *
+ * Cloned prims are entered in the scene hierarchy when the clone is published, like
+ * prims created by writes and maps: a hierarchy lookup (`ovstage_get_hierarchy`)
+ * reports a cloned prim under its parent in the copy, and a clone root under its
+ * destination parent whenever that parent is a prim, whether it was created through
+ * this API (by a write, a map, or a clone) or by USD population. A clone root whose
+ * destination parent does not exist attaches to the nearest existing ancestor, is
+ * reported as having no parent, and its derived transforms compose under that
+ * ancestor. When a later write, map, clone or USD population creates the parent, the
+ * clone root is reconnected under it and its derived transforms are recomputed on the
+ * next computation trigger (a reconnection that USD population would make while a
+ * fetched read group covers a prim it would give `omni:fabric:worldMatrix` is deferred
+ * until the next population step, `ovstage_compute_hierarchy` call, or write, map or
+ * clone of that parent after the group is released; a write, map or clone that would
+ * make such a promotion fails instead); a written or mapped parent of cloned prims that carry
+ * `omni:fabric:worldMatrix` receives that output itself once it has both the clones
+ * under it and a local transform, in whichever order they arrive, so the recomputation
+ * has a parent transform to compose with (see the transforms documentation).
+ * The ancestor a clone root attaches to while its destination parent is absent
+ * receives that output the same way when the clone is published.
+ * Giving a prim that output relocates its storage, so a clone that would give it to a
+ * prim an outstanding read covers — the destination parent, one of its ancestors, or
+ * an existing descendant the clone merges into — fails with `OVSTAGE_ERROR_OP_FAILED`
+ * before any prim is created; release the read group and clone again.
+ * Conversely, a clone whose target root path still has children
+ * entered in the hierarchy from a deleted prim re-attaches those children under the
+ * new root, as a write or map recreating that root does; they count in the report's
+ * `prims_cloned`. Creating destination parents before cloning is recommended: the
+ * copies then land in their final place at once, with nothing to reconnect later.
+ *
  * @param instance         The ovstage instance.
- * @param source_path      Path to the source subtree to clone.
- * @param target_paths     Array of target paths to clone to.
+ * @param source_path      Absolute path to the source subtree to clone, in canonical spelling.
+ * @param target_paths     Array of absolute prim, variant-selection, or property paths to clone to,
+ *                         in canonical spelling.
  * @param num_target_paths Number of target paths to clone to.
  * @param ordinal          Ordinal for this clone. Must exceed the global write floor
  *                         and the effective seals of the source subtree's attributes.
@@ -320,14 +445,17 @@ ovstage_api_status_t ovstage_get_usd_stage_id(
  *                         only the global and source-attribute floor checks apply.
  * @return Enqueue result with status + op_index.
  * - **status == OVSTAGE_OK** if the operation was enqueued successfully.
- * - `OVSTAGE_ERROR_INVALID_ARGUMENT` if a target path is empty or is not a valid path,
- *   or appears more than once in @p target_paths (rejected at enqueue; the offending
- *   path is reported through `ovstage_get_last_error`).
+ * - In the default `history_latest` implementation, `OVSTAGE_ERROR_INVALID_ARGUMENT`
+ *   if a source or target path is relative, malformed, or noncanonical; a target
+ *   has an unsupported path kind; or a target appears more than once in
+ *   @p target_paths (rejected at enqueue; details are reported through
+ *   `ovstage_get_last_op_error(instance, OVSTAGE_INVALID_OP_ID)`).
  * - a non-OK status if the enqueue was rejected (e.g. invalid arguments, or the
  *   required runtime capability is unavailable). Per-op execution errors — including
  *   `OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION`, `OVSTAGE_ERROR_NOT_FOUND` (missing
  *   source), `OVSTAGE_ERROR_PRIM_NOT_FOUND` (a target already exists), and
- *   `OVSTAGE_ERROR_OP_FAILED` (a merge conflict) — are
+ *   `OVSTAGE_ERROR_OP_FAILED` (a merge conflict, or a prim that would receive
+ *   `omni:fabric:worldMatrix` while an outstanding read covers it) — are
  *   surfaced through `wait_op` (as `OVSTAGE_ERROR_OP_FAILED` plus the message) and
  *   with their own code through ovstage_fetch_clone_result.
  *
@@ -363,12 +491,38 @@ ovstage_api_status_t ovstage_get_usd_stage_id(
  *         can extend their lifetime. Interned paths can stay allocated after the
  *         instance is destroyed.
  */
-ovstage_enqueue_result_t ovstage_clone(
+static inline ovstage_enqueue_result_t ovstage_clone(
     ovstage_instance_t* instance,
     ovx_string_t        source_path,
     const ovx_string_t* target_paths,
     size_t              num_target_paths,
-    ovstage_ordinal_t   ordinal);
+    ovstage_ordinal_t   ordinal)
+{
+    return ovstage_clone_ex(
+        instance != NULL ? &instance->data_plane : NULL,
+        source_path, target_paths, num_target_paths, ordinal);
+}
+
+/** @brief The pair form of ovstage_fetch_clone_result: the same call on the
+ *         data-plane instance, `&instance->data_plane`. C++ overloads
+ *         ovstage_fetch_clone_result for this receiver. */
+static inline ovstage_api_status_t ovstage_fetch_clone_result_ex(
+    ovstage_data_plane_instance_t* data_plane,
+    ovstage_op_id_t                op_id,
+    ovstage_timeout_ns_t           timeout,
+    ovstage_clone_result_t*        out_result)
+{
+    if (data_plane == NULL)
+    {
+        if (out_result != NULL)
+        {
+            ovstage_clone_result_t zero = { 0 };
+            *out_result = zero;
+        }
+        return OVSTAGE_ERROR_INVALID_ARGUMENT;
+    }
+    return data_plane->vtable->fetch_clone_result(data_plane->context, op_id, timeout, out_result);
+}
 
 /**
  * @brief Fetch the completion report of a clone operation.
@@ -383,7 +537,10 @@ ovstage_enqueue_result_t ovstage_clone(
  * @param instance   The ovstage instance.
  * @param op_id      The clone's op id.
  * @param timeout    Maximum time to wait for completion, in nanoseconds.
- * @param[out] out_result Receives the report on `OVSTAGE_OK`; zeroed otherwise.
+ * @param[out] out_result Receives the report on `OVSTAGE_OK`. An implementation
+ *             that does not serve this function returns
+ *             `OVSTAGE_ERROR_NOT_SUPPORTED` and leaves it unchanged. Zeroed on
+ *             any other failure.
  * @return OVSTAGE_OK and the report on success.
  * @return OVSTAGE_ERROR_INVALID_ARGUMENT if @p instance or @p out_result is NULL.
  * @return OVSTAGE_ERROR_INVALID_HANDLE if @p op_id is not a live clone operation
@@ -396,17 +553,46 @@ ovstage_enqueue_result_t ovstage_clone(
  *         `OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION`, `OVSTAGE_ERROR_OUT_OF_MEMORY` or
  *         `OVSTAGE_ERROR_INTERNAL` (an internal failure, which can also be reported
  *         after the clone was applied, so the targets may exist),
- *         otherwise `OVSTAGE_ERROR_OP_FAILED` — if the clone ran and failed, with the
- *         message available through `ovstage_get_last_op_error(op_id)`.
+ *         otherwise `OVSTAGE_ERROR_OP_FAILED` (a merge conflict, or a prim that would
+ *         receive `omni:fabric:worldMatrix` while an outstanding read covers it) — if
+ *         the clone ran and failed, with the message available through
+ *         `ovstage_get_last_op_error(op_id)`.
  *
  * @remark Like `wait_op`, an infinite-timeout fetch may execute the still-pending
  *         clone inline on the calling thread.
  */
-ovstage_api_status_t ovstage_fetch_clone_result(
+static inline ovstage_api_status_t ovstage_fetch_clone_result(
     ovstage_instance_t*     instance,
     ovstage_op_id_t         op_id,
     ovstage_timeout_ns_t    timeout,
-    ovstage_clone_result_t* out_result);
+    ovstage_clone_result_t* out_result)
+{
+    return ovstage_fetch_clone_result_ex(
+        instance != NULL ? &instance->data_plane : NULL, op_id, timeout, out_result);
+}
+
+/** @brief The pair form of ovstage_get_hierarchy: the same call on the hierarchy
+ *         instance, `&instance->ext_instances.hierarchy`. C++ overloads
+ *         ovstage_get_hierarchy for this receiver. */
+static inline ovstage_enqueue_result_t ovstage_get_hierarchy_ex(
+    ovstage_hierarchy_instance_t*   hierarchy,
+    ovx_primpath_list_t             prim_paths,
+    ovstage_ordinal_t               ordinal,
+    ovstage_hierarchy_relation_t    relation,
+    ovstage_hierarchy_handle_t*     out_hierarchy_handle)
+{
+    if (hierarchy == NULL)
+    {
+        ovstage_enqueue_result_t rejected;
+        if (out_hierarchy_handle != NULL)
+            *out_hierarchy_handle = OVSTAGE_INVALID_HIERARCHY_HANDLE;
+        rejected.status = OVSTAGE_ERROR_INVALID_ARGUMENT;
+        rejected.op_index = OVSTAGE_INVALID_OP_ID;
+        return rejected;
+    }
+    return hierarchy->vtable->get_hierarchy(
+        hierarchy->context, prim_paths, ordinal, relation, out_hierarchy_handle);
+}
 
 /**
  * @brief Enqueue a hierarchy lookup for a batch of prims.
@@ -429,12 +615,42 @@ ovstage_api_status_t ovstage_fetch_clone_result(
  * @return Enqueue result with status + op_index. Per-op execution failures are
  *         surfaced through ovstage_wait_op + ovstage_get_last_op_error.
  */
-ovstage_enqueue_result_t ovstage_get_hierarchy(
+static inline ovstage_enqueue_result_t ovstage_get_hierarchy(
     ovstage_instance_t*             instance,
     ovx_primpath_list_t             prim_paths,
     ovstage_ordinal_t               ordinal,
     ovstage_hierarchy_relation_t    relation,
-    ovstage_hierarchy_handle_t*     out_hierarchy_handle);
+    ovstage_hierarchy_handle_t*     out_hierarchy_handle)
+{
+    return ovstage_get_hierarchy_ex(
+        instance != NULL ? &instance->ext_instances.hierarchy : NULL,
+        prim_paths, ordinal, relation, out_hierarchy_handle);
+}
+
+/** @brief The pair form of ovstage_fetch_hierarchy_result: the same call on the
+ *         hierarchy instance, `&instance->ext_instances.hierarchy`. C++
+ *         overloads ovstage_fetch_hierarchy_result for this receiver. */
+static inline ovstage_api_status_t ovstage_fetch_hierarchy_result_ex(
+    ovstage_hierarchy_instance_t* hierarchy,
+    ovstage_hierarchy_handle_t    hierarchy_handle,
+    ovstage_hierarchy_result_t*   out_result)
+{
+    if (hierarchy == NULL)
+    {
+        if (out_result != NULL)
+        {
+#ifdef __cplusplus
+            ovstage_hierarchy_result_t zero{};
+#else
+            ovstage_hierarchy_result_t zero = { 0 };
+#endif
+            *out_result = zero;
+        }
+        return OVSTAGE_ERROR_INVALID_ARGUMENT;
+    }
+    return hierarchy->vtable->fetch_hierarchy_result(
+        hierarchy->context, hierarchy_handle, out_result);
+}
 
 /**
  * @brief Fetch the result of a completed hierarchy lookup batch.
@@ -449,19 +665,57 @@ ovstage_enqueue_result_t ovstage_get_hierarchy(
  * @post On OVSTAGE_OK, pointers in `*out_result` remain valid until
  *       ovstage_release_hierarchy_result.
  */
-ovstage_api_status_t ovstage_fetch_hierarchy_result(
+static inline ovstage_api_status_t ovstage_fetch_hierarchy_result(
     ovstage_instance_t*          instance,
     ovstage_hierarchy_handle_t   hierarchy_handle,
-    ovstage_hierarchy_result_t*  out_result);
+    ovstage_hierarchy_result_t*  out_result)
+{
+    return ovstage_fetch_hierarchy_result_ex(
+        instance != NULL ? &instance->ext_instances.hierarchy : NULL,
+        hierarchy_handle, out_result);
+}
+
+/** @brief The pair form of ovstage_release_hierarchy_result: the same call on
+ *         the hierarchy instance, `&instance->ext_instances.hierarchy`. C++
+ *         overloads ovstage_release_hierarchy_result for this receiver. */
+static inline ovstage_api_status_t ovstage_release_hierarchy_result_ex(
+    ovstage_hierarchy_instance_t*       hierarchy,
+    const ovstage_hierarchy_result_t*   result)
+{
+    if (hierarchy == NULL)
+        return OVSTAGE_ERROR_INVALID_ARGUMENT;
+    return hierarchy->vtable->release_hierarchy_result(hierarchy->context, result);
+}
 
 /**
  * @brief Release a fetched hierarchy result payload.
  *
  * After this call, pointers in `*result` are invalid.
  */
-ovstage_api_status_t ovstage_release_hierarchy_result(
+static inline ovstage_api_status_t ovstage_release_hierarchy_result(
     ovstage_instance_t*                 instance,
-    const ovstage_hierarchy_result_t*   result);
+    const ovstage_hierarchy_result_t*   result)
+{
+    return ovstage_release_hierarchy_result_ex(
+        instance != NULL ? &instance->ext_instances.hierarchy : NULL, result);
+}
+
+/** @brief The pair form of ovstage_release_hierarchy: the same call on the
+ *         hierarchy instance, `&instance->ext_instances.hierarchy`. C++
+ *         overloads ovstage_release_hierarchy for this receiver. */
+static inline ovstage_enqueue_result_t ovstage_release_hierarchy_ex(
+    ovstage_hierarchy_instance_t* hierarchy,
+    ovstage_hierarchy_handle_t    handle)
+{
+    if (hierarchy == NULL)
+    {
+        ovstage_enqueue_result_t rejected;
+        rejected.status = OVSTAGE_ERROR_INVALID_ARGUMENT;
+        rejected.op_index = OVSTAGE_INVALID_OP_ID;
+        return rejected;
+    }
+    return hierarchy->vtable->release_hierarchy(hierarchy->context, handle);
+}
 
 /**
  * @brief Enqueue release of a hierarchy handle.
@@ -469,9 +723,34 @@ ovstage_api_status_t ovstage_release_hierarchy_result(
  * Per-handle ordered: the release waits for any in-flight fetch on the same
  * handle to complete before reclaiming resources.
  */
-ovstage_enqueue_result_t ovstage_release_hierarchy(
+static inline ovstage_enqueue_result_t ovstage_release_hierarchy(
     ovstage_instance_t*          instance,
-    ovstage_hierarchy_handle_t   handle);
+    ovstage_hierarchy_handle_t   handle)
+{
+    return ovstage_release_hierarchy_ex(
+        instance != NULL ? &instance->ext_instances.hierarchy : NULL, handle);
+}
+
+/** @brief The pair form of ovstage_get_hierarchy_computation_models: the same
+ *         call on the hierarchy instance, `&instance->ext_instances.hierarchy`.
+ *         C++ overloads ovstage_get_hierarchy_computation_models for this
+ *         receiver. */
+static inline ovstage_api_status_t ovstage_get_hierarchy_computation_models_ex(
+    ovstage_hierarchy_instance_t*                        hierarchy,
+    const ovstage_hierarchy_computation_model_desc_t**   out_models,
+    size_t*                                              out_model_count)
+{
+    if (hierarchy == NULL)
+    {
+        if (out_models != NULL)
+            *out_models = NULL;
+        if (out_model_count != NULL)
+            *out_model_count = 0;
+        return OVSTAGE_ERROR_INVALID_ARGUMENT;
+    }
+    return hierarchy->vtable->get_hierarchy_computation_models(
+        hierarchy->context, out_models, out_model_count);
+}
 
 /**
  * @brief Return the hierarchy computation models supported by this runtime.
@@ -486,10 +765,35 @@ ovstage_enqueue_result_t ovstage_release_hierarchy(
  * @param[out] out_model_count Receives the number of descriptors.
  * @return OVSTAGE_OK on success.
  */
-ovstage_api_status_t ovstage_get_hierarchy_computation_models(
+static inline ovstage_api_status_t ovstage_get_hierarchy_computation_models(
     ovstage_instance_t*                                  instance,
     const ovstage_hierarchy_computation_model_desc_t**   out_models,
-    size_t*                                              out_model_count);
+    size_t*                                              out_model_count)
+{
+    return ovstage_get_hierarchy_computation_models_ex(
+        instance != NULL ? &instance->ext_instances.hierarchy : NULL,
+        out_models, out_model_count);
+}
+
+/** @brief The pair form of ovstage_compute_hierarchy: the same call on the
+ *         hierarchy instance, `&instance->ext_instances.hierarchy`. C++
+ *         overloads ovstage_compute_hierarchy for this receiver. */
+static inline ovstage_enqueue_result_t ovstage_compute_hierarchy_ex(
+    ovstage_hierarchy_instance_t*              hierarchy,
+    ovstage_hierarchy_computation_model_id_t   computation_model_id,
+    ovstage_ordinal_t                          input_ordinal,
+    ovstage_ordinal_t                          output_ordinal)
+{
+    if (hierarchy == NULL)
+    {
+        ovstage_enqueue_result_t rejected;
+        rejected.status = OVSTAGE_ERROR_INVALID_ARGUMENT;
+        rejected.op_index = OVSTAGE_INVALID_OP_ID;
+        return rejected;
+    }
+    return hierarchy->vtable->compute_hierarchy(
+        hierarchy->context, computation_model_id, input_ordinal, output_ordinal);
+}
 
 /**
  * @brief Enqueue hierarchy computation using a runtime computation model.
@@ -524,11 +828,16 @@ ovstage_api_status_t ovstage_get_hierarchy_computation_models(
  * @return Enqueue result with status + op_index. Per-op execution failures are
  *         surfaced through ovstage_wait_op + ovstage_get_last_op_error.
  */
-ovstage_enqueue_result_t ovstage_compute_hierarchy(
+static inline ovstage_enqueue_result_t ovstage_compute_hierarchy(
     ovstage_instance_t*                        instance,
     ovstage_hierarchy_computation_model_id_t   computation_model_id,
     ovstage_ordinal_t                          input_ordinal,
-    ovstage_ordinal_t                          output_ordinal);
+    ovstage_ordinal_t                          output_ordinal)
+{
+    return ovstage_compute_hierarchy_ex(
+        instance != NULL ? &instance->ext_instances.hierarchy : NULL,
+        computation_model_id, input_ordinal, output_ordinal);
+}
 
 /* ═══════════════════════════════════════════════════════════════════════════════
  * Deferred Design Items
@@ -549,6 +858,70 @@ ovstage_enqueue_result_t ovstage_compute_hierarchy(
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
 #ifdef __cplusplus
+} /* extern "C" */
+
+/* C++ spells the pair form with the name of the instance form. A literal NULL or
+ * nullptr first argument is ambiguous between the two receivers: pass a
+ * typed null, or call the _ex form. */
+inline ovstage_api_status_t ovstage_get_usd_stage_id(
+    ovstage_usd_instance_t* usd, uint64_t* out_usd_stage_id)
+{
+    return ovstage_get_usd_stage_id_ex(usd, out_usd_stage_id);
+}
+
+inline ovstage_enqueue_result_t ovstage_clone(
+    ovstage_data_plane_instance_t* data_plane, ovx_string_t source_path,
+    const ovx_string_t* target_paths, size_t num_target_paths, ovstage_ordinal_t ordinal)
+{
+    return ovstage_clone_ex(data_plane, source_path, target_paths, num_target_paths, ordinal);
+}
+
+inline ovstage_api_status_t ovstage_fetch_clone_result(
+    ovstage_data_plane_instance_t* data_plane, ovstage_op_id_t op_id,
+    ovstage_timeout_ns_t timeout, ovstage_clone_result_t* out_result)
+{
+    return ovstage_fetch_clone_result_ex(data_plane, op_id, timeout, out_result);
+}
+
+inline ovstage_enqueue_result_t ovstage_get_hierarchy(
+    ovstage_hierarchy_instance_t* hierarchy, ovx_primpath_list_t prim_paths,
+    ovstage_ordinal_t ordinal, ovstage_hierarchy_relation_t relation,
+    ovstage_hierarchy_handle_t* out_hierarchy_handle)
+{
+    return ovstage_get_hierarchy_ex(hierarchy, prim_paths, ordinal, relation, out_hierarchy_handle);
+}
+
+inline ovstage_api_status_t ovstage_fetch_hierarchy_result(
+    ovstage_hierarchy_instance_t* hierarchy, ovstage_hierarchy_handle_t hierarchy_handle,
+    ovstage_hierarchy_result_t* out_result)
+{
+    return ovstage_fetch_hierarchy_result_ex(hierarchy, hierarchy_handle, out_result);
+}
+
+inline ovstage_api_status_t ovstage_release_hierarchy_result(
+    ovstage_hierarchy_instance_t* hierarchy, const ovstage_hierarchy_result_t* result)
+{
+    return ovstage_release_hierarchy_result_ex(hierarchy, result);
+}
+
+inline ovstage_enqueue_result_t ovstage_release_hierarchy(
+    ovstage_hierarchy_instance_t* hierarchy, ovstage_hierarchy_handle_t handle)
+{
+    return ovstage_release_hierarchy_ex(hierarchy, handle);
+}
+
+inline ovstage_api_status_t ovstage_get_hierarchy_computation_models(
+    ovstage_hierarchy_instance_t* hierarchy,
+    const ovstage_hierarchy_computation_model_desc_t** out_models, size_t* out_model_count)
+{
+    return ovstage_get_hierarchy_computation_models_ex(hierarchy, out_models, out_model_count);
+}
+
+inline ovstage_enqueue_result_t ovstage_compute_hierarchy(
+    ovstage_hierarchy_instance_t* hierarchy, ovstage_hierarchy_computation_model_id_t computation_model_id,
+    ovstage_ordinal_t input_ordinal, ovstage_ordinal_t output_ordinal)
+{
+    return ovstage_compute_hierarchy_ex(hierarchy, computation_model_id, input_ordinal, output_ordinal);
 }
 #endif
 

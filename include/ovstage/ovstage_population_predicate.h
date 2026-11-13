@@ -86,6 +86,48 @@ extern "C"
          *  authoring it; `customData:myTool:export` selects the prims that carry that
          *  key. */
         OVSTAGE_POPULATION_PRIM_PREDICATE_HAS_METADATA = 17,
+        /** `values.targeted_by`, with `value_count` 2: matches a prim that a relationship
+         *  points at. The relationship must match `targeted_by.property_predicate`, and the
+         *  prim carrying it must match `targeted_by.prim_predicate`. A target naming a property
+         *  points at the prim that owns the property.
+         *
+         *  Only relationships on prims population walks count: active, defined, loaded and
+         *  not abstract. A relationship inside a native instance counts once, as authored in
+         *  the prototype, not once per instance.
+         *
+         *  It asks only about the prim being matched. It may be the whole prim predicate of a
+         *  selector or a derived property, or sit inside `OVSTAGE_POPULATION_PRIM_PREDICATE_AND`,
+         *  `OVSTAGE_POPULATION_PRIM_PREDICATE_OR` and `OVSTAGE_POPULATION_PRIM_PREDICATE_NOT`,
+         *  at any depth. Anywhere else, including the prim predicate of an expression, enqueue
+         *  fails with `OVSTAGE_ERROR_NOT_SUPPORTED`.
+         *
+         *  Its two predicates may not contain `IS_TARGETED_BY`,
+         *  `OVSTAGE_POPULATION_PROPERTY_PREDICATE_TARGETS` or
+         *  `OVSTAGE_POPULATION_PRIM_PREDICATE_HAS_DESCENDANT`. Enqueue fails with
+         *  `OVSTAGE_ERROR_NOT_SUPPORTED` if they do.
+         *
+         *  After `apply_usd_changes`, a prim is selected as a fresh population would select
+         *  it, including when the prims pointing at it or their relationships changed. */
+        OVSTAGE_POPULATION_PRIM_PREDICATE_IS_TARGETED_BY = 18,
+        /** `values.subpredicates`, exactly one: matches when any descendant of the prim
+         *  matches. The descendants are the prims population walks below the prim: active,
+         *  defined, loaded and not abstract.
+         *
+         *  The walk crosses native instance boundaries. When the prim is an instance, its
+         *  descendants are the prims of its prototype. When the walk reaches an instance below
+         *  the prim, it continues into that instance's prototype, and the prims there are
+         *  descendants of the prim as well.
+         *
+         *  A prim is not its own descendant; `OR` with the subpredicate to include the prim
+         *  itself.
+         *
+         *  After `apply_usd_changes`, a prim is selected as a fresh population would select
+         *  it, including after changes below it or inside the prototypes it reaches. */
+        OVSTAGE_POPULATION_PRIM_PREDICATE_HAS_DESCENDANT = 19,
+        /** Takes no values: matches a native instance, a prim USD instances because it is
+         *  `instanceable` and has composition arcs. An instance nested inside a prototype
+         *  matches too. */
+        OVSTAGE_POPULATION_PRIM_PREDICATE_IS_INSTANCE = 20,
     } ovstage_population_prim_predicate_kind_t;
 
     /** How an `ovstage_population_property_predicate_t` matches, and which member of
@@ -131,6 +173,18 @@ extern "C"
         /** Matches a property carrying an authored opinion, as opposed to one resolving
          *  to its schema fallback. Takes no values. */
         OVSTAGE_POPULATION_PROPERTY_PREDICATE_IS_AUTHORED = 12,
+        /** `values.prim_predicate`, exactly one: matches a relationship any of whose targets
+         *  is a prim matching it. A target that names a property path counts as the prim
+         *  carrying it, and a target population does not walk (inactive, undefined, abstract,
+         *  unloaded or inside an instance) matches nothing. An attribute never matches, even
+         *  one with connections: connections are not targets.
+         *
+         *  Accepted only inside a prim predicate, beneath
+         *  `OVSTAGE_POPULATION_PRIM_PREDICATE_HAS_PROPERTY`; anywhere else it is rejected at
+         *  enqueue with `OVSTAGE_ERROR_NOT_SUPPORTED`. After `apply_usd_changes`, a prim is
+         *  selected as a fresh population would select it, including after changes to its
+         *  targets or to the prims above them. */
+        OVSTAGE_POPULATION_PROPERTY_PREDICATE_TARGETS = 13,
     } ovstage_population_property_predicate_kind_t;
 
     /** Which prims a selector puts in scope.
@@ -149,6 +203,11 @@ extern "C"
             const ovx_string_t*                            strings;
             const ovstage_population_prim_predicate_t*     subpredicates;
             const ovstage_population_property_predicate_t* property_predicate;
+            struct
+            {
+                const ovstage_population_prim_predicate_t*     prim_predicate;     /* the referrers */
+                const ovstage_population_property_predicate_t* property_predicate; /* their relationships */
+            } targeted_by;
         } values;
         size_t value_count;
     };
@@ -165,6 +224,7 @@ extern "C"
         {
             const ovx_string_t*                            strings;
             const ovstage_population_property_predicate_t* subpredicates;
+            const ovstage_population_prim_predicate_t*     prim_predicate;
         } values;
         size_t value_count;
     };
@@ -176,8 +236,8 @@ extern "C"
      *  what it matches.
      *
      *  A nested predicate is referenced, not copied: the object passed to `_and`,
-     *  `_or`, `_not`, `_has_parent`, `_has_ancestor`, or `_has_property` must outlive
-     *  the predicate built from it. */
+     *  `_or`, `_not`, `_has_parent`, `_has_ancestor`, `_has_descendant`, `_has_property`,
+     *  `_is_targeted_by`, or `_targets` must outlive the predicate built from it. */
 
     /** `OVSTAGE_POPULATION_PRIM_PREDICATE_NONE`. */
     static inline ovstage_population_prim_predicate_t ovstage_population_prim_predicate_none(void)
@@ -251,6 +311,27 @@ extern "C"
         predicate.kind = OVSTAGE_POPULATION_PRIM_PREDICATE_HAS_ANCESTOR;
         predicate.values.subpredicates = subpredicate;
         predicate.value_count = 1;
+        return predicate;
+    }
+
+    /** `OVSTAGE_POPULATION_PRIM_PREDICATE_HAS_DESCENDANT` over one subpredicate. */
+    static inline ovstage_population_prim_predicate_t ovstage_population_prim_predicate_has_descendant(
+        const ovstage_population_prim_predicate_t* subpredicate)
+    {
+        ovstage_population_prim_predicate_t predicate;
+        predicate.kind = OVSTAGE_POPULATION_PRIM_PREDICATE_HAS_DESCENDANT;
+        predicate.values.subpredicates = subpredicate;
+        predicate.value_count = 1;
+        return predicate;
+    }
+
+    /** `OVSTAGE_POPULATION_PRIM_PREDICATE_IS_INSTANCE`. */
+    static inline ovstage_population_prim_predicate_t ovstage_population_prim_predicate_is_instance(void)
+    {
+        ovstage_population_prim_predicate_t predicate;
+        predicate.kind = OVSTAGE_POPULATION_PRIM_PREDICATE_IS_INSTANCE;
+        predicate.values.strings = 0;
+        predicate.value_count = 0;
         return predicate;
     }
 
@@ -375,6 +456,19 @@ extern "C"
         predicate.kind = OVSTAGE_POPULATION_PRIM_PREDICATE_HAS_METADATA;
         predicate.values.strings = paths;
         predicate.value_count = path_count;
+        return predicate;
+    }
+
+    /** `OVSTAGE_POPULATION_PRIM_PREDICATE_IS_TARGETED_BY`: targeted by a relationship matching
+     *  `relationship` on a prim matching `referrer`. */
+    static inline ovstage_population_prim_predicate_t ovstage_population_prim_predicate_is_targeted_by(
+        const ovstage_population_prim_predicate_t* referrer, const ovstage_population_property_predicate_t* relationship)
+    {
+        ovstage_population_prim_predicate_t predicate;
+        predicate.kind = OVSTAGE_POPULATION_PRIM_PREDICATE_IS_TARGETED_BY;
+        predicate.values.targeted_by.prim_predicate = referrer;
+        predicate.values.targeted_by.property_predicate = relationship;
+        predicate.value_count = 2;
         return predicate;
     }
 
@@ -515,6 +609,17 @@ extern "C"
         predicate.kind = OVSTAGE_POPULATION_PROPERTY_PREDICATE_IS_AUTHORED;
         predicate.values.strings = 0;
         predicate.value_count = 0;
+        return predicate;
+    }
+
+    /** `OVSTAGE_POPULATION_PROPERTY_PREDICATE_TARGETS` over one prim predicate. */
+    static inline ovstage_population_property_predicate_t ovstage_population_property_predicate_targets(
+        const ovstage_population_prim_predicate_t* target)
+    {
+        ovstage_population_property_predicate_t predicate;
+        predicate.kind = OVSTAGE_POPULATION_PROPERTY_PREDICATE_TARGETS;
+        predicate.values.prim_predicate = target;
+        predicate.value_count = 1;
         return predicate;
     }
 

@@ -31,7 +31,7 @@ Access the Extension
 --------------------
 
 The C entry points live in an explicitly included experimental header, rather
-than in the core ``ovstage_vtable_t``. The typed lookup below uses the instance's
+than in the core ``ovstage_data_plane_vtable_t``. The typed lookup below uses the instance's
 ``query_extension`` mechanism and checks the extension version and table size.
 The convenience wrappers perform the same lookup before dispatching the call.
 
@@ -173,7 +173,8 @@ has finished consuming it. No overlapping edits are made while the read is live.
                              try:
                                  consumer.wait_event(readable)  # Fetch has issued the record.
                                  with consumer:
-                                     view = cp.from_dlpack(group.dlpack(0))
+                                     column = group.columns[0]  # One requested attribute.
+                                     view = cp.from_dlpack(column.dlpack(0))
                                      result = cp.sum(view)
                              finally:
                                  # Complete all uses before releasing this borrowed group.
@@ -224,15 +225,16 @@ has finished consuming it. No overlapping edits are made while the read is live.
              stage, query, &attribute, 1, { 0, ordinal, false }, &readPlacement, &read));
          for (;;) {
              ovstage_read_group_t group{};
+             size_t groupFetchedCount = 0;
              const auto status = ovstage_fetch_read_next(
-                 stage, read, OVSTAGE_TIMEOUT_INFINITE, &group);
+                 stage, read, OVSTAGE_TIMEOUT_INFINITE, &group, 1, &groupFetchedCount);
              if (status == OVSTAGE_ERROR_END_OF_ITERATION)
                  break;
              checkStage(stage, status);
              checkCuda(cudaStreamWaitEvent(consumer, read_ready, 0));
              enqueueConsumer(consumer, group);
              checkCuda(cudaStreamSynchronize(consumer));
-             checkStage(stage, ovstage_release_group(stage, &group));
+             checkStage(stage, ovstage_release_groups(stage, &group, 1));
          }
          waitOp(stage, ovstage_release_read(stage, read));
          checkCuda(cudaEventSynchronize(write_ready));

@@ -40,6 +40,21 @@ static inline ovstage_config_entry_t ovstage_config_entry_string(ovstage_config_
 }
 
 /**
+ * Build a config entry for a boolean setting.
+ * @param key Config key from ovstage_config_bool_t.
+ * @param value Boolean value.
+ */
+static inline ovstage_config_entry_t ovstage_config_entry_bool(ovstage_config_bool_t key,
+                                                               bool value)
+{
+    ovstage_config_entry_t entry;
+    entry.key_type = OVSTAGE_CONFIG_KEY_TYPE_BOOL;
+    entry.key.bool_key = key;
+    entry.value.bool_value = value;
+    return entry;
+}
+
+/**
  * Build a config entry for an unsigned 64-bit setting.
  * @param key Config key from ovstage_config_uint64_t.
  * @param value Unsigned 64-bit value.
@@ -52,6 +67,31 @@ static inline ovstage_config_entry_t ovstage_config_entry_uint64(ovstage_config_
     entry.key.uint64_key = key;
     entry.value.uint_value = value;
     return entry;
+}
+
+/**
+ * Configure the number of retained sealed ordinals for history-enabled
+ * attributes (OVSTAGE_CONFIG_RETENTION_WINDOW).
+ * The process default is four. Valid capacities are [1, SIZE_MAX - 1].
+ * Supply an override before creating the first instance. Later explicit
+ * values must match the active setting. Existing instances never resize.
+ * After the last process reference is released the default resets to four.
+ * A history-capable instance reads the setting: it bounds the earlier sealed
+ * values that the selected pairs retain. An instance that keeps history off
+ * ignores the setting. The setting alone retains nothing. Enroll attributes
+ * with ovstage_enable_history() (ovstage_history.h) on a sealed
+ * history-capable instance.
+ * @remark The `implementation` member of ovstage_instance_desc_t selects the
+ *         implementation: "history_selective" is history-capable, and the
+ *         default "history_latest" keeps history off.
+ * @note Experimental. This setting, the implementation "history_selective"
+ *       and the history selection API of ovstage_history.h are experimental.
+ *       Their API, ABI and semantics can change between releases without a
+ *       deprecation period.
+ */
+static inline ovstage_config_entry_t ovstage_config_entry_retention_window(uint64_t capacity)
+{
+    return ovstage_config_entry_uint64(OVSTAGE_CONFIG_RETENTION_WINDOW, capacity);
 }
 
 /**
@@ -90,6 +130,54 @@ static inline ovstage_config_entry_t ovstage_config_entry_runtime_default_ordina
     return ovstage_config_entry_uint64(
         OVSTAGE_CONFIG_RUNTIME_DEFAULT_ORDINAL_ADMISSION_POLICY,
         (uint64_t)policy);
+}
+
+/**
+ * Configure the maximum number of threads one population operation may use to
+ * read what its selectors select, including the thread that runs it.
+ *
+ * 1 reads serially, which is the default. N > 1 allows up to N threads, and
+ * OVSTAGE_POPULATION_THREAD_LIMIT_AUTO lets the runtime choose, up to the
+ * concurrency the process allows. The runtime may use fewer threads than the
+ * limit. Populated data does not depend on this setting.
+ *
+ * The limit does not cover the rest of a population operation. Opening and
+ * composing the USD stage and populating OVSTAGE_POPULATION_DOMAIN_RENDERING
+ * keep their own concurrency, so a limit of 1 does not make a whole
+ * population operation single-threaded. Which population work the limit
+ * covers may grow between releases.
+ *
+ * OVSTAGE_POPULATION_THREAD_LIMIT_DEFAULT (0) means no override; an
+ * entry with that value is ignored. Supply a limit on the first process
+ * reference. Later limits must match until all initialization and instance
+ * references are gone. Existing instances retain the limit captured when they
+ * were created.
+ *
+ * @param limit The thread limit.
+ */
+static inline ovstage_config_entry_t ovstage_config_entry_population_thread_limit(uint64_t limit)
+{
+    return ovstage_config_entry_uint64(OVSTAGE_CONFIG_POPULATION_THREAD_LIMIT, limit);
+}
+
+/**
+ * Configure strict USD resolution for wholesale populations (opens and
+ * repopulates).
+ *
+ * When enabled, ovstage_population_open_usd_* and
+ * ovstage_population_repopulate_usd_with_desc fail with
+ * OVSTAGE_ERROR_OP_FAILED when composition reports unresolved
+ * sublayer/reference/payload asset paths (up to three of the unresolved
+ * identifiers, plus a count of the rest, are listed by
+ * ovstage_population_get_last_op_error). Disabled by default:
+ * unresolved dependencies are logged as warnings and the op succeeds.
+ *
+ * Process-scoped: supply it when acquiring the first process reference (see
+ * OVSTAGE_CONFIG_POPULATION_STRICT_RESOLUTION for the conflict rules).
+ */
+static inline ovstage_config_entry_t ovstage_config_entry_population_strict_resolution(bool enabled)
+{
+    return ovstage_config_entry_bool(OVSTAGE_CONFIG_POPULATION_STRICT_RESOLUTION, enabled);
 }
 
 /**

@@ -13,6 +13,7 @@
 #include <ovstage/ovstage.h>
 #include <ovstage/ovstage_population.h>
 #include <ovstage/ovstage_population_export.h>
+#include <ovstage/ovstage_population_predicate.h>
 #include <ovx/path_dictionary/path_dictionary.h>
 #include <ovx/path_dictionary/path_dictionary_utils.h>
 #include <dlpack/dlpack.h>
@@ -218,10 +219,19 @@ def Xform "World"
     }
 }
 )usd";
+    // RENDERING, and the physics properties of the prims that apply a physics API.
+    const ovx_string_t physicsApis[] = { str("PhysicsCollisionAPI"), str("PhysicsRigidBodyAPI") };
+    const ovx_string_t physicsNamespace[] = { str("physics") };
+    ovstage_population_selector_t physics{};
+    physics.prim_predicate = ovstage_population_prim_predicate_has_applied_schema(physicsApis, 2);
+    physics.property_predicate = ovstage_population_property_predicate_in_namespace(physicsNamespace, 1);
+    ovstage_population_desc_t population{};
+    population.domains = OVSTAGE_POPULATION_DOMAIN_RENDERING;
+    population.selectors = &physics;
+    population.selector_count = 1;
     ASSERT_TRUE(waitPopulation(runtime.get(),
-        ovstage_population_open_usd_from_string(
-            runtime.get(), str(source), 1, NAN, OVSTAGE_POPULATION_DOMAIN_ALL),
-        "open_usd_from_string"));
+        ovstage_population_open_usd_from_string_with_desc(runtime.get(), str(source), 1, NAN, &population, 1),
+        "open_usd_from_string_with_desc"));
     ovstage_write_floor_desc_t floor{};
     floor.ordinal = 1;
     floor.scope = OVSTAGE_SCOPE_ALL;

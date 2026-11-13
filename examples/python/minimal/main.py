@@ -63,8 +63,9 @@ def main() -> int:
                     if group is None:
                         raise SystemExit("read returned no group at ordinal 1")
                     try:
-                        # group.array(i) is a zero-copy numpy view of tensor i (CPU).
-                        print("read back ordinal", group.ordinal, group.array(0))  # -> [1. 2. 3.]
+                        # column.array(i) is a zero-copy numpy view of tensor i (CPU).
+                        column = group.columns[0]
+                        print("read back ordinal", column.ordinal, column.array(0))  # -> [1. 2. 3.]
                     finally:
                         stage.release_group(group)
                 # [/snippet:minimal-write-read]
@@ -99,7 +100,7 @@ def main() -> int:
                 # ovstage speaks the standard DLPack protocol, so it interoperates
                 # zero-copy with numpy / warp / torch / cupy on CPU or CUDA. Ingest:
                 # hand write_attribute any object exposing __dlpack__ (keep the source
-                # alive until the write's Operation is waited). Export: group.dlpack(i)
+                # alive until the write's Operation is waited). Export: column.dlpack(i)
                 # is a zero-copy view, valid only until the group is released -- copy
                 # it if it must outlive the read.
                 producer = np.array([7.0, 8.0, 9.0], np.float32)
@@ -115,20 +116,21 @@ def main() -> int:
                     if group is None:
                         raise SystemExit("read returned no group at ordinal 4")
                     try:
-                        column = np.from_dlpack(group.dlpack(0))
+                        read_column = group.columns[0]
+                        values_view = np.from_dlpack(read_column.dlpack(0))
                         # The earlier clone widened the "temperature" column past our
                         # 3 prims, so this view spans every prim in the column and the
-                        # group carries a data index_map: narrow to this group's rows
+                        # column carries a data index_map: narrow to this group's rows
                         # via data_count + data_row_index (a gather -- it copies,
                         # unlike the zero-copy view above). Without an index_map the
                         # group is dense -- data_count is not meaningful then, and the
                         # view's rows are already exactly this group's rows, in order.
-                        if group.has_data_index_map:
+                        if read_column.has_data_index_map:
                             values = np.array(
-                                [column[group.data_row_index(i)] for i in range(group.data_count)])
+                                [values_view[read_column.data_row_index(i)] for i in range(read_column.data_count)])
                         else:
-                            values = column
-                        print("dlpack read back ordinal", group.ordinal, values)  # -> [7. 8. 9.]
+                            values = values_view
+                        print("dlpack read back ordinal", read_column.ordinal, values)  # -> [7. 8. 9.]
                     finally:
                         stage.release_group(group)
                 # [/snippet:dlpack-interchange]

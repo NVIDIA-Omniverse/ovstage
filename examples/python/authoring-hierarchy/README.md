@@ -47,7 +47,7 @@ children of /World/Proto: /World/Proto/Arm /World/Proto/Body
 siblings of /World/Proto/Body: /World/Proto/Arm
 ```
 
-- The first two lines prove the prims exist with zero USD: attribute writes to
+- `prototype prim types` and `applied schemas` prove the prims exist with zero USD: attribute writes to
   nested paths created them, and the reserved `usd-prim-type` / `usd-schemas`
   columns read back exactly what was stamped.
 - The `absent` line shows that the derived `omni:fabric:worldMatrix` column
@@ -57,8 +57,7 @@ siblings of /World/Proto/Body: /World/Proto/Arm
 - The `moved` / `recomputed` pair shows that a later edit needs another
   compute: the ordinal-4 write lands in the derived rows only after the second
   `compute_hierarchy` — the tip's z becomes 47.0.
-- The last relation lines come from `get_hierarchy` lookups against the
-  write-created prims.
+- `parent of`, `children of`, and `siblings of` come from `get_hierarchy` lookups against the write-created prims.
 
 ## Build and run
 
@@ -77,19 +76,18 @@ uv run main.py
 
 ## Snippets
 
-The `[snippet:name]` markers in `main.py` fence regions referenced by the
-ovstage skills under `../../../skills/`; keep them intact when editing.
+The `[snippet:name]` markers in [main.py](main.py) identify the source regions described below and referenced by the [ovstage skills](../../../skills/). Keep the markers intact when editing.
 
-- `setup` — imports (`numpy`, `ovstage` types)
-- `insert-author-subtree` — create prims via an INSERT (create-only) write to nested paths
-- `author-prim-types` — stamp `usd-prim-type` (scalar uint64 token ids)
-- `author-applied-schemas` — stamp `usd-schemas` (token-id array; whole-set rows)
-- `author-local-transforms` — `omni:xform` as ONE 16-lane float64 element per prim
-- `clone-prototype-envs` — clone one prototype to N environments in one call
-- `hierarchy-computation-models` — enumerate the runtime's computation models
-- `world-matrix-staleness` — absent → seed output rows → compute → seal → correct
-- `recompute-after-edit` — a later local edit needs another compute to land
-- `hierarchy-lookups` — parent/children/siblings via `get_hierarchy`
+- `setup` — Imports NumPy and the ovstage types used to write attributes, read values, and select a hierarchy computation model. The program creates its stage and path dictionary in `main()`.
+- `insert-author-subtree` — Calls `write_attribute()` with `PrimMode.INSERT` to create the prototype prims at nested paths. Each prim receives a `proto:part` value at ordinal 1; INSERT requires that the prims do not already exist.
+- `author-prim-types` — Uses `intern_token()` to turn type names such as `Xform` and `Cube` into identifiers, then writes one `uint64` identifier per prim to `usd-prim-type`. Later reads resolve these identifiers back to type names.
+- `author-applied-schemas` — Writes the `PhysicsRigidBodyAPI` and `PhysicsMassAPI` identifiers as an array on `/World/Proto/Body`. Each `usd-schemas` write replaces the prim's complete applied-schema set; an empty array clears it.
+- `author-local-transforms` — Uses `_matrix_rows()` to prepare one 4×4 float64 matrix per prim and writes `omni:xform` with the `MATRIX` semantic. Waiting for `advance_write_floor(ordinal=1)` makes the completed authoring step available to readers.
+- `clone-prototype-envs` — Calls `clone()` once to copy `/World/Proto` to three environment paths. `_write_local_translation()` gives each new root a different X translation, then the snippet advances the write floor to 2.
+- `hierarchy-computation-models` — Calls `get_hierarchy_computation_models()` and prints the available model names. This example uses `GPU_INCREMENTAL` for its client-authored hierarchy and requires a CUDA-capable GPU.
+- `world-matrix-staleness` — Reads the example's initially absent world matrices, writes placeholder matrices, then calls `compute_hierarchy()` at ordinal 3. `_read_world_translation()` reads the computed result for each tip; `/World/Env_0/Body/Tip` ends at `(100, 100, 7)`.
+- `recompute-after-edit` — Moves `/World/Env_1` at ordinal 4, calls `compute_hierarchy()` again, and advances the write floor before reading. The updated tip translation is `(200, 100, 47)`.
+- `hierarchy-lookups` — The `_lookup()` helper calls `get_hierarchy()` for a requested parent, children, or siblings relation and returns the resulting path strings. The caller sorts these strings for display because relation results have no guaranteed order.
 
 ## Notes
 

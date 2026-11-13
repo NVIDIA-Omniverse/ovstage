@@ -72,24 +72,30 @@ static std::vector<std::string> readPrimTypes(ovstage_instance_t* stage, path_di
     std::vector<std::string> typeNames;
     for (;;)
     {
+        size_t fetchedGroupCount = 0;
         ovstage_read_group_t group{};
-        const ovstage_api_status_t fetched = ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group);
+        const ovstage_api_status_t fetched =
+            ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group, 1, &fetchedGroupCount);
         if (fetched == OVSTAGE_ERROR_END_OF_ITERATION)
             break; // the normal end of the group stream
         check(stage, fetched, "fetch_read_next");
-        if (group.data.tensor_count == 1 && group.data.tensors[0].data && group.data.tensors[0].ndim > 0)
+        if (group.column_count != 1)
+            fail("single-attribute read returned multiple columns");
+        const ovstage_read_column_t& column = group.columns[0];
+        if (column.data.tensor_count == 1 && column.data.tensors[0].data && column.data.tensors[0].ndim > 0)
         {
-            const uint64_t* ids = static_cast<const uint64_t*>(group.data.tensors[0].data);
-            for (int64_t i = 0; i < group.data.tensors[0].shape[0]; ++i)
+            const auto* ids = reinterpret_cast<const uint64_t*>(
+                static_cast<const uint8_t*>(column.data.tensors[0].data) + column.data.tensors[0].byte_offset);
+            for (int64_t i = 0; i < column.data.tensors[0].shape[0]; ++i)
             {
-                ovx_token_t token = static_cast<ovx_token_t>(ids[i]);
+                ovx_token_t token{ ids[i] };
                 ovx_string_t name{};
                 ovx_api_result_t ovxResult = path_dictionary_get_strings_from_tokens(dict, &token, 1, &name);
                 checkOvx(dict, ovxResult, "resolve-type");
                 typeNames.push_back(std::string(name.ptr ? name.ptr : "", name.length));
             }
         }
-        ovstage_release_group(stage, &group);
+        ovstage_release_groups(stage, &group, 1);
     }
     enq = ovstage_release_read(stage, read);
     waitOp(stage, enq, "release_read");
@@ -199,22 +205,23 @@ int main(int argc, char** argv)
     ovstage_read_handle_t read = OVSTAGE_INVALID_READ_HANDLE;
     enq = ovstage_read_attributes(stage, torusQuery, &xform, 1, range, &read);
     waitOp(stage, enq, "read_attributes");
+    size_t fetchedGroupCount = 0;
     ovstage_read_group_t group{};
-    status = ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group);
+    status = ovstage_fetch_read_next(stage, read, OVSTAGE_TIMEOUT_INFINITE, &group, 1, &fetchedGroupCount);
     check(stage, status, "fetch_read_next");
     // Single-path query -> one scalar-lane 4x4 matrix row.
-    if (group.data.tensor_count != 1 || !group.data.tensors[0].data || group.data.tensors[0].ndim != 3 ||
-        !group.data.tensors[0].shape || group.data.tensors[0].shape[0] != 1 ||
-        group.data.tensors[0].shape[1] != 4 || group.data.tensors[0].shape[2] != 4 ||
-        group.data.tensors[0].dtype.code != kDLFloat || group.data.tensors[0].dtype.bits != 64 ||
-        group.data.tensors[0].dtype.lanes != 1)
+    if (group.column_count != 1 || !group.columns || group.columns[0].data.tensor_count != 1 || !group.columns[0].data.tensors[0].data || group.columns[0].data.tensors[0].ndim != 3 ||
+        !group.columns[0].data.tensors[0].shape || group.columns[0].data.tensors[0].shape[0] != 1 ||
+        group.columns[0].data.tensors[0].shape[1] != 4 || group.columns[0].data.tensors[0].shape[2] != 4 ||
+        group.columns[0].data.tensors[0].dtype.code != kDLFloat || group.columns[0].data.tensors[0].dtype.bits != 64 ||
+        group.columns[0].data.tensors[0].dtype.lanes != 1)
     {
         std::fprintf(stderr, "unexpected omni:xform read layout\n");
         return EXIT_FAILURE;
     }
-    const double* m = static_cast<const double*>(group.data.tensors[0].data);
+    const double* m = static_cast<const double*>(group.columns[0].data.tensors[0].data);
     std::printf("final Torus xform translation (row [3][0:3]): %.1f %.1f %.1f\n", m[12], m[13], m[14]);
-    ovstage_release_group(stage, &group);
+    ovstage_release_groups(stage, &group, 1);
     enq = ovstage_release_read(stage, read);
     waitOp(stage, enq, "release_read");
     // [/snippet:update-table]

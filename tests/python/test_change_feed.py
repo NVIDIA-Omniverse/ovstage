@@ -27,9 +27,9 @@ def _write_tokens(stage, query, attribute, value, count, *, is_array, ordinal):
     """Write one token id to every prim of `query`: a fixed column (usd-prim-type,
     one row per prim) or a ragged column (usd-schemas, one single-element row per prim)."""
     if is_array:
-        tensors = [np.array([value], np.uint64) for _ in range(count)]
+        tensors = [np.array([value.raw_id], np.uint64) for _ in range(count)]
     else:
-        tensors = np.full(count, value, np.uint64)
+        tensors = np.full(count, value.raw_id, np.uint64)
     stage.write_attribute(query, attribute, ordinal=ordinal, tensors=tensors, is_array=is_array).wait()
 
 
@@ -67,17 +67,18 @@ def _change_rows(stage, paths, query, attrs, first, last):
         rows = []
         for group in read.groups():
             with group:
-                assert not group.is_delete
                 list_paths = paths.get_path_strings(group.prim_list)
-                for i in range(group.prim_count):
-                    row = group.data_row_index(i) if group.has_data_index_map else i
-                    value = group.array(row)[0] if group.is_array else group.array(0)[row]
-                    rows.append((group.attribute, list_paths[group.prim_index(i)], value.item()))
-    return ErrorCode.OK, sorted(rows)
+                for column in group.columns:
+                    assert not column.is_delete
+                    for i in range(group.prim_count):
+                        row = column.data_row_index(i) if column.has_data_index_map else i
+                        value = column.array(row)[0] if column.is_array else column.array(0)[row]
+                        rows.append((column.attribute, list_paths[group.prim_index(i)], value.item()))
+    return ErrorCode.OK, sorted(rows, key=lambda row: (row[0].raw_id, row[1]))
 
 
 def _control_rows(attribute, values):
-    return sorted(zip([attribute] * len(CONTROL_PATHS), CONTROL_PATHS, values))
+    return sorted(zip([attribute] * len(CONTROL_PATHS), CONTROL_PATHS, values), key=lambda row: row[1])
 
 
 @pytest.fixture
@@ -211,9 +212,9 @@ def test_retained_query_keeps_membership_while_fresh_query_sees_new_prim(scene):
                 status, fresh_rows = _change_rows(stage, paths, fresh, structural, 2, 2)
                 assert status == ErrorCode.OK
                 assert fresh_rows == sorted([
-                    (scene.prim_type, NEW_CONTROL_PATH, scene.xform),
-                    (scene.schemas, NEW_CONTROL_PATH, scene.rigid_body),
-                ])
+                    (scene.prim_type, NEW_CONTROL_PATH, scene.xform.raw_id),
+                    (scene.schemas, NEW_CONTROL_PATH, scene.rigid_body.raw_id),
+                ], key=lambda row: row[0].raw_id)
             # [/snippet:frozen-vs-fresh-query]
         finally:
             stage.release_query(new_query).wait()
@@ -252,8 +253,8 @@ def test_include_seal_leaves_structural_changes_unreadable_until_covered(scene):
                 status, rows = _change_rows(stage, paths, fresh, structural, 2, 2)
                 assert status == ErrorCode.OK
                 assert rows == sorted([
-                    (scene.prim_type, NEW_CONTROL_PATH, scene.xform),
-                    (scene.schemas, NEW_CONTROL_PATH, scene.rigid_body),
-                ])
+                    (scene.prim_type, NEW_CONTROL_PATH, scene.xform.raw_id),
+                    (scene.schemas, NEW_CONTROL_PATH, scene.rigid_body.raw_id),
+                ], key=lambda row: row[0].raw_id)
         finally:
             stage.release_query(new_query).wait()

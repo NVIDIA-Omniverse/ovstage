@@ -93,6 +93,7 @@ protected:
     ::testing::AssertionResult readSemantic(ovx_token_t attr, ovstage_read_group_t* group, ovstage_read_handle_t* read,
                                             ovstage_attribute_semantic_t* semantic)
     {
+        size_t fetchedGroupCount = 0;
         *group = ovstage_read_group_t{};
         ovstage_ordinal_range_t range{};
         range.end_ordinal = 1;
@@ -105,7 +106,8 @@ protected:
             return ::testing::AssertionFailure() << "read_attributes failed";
         }
 
-        const ovstage_api_status_t fetched = ovstage_fetch_read_next(stage_, *read, OVSTAGE_TIMEOUT_INFINITE, group);
+        const ovstage_api_status_t fetched =
+            ovstage_fetch_read_next(stage_, *read, OVSTAGE_TIMEOUT_INFINITE, group, 1, &fetchedGroupCount);
         if (fetched != OVSTAGE_OK)
         {
             waitOp(stage_, ovstage_release_read(stage_, *read), "release_read");
@@ -113,13 +115,24 @@ protected:
             return ::testing::AssertionFailure() << "fetch_read_next failed (code " << fetched << ")";
         }
 
-        *semantic = group->semantic;
+        if (group->column_count != 1u || group->columns == nullptr)
+        {
+            const size_t columnCount = group->column_count;
+            const void* columns = group->columns;
+            ovstage_release_groups(stage_, group, 1);
+            waitOp(stage_, ovstage_release_read(stage_, *read), "release_read");
+            *read = OVSTAGE_INVALID_READ_HANDLE;
+            return ::testing::AssertionFailure()
+                   << "single-attribute read returned " << columnCount
+                   << " columns with column array " << columns;
+        }
+        *semantic = group->columns[0].semantic;
         return ::testing::AssertionSuccess();
     }
 
     void releaseRead(ovstage_read_group_t* group, ovstage_read_handle_t read)
     {
-        ovstage_release_group(stage_, group);
+        ovstage_release_groups(stage_, group, 1);
         waitOp(stage_, ovstage_release_read(stage_, read), "release_read");
     }
 
@@ -143,14 +156,14 @@ TEST_F(SemanticsTest, SemanticRolesRoundTrip)
     // A semantic is the authored USD interpretation of a column's bytes, orthogonal
     // to the storage dtype: the same 3-lane float32 storage is POINT on one column
     // and COLOR on another; a 16-lane float64 is MATRIX. The write stamps it and
-    // reads recover it (group.semantic). TOKEN_ID pins uint64 storage whose payload
+    // reads recover it (column.semantic). TOKEN_ID pins uint64 storage whose payload
     // is pre-interned path-dictionary token ids — ovstage never stringifies.
     float pointData[] = { 0, 0, 1, 0, 1, 0 };
     float colorData[] = { 1, 0, 0, 0, 0.5f, 0 };
     double matrixData[32];
     for (int i = 0; i < 32; ++i)
         matrixData[i] = ((i % 16) % 5 == 0) ? 1.0 : 0.0; // two identity mat4s (diagonal within each 4x4)
-    uint64_t materialIds[] = { intern("steel"), intern("rubber") };
+    ovx_token_t materialIds[] = { intern("steel"), intern("rubber") };
 
     DLTensor pointTensor{ pointData, { kDLCPU, 0 }, 1, { kDLFloat, 32, 3 }, shape, strides, 0 };
     DLTensor colorTensor{ colorData, { kDLCPU, 0 }, 1, { kDLFloat, 32, 3 }, shape, strides, 0 };
@@ -178,10 +191,11 @@ TEST_F(SemanticsTest, SemanticRolesRoundTrip)
     EXPECT_EQ(semantic, OVSTAGE_SEMANTIC_COLOR);
     releaseRead(&group, read);
     ASSERT_TRUE(readSemantic(matrix, &group, &read, &semantic));
-    const bool hasMatrixTensor = group.data.tensor_count > 0u;
+    const ovstage_read_column_t& matrixColumn = group.columns[0];
+    const bool hasMatrixTensor = matrixColumn.data.tensor_count > 0u;
     if (hasMatrixTensor)
     {
-        const DLTensor& tensor = group.data.tensors[0];
+        const DLTensor& tensor = matrixColumn.data.tensors[0];
         EXPECT_EQ(tensor.dtype.lanes, 1u);
         ASSERT_EQ(tensor.ndim, 3);
         ASSERT_NE(tensor.shape, nullptr);
@@ -194,20 +208,22 @@ TEST_F(SemanticsTest, SemanticRolesRoundTrip)
     ASSERT_TRUE(hasMatrixTensor);
 
     ASSERT_TRUE(readSemantic(material, &group, &read, &semantic));
-    const bool hasMaterialTensor = group.data.tensor_count > 0u && group.data.tensors[0].data;
+    const ovstage_read_column_t& materialColumn = group.columns[0];
+    const bool hasMaterialTensor = materialColumn.data.tensor_count > 0u && materialColumn.data.tensors[0].data;
     std::set<std::string> resolved;
     bool resolvedIds = true;
     if (hasMaterialTensor)
     {
-        const uint64_t* ids = static_cast<const uint64_t*>(group.data.tensors[0].data);
+        const auto* ids = reinterpret_cast<const uint64_t*>(
+            static_cast<const uint8_t*>(materialColumn.data.tensors[0].data) + materialColumn.data.tensors[0].byte_offset);
         for (int i = 0; i < 2; ++i)
         {
-            const ovx_token_t token = static_cast<ovx_token_t>(ids[i]);
+            const ovx_token_t token{ ids[i] };
             ovx_string_t name{};
             if (path_dictionary_get_strings_from_tokens(dict_, &token, 1, &name).status != OVX_API_SUCCESS)
             {
                 resolvedIds = false;
-                ADD_FAILURE() << "failed to resolve token id " << token;
+                ADD_FAILURE() << "failed to resolve token id " << token.raw_id;
                 continue;
             }
             resolved.insert(std::string(name.ptr ? name.ptr : "", name.ptr ? name.length : 0));
@@ -221,3 +237,64 @@ TEST_F(SemanticsTest, SemanticRolesRoundTrip)
 }
 
 } // namespace
+
+TEST_F(SemanticsTest, BatchedReadFetchAndRelease)
+{
+    const ovx_token_t attrs[] = { intern("batch:a"), intern("batch:b"), intern("batch:c"), intern("batch:d") };
+    float values[] = { 1.0f, 2.0f };
+    int64_t shape = 2;
+    DLTensor tensor{ values, { kDLCPU, 0 }, 1, { kDLFloat, 32, 1 }, &shape, nullptr, 0 };
+    for (auto attr : attrs)
+        writeSemantic(attr, &tensor, OVSTAGE_SEMANTIC_NONE);
+    ovstage_write_floor_desc_t floor{};
+    floor.ordinal = 1;
+    floor.scope = OVSTAGE_SCOPE_ALL;
+    ASSERT_TRUE(waitOp(stage_, ovstage_advance_write_floor(stage_, &floor), "seal"));
+    ovstage_ordinal_range_t range{};
+    range.end_ordinal = 1;
+    ovstage_read_handle_t read = OVSTAGE_INVALID_READ_HANDLE;
+    ASSERT_TRUE(waitOp(stage_, ovstage_read_attributes(stage_, query_, attrs, 4, range, &read), "read"));
+
+    size_t totalGroups = 0;
+    size_t totalValues = 0;
+    float sum = 0.0f;
+    // [snippet:batched-read-groups-c]
+    ovstage_read_group_t groups[3]{};
+    for (;;)
+    {
+        size_t count = 0;
+        const auto status = ovstage_fetch_read_next(stage_, read, OVSTAGE_TIMEOUT_INFINITE, groups, 3, &count);
+        if (status == OVSTAGE_ERROR_END_OF_ITERATION)
+        {
+            EXPECT_EQ(count, 0u);
+            break;
+        }
+        ASSERT_EQ(status, OVSTAGE_OK);
+        ASSERT_GT(count, 0u);
+        ASSERT_LE(count, 3u);
+        for (size_t i = 0; i < count; ++i)
+        {
+            for (size_t c = 0; c < groups[i].column_count; ++c)
+            {
+                const auto& column = groups[i].columns[c];
+                const auto& tensor = column.data.tensors[0];
+                const auto* data =
+                    reinterpret_cast<const float*>(static_cast<const uint8_t*>(tensor.data) + tensor.byte_offset);
+                for (size_t row = 0; row < groups[i].prims.count; ++row)
+                {
+                    const size_t index = column.data.index_map ? column.data.index_map[row] : row;
+                    sum += data[index]; // Finish using borrowed values before release.
+                    ++totalValues;
+                }
+            }
+        }
+        totalGroups += count;
+        ASSERT_EQ(ovstage_release_groups(stage_, groups, count), OVSTAGE_OK);
+        // Even a short batch needs another fetch to observe completion.
+    }
+    ASSERT_TRUE(waitOp(stage_, ovstage_release_read(stage_, read), "release_read"));
+    // [/snippet:batched-read-groups-c]
+    EXPECT_GT(totalGroups, 0u);
+    EXPECT_EQ(totalValues, 8u);
+    EXPECT_FLOAT_EQ(sum, 12.0f);
+}

@@ -30,7 +30,8 @@ import numpy as np
 
 import ovstage
 from ovstage import (AttributeSemantic, DLDataType, DLDataTypeCode, OrdinalRange, OvstageError,
-                     PrimMode, WriteDesc, make_dltensor)
+                     PrimMode, WriteDesc, make_dltensor,
+)
 # [/snippet:setup]
 
 # One float3 storage type: the per-element tuple width is carried in dtype.lanes
@@ -65,14 +66,16 @@ def section1_batched_writes(stage, paths) -> None:
         stage.write_attributes(query, [
             WriteDesc(attribute=heat, tensors=np.array([7.0, 8.0], np.float32), is_array=False),
             WriteDesc(attribute=tint, tensors=_float3_rows([0.1, 0.2, 0.3, 0.4, 0.5, 0.6]),
-                      is_array=False, semantic=AttributeSemantic.COLOR),
-        ], ordinal=1).wait()
+                      is_array=False, semantic=AttributeSemantic.COLOR,
+                ),
+        ], ordinal=1,
+        ).wait()
         stage.advance_write_floor(ordinal=1).wait()
         # [/snippet:batched-write-attributes]
 
         print("heat:", _latest_values(stage, paths, query, heat, 1, order))
         with _single_group(stage, query, tint, 1) as group:
-            values = group.array(0)
+            values = group.columns[0].array(0)
             print("tint:", values[0], values[1])
     paths.destroy_path_list(plist)
 
@@ -296,7 +299,7 @@ def section5_write_options(stage, paths) -> None:
 
             # [snippet:write-semantic]
             # TOKEN_ID requires interned token identifiers stored as uint64 values.
-            materials = np.array([paths.intern_token(name) for name in ["steel", "rubber", "wood"]],
+            materials = np.array([paths.intern_token(name).raw_id for name in ["steel", "rubber", "wood"]],
                                  dtype=np.uint64)
             stage.write_attribute(query, "material", ordinal=15, tensors=materials,
                                   is_array=False, semantic=AttributeSemantic.TOKEN_ID).wait()
@@ -318,10 +321,13 @@ def section5_write_options(stage, paths) -> None:
                 read.wait()
                 for group in read.groups():
                     with group:
-                        rows = group.array(0)
-                        for i in range(group.prim_count):
-                            row = group.data_row_index(i) if group.has_data_index_map else i
-                            saved.append(float(rows[row]))
+                        for column in group.columns:
+                            if column.is_delete:
+                                continue
+                            rows = column.array(0)
+                            for i in range(group.prim_count):
+                                row = column.data_row_index(i) if column.has_data_index_map else i
+                                saved.append(float(rows[row]))
             # Sorting is for display; read groups need not arrive in query order.
             print("Copied heat values:", sorted(saved))
             # Copied heat values: [200.0, 300.0, 400.0]
@@ -333,12 +339,15 @@ def section5_write_options(stage, paths) -> None:
                 read.wait()
                 for group in read.groups():
                     with group:
-                        # Raw and NumPy shapes are (N, 3), with scalar lanes.
-                        vectors = np.from_dlpack(group.dlpack(0))
-                        for i in range(group.prim_count):
-                            row = group.data_row_index(i) if group.has_data_index_map else i
-                            print("Velocity:", vectors[row].tolist())
-                            # One of [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0].
+                        for column in group.columns:
+                            if column.is_delete:
+                                continue
+                            # Raw and NumPy shapes are (N, 3), with scalar lanes.
+                            vectors = np.from_dlpack(column.dlpack(0))
+                            for i in range(group.prim_count):
+                                row = column.data_row_index(i) if column.has_data_index_map else i
+                                print("Velocity:", vectors[row].tolist())
+                                # One of [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0].
             # [/snippet:read-fixed-vectors]
 
             # [snippet:read-change-range]
@@ -349,12 +358,13 @@ def section5_write_options(stage, paths) -> None:
                 read.wait()
                 for group in read.groups():
                     with group:
-                        if group.is_delete:
-                            continue  # Deletions carry no value tensor.
-                        values = group.array(0)
-                        for i in range(group.prim_count):
-                            row = group.data_row_index(i) if group.has_data_index_map else i
-                            changed.append(float(values[row]))
+                        for column in group.columns:
+                            if column.is_delete:
+                                continue  # Deletions carry no value tensor.
+                            values = column.array(0)
+                            for i in range(group.prim_count):
+                                row = column.data_row_index(i) if column.has_data_index_map else i
+                                changed.append(float(values[row]))
             print("Heat values changed at 14:", sorted(changed))
             # Heat values changed at 14: [300.0, 400.0]
             # [/snippet:read-change-range]
@@ -391,12 +401,13 @@ def _latest_rows(stage, paths, query, attr, end_ordinal):
     with stage.read_attributes(query, [attr], OrdinalRange.latest(end_ordinal)) as read:
         read.wait()
         for group in read.groups():
-            if not group.is_delete:
+            column = group.columns[0]
+            if not column.is_delete:
                 group_paths = paths.get_paths(group.prim_list)
-                values = group.array(0)  # zero-copy view; valid until release_group
+                values = column.array(0)  # zero-copy view; valid until release_group
                 for local in range(group.prim_count):
                     path = paths.path_to_string(group_paths[group.prim_index(local)])
-                    row = group.data_row_index(local) if group.has_data_index_map else local
+                    row = column.data_row_index(local) if column.has_data_index_map else local
                     rows[path] = float(values[row])
             stage.release_group(group)
     return rows
