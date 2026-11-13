@@ -34,12 +34,19 @@ the ``ovstage`` directory under ``site-packages``.
 Running
 -------
 
-On Linux, run it directly. It finds the libraries it needs inside the package, with no
-environment setup:
+For OVStage 0.4.0 on Linux, add the package's ``bin/plugins`` directory to
+``LD_LIBRARY_PATH`` before running the benchmark. Its library search path does not
+find the bundled USD library automatically; without this workaround, startup fails
+with ``libov_25.11usd_ms.so: cannot open shared object file``.
+
+Run this setup in the shell where you will run the benchmark commands below,
+replacing the path with your package location:
 
 .. code-block:: bash
 
-   <ovstage-package>/bin/benchmark.ovstage --benchmark_list_tests
+   ovstage_package="/absolute/path/to/ovstage-package"
+   export LD_LIBRARY_PATH="$ovstage_package/bin/plugins${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+   "$ovstage_package/bin/benchmark.ovstage" --benchmark_list_tests
 
 On Windows, put the package ``bin\``, ``bin\plugins\`` and each immediate subdirectory of
 ``bin\plugins\`` on ``PATH`` first. ``ovstage.dll`` depends on libraries in the plugin
